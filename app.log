@@ -1,0 +1,320 @@
+2026-09-04 10:26:48 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:26:48 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:26:48 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:26:49 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=19700): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-04 10:26:50 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:26:50 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:26:50 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:26:50 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=19700)
+2026-09-04 10:27:58 INFO    [Thread-3 (worker)] it_asset_app: AD helper: launched new subprocess (pid=51736): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-04 10:27:59 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:27:59 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:27:59 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:27:59 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=51736)
+2026-09-04 10:27:59 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD helper: received lookup request_id='a647485b51ec49a5ab3c7462abaa5701' emp_id='900250983'
+2026-09-04 10:28:06 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD lookup: starting search for emp_id='900250983' (header_keyword='EmployeeID', name_column='Employee Name')
+2026-09-04 10:28:06 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: filled search textbox OK
+2026-09-04 10:28:07 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: clicked 'View Report' button OK
+2026-09-04 10:28:10 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: results table ready after 2.9s
+2026-09-04 10:28:12 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: raw extracted rows (0): []
+2026-09-04 10:28:12 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: report loaded but 0 usable candidates for emp_id='900250983' (raw rows=0)
+2026-09-04 10:28:12 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD helper: lookup failed for request_id='a647485b51ec49a5ab3c7462abaa5701' emp_id='900250983'
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1132, in stdin_reader
+    candidates = perform_search(emp_id)
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 998, in perform_search
+    return _perform_ssrs_search(
+        window, emp_id, button_text, header_keyword, name_column, ready_timeout
+    )
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 925, in _perform_ssrs_search
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: The report loaded, but returned no rows for Employee ID '900250983'. Double-check the ID is correct and enabled in AD.
+2026-09-04 10:32:09 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:32:09 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:32:09 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:32:10 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=38112): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-04 10:32:11 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:32:11 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:32:11 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:32:11 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=38112)
+2026-09-04 10:33:02 INFO    [Thread-3 (worker)] it_asset_app: AD helper: launched new subprocess (pid=41304): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-04 10:33:03 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:33:03 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:33:03 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:33:03 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=41304)
+2026-09-04 10:33:03 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD helper: received lookup request_id='1c0580abfb144aab8240d09b186239d9' emp_id='900250983'
+2026-09-04 10:33:10 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD lookup: starting search for emp_id='900250983' (header_keyword='EmployeeID', name_column='Employee Name')
+2026-09-04 10:33:10 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: filled search textbox OK
+2026-09-04 10:33:10 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: clicked 'View Report' button OK
+2026-09-04 10:33:13 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: results table ready after 2.4s
+2026-09-04 10:33:15 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: raw extracted rows (0): []
+2026-09-04 10:33:15 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: report loaded but 0 usable candidates for emp_id='900250983' (raw rows=0)
+2026-09-04 10:33:15 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD helper: lookup failed for request_id='1c0580abfb144aab8240d09b186239d9' emp_id='900250983'
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1132, in stdin_reader
+    candidates = perform_search(emp_id)
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 998, in perform_search
+    return _perform_ssrs_search(
+        window, emp_id, button_text, header_keyword, name_column, ready_timeout
+    )
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 925, in _perform_ssrs_search
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: The report loaded, but returned no rows for Employee ID '900250983'. Double-check the ID is correct and enabled in AD.
+2026-09-04 10:33:58 INFO    [MainThread] it_asset_app: Topaz: capture() starting
+2026-09-04 10:33:58 DEBUG   [Thread-5 (worker)] it_asset_app: Topaz: ProgID 'TOPAZSIGPLUS.SigPlusCtrl.1' failed: (-2147221005, 'Invalid class string', None, None)
+2026-09-04 10:33:58 INFO    [Thread-5 (worker)] it_asset_app: Topaz: connected via ProgID 'SigPlus.SigPlusCtrl.1'
+2026-09-04 10:33:58 DEBUG   [Thread-5 (worker)] it_asset_app: Topaz: calling SetTabletState(1, hwnd=661100) to arm the pad
+2026-09-04 10:33:58 ERROR   [Thread-5 (worker)] it_asset_app: Topaz: failed to connect/arm the pad
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 2073, in worker
+    sig.SetTabletState(1, hwnd)
+    ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\win32com\client\dynamic.py", line 631, in __getattr__
+    raise AttributeError(f"{self._username_}.{attr}")
+AttributeError: SigPlus.SigPlusCtrl.1.SetTabletState. Did you mean: 'SetTabletPortPath'?
+2026-09-04 10:33:59 WARNING [MainThread] it_asset_app: Topaz pad not available, falling back to on-screen signing: Topaz pad did not respond (SigPlus.SigPlusCtrl.1.SetTabletState).
+2026-09-04 10:46:08 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:46:08 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:46:08 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:46:09 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=39904): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-04 10:46:09 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-04 10:46:09 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-04 10:46:09 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-04 10:46:10 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=39904)
+2026-09-04 10:57:46 INFO    [MainThread] it_asset_app: Topaz: capture() starting
+2026-09-04 10:57:46 DEBUG   [Thread-3 (worker)] it_asset_app: Topaz: ProgID 'TOPAZSIGPLUS.SigPlusCtrl.1' failed: (-2147221005, 'Invalid class string', None, None)
+2026-09-04 10:57:46 INFO    [Thread-3 (worker)] it_asset_app: Topaz: connected via ProgID 'SigPlus.SigPlusCtrl.1'
+2026-09-04 10:57:46 DEBUG   [Thread-3 (worker)] it_asset_app: Topaz: calling SetTabletState(1, hwnd=1251162) to arm the pad
+2026-09-04 10:57:46 ERROR   [Thread-3 (worker)] it_asset_app: Topaz: failed to connect/arm the pad
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 2073, in worker
+    sig.SetTabletState(1, hwnd)
+    ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\win32com\client\dynamic.py", line 631, in __getattr__
+    raise AttributeError(f"{self._username_}.{attr}")
+AttributeError: SigPlus.SigPlusCtrl.1.SetTabletState. Did you mean: 'SetTabletPortPath'?
+2026-09-04 10:57:46 WARNING [MainThread] it_asset_app: Topaz pad not available, falling back to on-screen signing: Topaz pad did not respond (SigPlus.SigPlusCtrl.1.SetTabletState).
+2026-09-04 10:58:38 INFO    [MainThread] it_asset_app: Topaz: capture() starting
+2026-09-04 10:58:38 DEBUG   [Thread-4 (worker)] it_asset_app: Topaz: ProgID 'TOPAZSIGPLUS.SigPlusCtrl.1' failed: (-2147221005, 'Invalid class string', None, None)
+2026-09-04 10:58:38 INFO    [Thread-4 (worker)] it_asset_app: Topaz: connected via ProgID 'SigPlus.SigPlusCtrl.1'
+2026-09-04 10:58:38 DEBUG   [Thread-4 (worker)] it_asset_app: Topaz: calling SetTabletState(1, hwnd=1251162) to arm the pad
+2026-09-04 10:58:38 ERROR   [Thread-4 (worker)] it_asset_app: Topaz: failed to connect/arm the pad
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 2073, in worker
+    sig.SetTabletState(1, hwnd)
+    ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\win32com\client\dynamic.py", line 631, in __getattr__
+    raise AttributeError(f"{self._username_}.{attr}")
+AttributeError: SigPlus.SigPlusCtrl.1.SetTabletState. Did you mean: 'SetTabletPortPath'?
+2026-09-04 10:58:38 WARNING [MainThread] it_asset_app: Topaz pad not available, falling back to on-screen signing: Topaz pad did not respond (SigPlus.SigPlusCtrl.1.SetTabletState).
+2026-09-07 11:21:09 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:21:09 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:21:09 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:21:09 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=21288): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-07 11:21:10 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:21:10 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:21:10 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:21:10 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=21288)
+2026-09-07 11:21:24 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:21:24 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:21:24 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:21:24 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=33092): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-07 11:21:25 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:21:25 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:21:25 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:21:25 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=33092)
+2026-09-07 11:21:52 CRITICAL [MainThread] it_asset_app: UNCAUGHT EXCEPTION
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 3973, in <module>
+    app.mainloop()
+    ~~~~~~~~~~~~^^
+  File "C:\Program Files\Python314\Lib\tkinter\__init__.py", line 1625, in mainloop
+    self.tk.mainloop(n)
+    ~~~~~~~~~~~~~~~~^^^
+KeyboardInterrupt
+2026-09-07 11:22:09 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:22:09 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:22:09 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:22:09 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=4940): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-07 11:22:09 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:22:09 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:22:09 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:22:10 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=4940)
+2026-09-07 11:22:53 INFO    [Thread-3 (worker)] it_asset_app: AD helper: launched new subprocess (pid=8912): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-07 11:22:54 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-07 11:22:54 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-07 11:22:54 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-07 11:22:54 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=8912)
+2026-09-07 11:22:54 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD helper: received lookup request_id='476b78a0d5df44a98de5e4f3457d3558' emp_id='002227711'
+2026-09-07 11:22:58 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD lookup: starting search for emp_id='002227711' (header_keyword='EmployeeID', name_column='Employee Name')
+2026-09-07 11:22:58 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: filled search textbox OK
+2026-09-07 11:22:59 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: clicked 'View Report' button OK
+2026-09-07 11:23:02 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: results table ready after 3.2s
+2026-09-07 11:23:04 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: raw extracted rows (0): []
+2026-09-07 11:23:04 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: report loaded but 0 usable candidates for emp_id='002227711' (raw rows=0)
+2026-09-07 11:23:04 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD helper: lookup failed for request_id='476b78a0d5df44a98de5e4f3457d3558' emp_id='002227711'
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1132, in stdin_reader
+    candidates = perform_search(emp_id)
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 998, in perform_search
+    return _perform_ssrs_search(
+        window, emp_id, button_text, header_keyword, name_column, ready_timeout
+    )
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 925, in _perform_ssrs_search
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: The report loaded, but returned no rows for Employee ID '002227711'. Double-check the ID is correct and enabled in AD.
+2026-09-07 11:28:23 CRITICAL [MainThread] it_asset_app: UNCAUGHT EXCEPTION
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 3973, in <module>
+    app.mainloop()
+    ~~~~~~~~~~~~^^
+  File "C:\Program Files\Python314\Lib\tkinter\__init__.py", line 1625, in mainloop
+    self.tk.mainloop(n)
+    ~~~~~~~~~~~~~~~~^^^
+KeyboardInterrupt
+2026-09-08 12:13:57 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 12:13:57 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 12:13:57 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 12:13:57 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=13200): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 12:13:58 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 12:13:58 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 12:13:58 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 12:13:59 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=13200)
+2026-09-08 12:15:19 INFO    [Thread-3 (worker)] it_asset_app: AD helper: launched new subprocess (pid=46452): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 12:15:20 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 12:15:20 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 12:15:20 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 12:15:20 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=46452)
+2026-09-08 12:15:20 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD helper: received lookup request_id='2c4154b5149141468a1a4852ac719aae' emp_id='900290126'
+2026-09-08 12:15:26 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD lookup: starting search for emp_id='900290126' (header_keyword='EmployeeID', name_column='Employee Name')
+2026-09-08 12:15:26 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: filled search textbox OK
+2026-09-08 12:15:26 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: clicked 'View Report' button OK
+2026-09-08 12:15:32 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: results table ready after 5.2s
+2026-09-08 12:15:34 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: raw extracted rows (0): []
+2026-09-08 12:15:34 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: report loaded but 0 usable candidates for emp_id='900290126' (raw rows=0)
+2026-09-08 12:15:34 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD helper: lookup failed for request_id='2c4154b5149141468a1a4852ac719aae' emp_id='900290126'
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1132, in stdin_reader
+    candidates = perform_search(emp_id)
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 998, in perform_search
+    return _perform_ssrs_search(
+        window, emp_id, button_text, header_keyword, name_column, ready_timeout
+    )
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 925, in _perform_ssrs_search
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: The report loaded, but returned no rows for Employee ID '900290126'. Double-check the ID is correct and enabled in AD.
+2026-09-08 12:43:48 INFO    [Thread-5 (worker)] it_asset_app: AD helper: launched new subprocess (pid=2348): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 12:43:50 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 12:43:50 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 12:43:50 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 12:43:50 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=2348)
+2026-09-08 12:43:50 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD helper: received lookup request_id='0fed5f3438914f3d9f4dd9cfadef6ce3' emp_id='900290126'
+2026-09-08 12:43:59 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD lookup: starting search for emp_id='900290126' (header_keyword='EmployeeID', name_column='Employee Name')
+2026-09-08 12:43:59 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: filled search textbox OK
+2026-09-08 12:44:00 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: clicked 'View Report' button OK
+2026-09-08 12:44:04 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: results table ready after 4.4s
+2026-09-08 12:44:06 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: raw extracted rows (0): []
+2026-09-08 12:44:06 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: report loaded but 0 usable candidates for emp_id='900290126' (raw rows=0)
+2026-09-08 12:44:06 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD helper: lookup failed for request_id='0fed5f3438914f3d9f4dd9cfadef6ce3' emp_id='900290126'
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1132, in stdin_reader
+    candidates = perform_search(emp_id)
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 998, in perform_search
+    return _perform_ssrs_search(
+        window, emp_id, button_text, header_keyword, name_column, ready_timeout
+    )
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 925, in _perform_ssrs_search
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: The report loaded, but returned no rows for Employee ID '900290126'. Double-check the ID is correct and enabled in AD.
+2026-09-08 13:08:59 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 13:08:59 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 13:08:59 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 13:09:00 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=40136): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 13:09:01 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 13:09:01 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 13:09:01 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 13:09:01 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=40136)
+2026-09-08 13:09:27 INFO    [Thread-3 (worker)] it_asset_app: AD helper: launched new subprocess (pid=2688): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 13:09:28 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 13:09:28 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 13:09:28 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 13:09:28 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=2688)
+2026-09-08 13:11:37 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 13:11:37 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 13:11:37 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 13:11:38 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=41432): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 13:11:39 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 13:11:39 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 13:11:39 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 13:11:39 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=41432)
+2026-09-08 13:12:04 INFO    [Thread-3 (worker)] it_asset_app: AD helper: launched new subprocess (pid=20624): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-08 13:12:05 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-08 13:12:05 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\app.log
+2026-09-08 13:12:05 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-08 13:12:05 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=20624)
+2026-09-08 13:12:05 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD helper: received lookup request_id='a6633706472a471ca01638f5379f67a2' emp_id='900290126'
+2026-09-08 13:12:12 INFO    [Thread-1 (stdin_reader)] it_asset_app: AD lookup: starting search for emp_id='900290126' (header_keyword='EmployeeID', name_column='Employee Name')
+2026-09-08 13:12:12 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: filled search textbox OK
+2026-09-08 13:12:13 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: clicked 'View Report' button OK
+2026-09-08 13:12:14 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: results table ready after 0.8s
+2026-09-08 13:12:14 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: extracted 1 row(s) via strategy='split-header'; tables seen on page: [{'headers': ['Loading...\nCancel\n\n\n\xa0\t\t\t\xa0\t\t\t\xa0\t\t\n\t\t\t\t\t\tSearch AD for MSID, EmployeeID, or Email Address (one entry per line)\t\n\t\n\t\n\t\t\n\n\n\n\n\t\t\n\t\t\t\tof\t\t0\t\t\n\t\t\n\t\n\t\nPage Width\nWhole Page\n500%\n200%\n150%\n100%\n75%\n50%\n25%\n10%\n\t\n\t\n\t\n\t\tFind\t\t\n\t\t|\t\tNext'], 'rowCount': 1, 'matched': True}, {'headers': ['', 'Loading...\nCancel'], 'rowCount': 1, 'matched': False}, {'headers': ['', '', ''], 'rowCount': 5, 'matched': False}, {'headers': ['Search AD for MSID, EmployeeID, or Email Address (one entry per line)', '', ''], 'rowCount': 1, 'matched': True}, {'headers': ['', '', '', '', '', '', '', '', ''], 'rowCount': 2, 'matched': False}, {'headers': ['', ''], 'rowCount': 1, 'matched': False}, {'headers': ['', '', '', '', '', '', 'of', '', '0', '', '', '', ''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': ['Page Width\nWhole Page\n500%\n200%\n150%\n100%\n75%\n50%\n25%\n10%'], 'rowCount': 1, 'matched': False}, {'headers': ['Word\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tExcel\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tPowerPoint\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tPDF\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tTIFF file\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tMHTML (web archive)\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tCSV (comma delimited)\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tXML file with report data\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tData Feed'], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': ['', '', 'Find', '', '', '', '|', '', 'Next', '', ''], 'rowCount': 1, 'matched': False}]
+2026-09-08 13:12:14 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: raw extracted rows: [{'Loading...\nCancel\n\n\n\xa0\t\t\t\xa0\t\t\t\xa0\t\t\n\t\t\t\t\t\tSearch AD for MSID, EmployeeID, or Email Address (one entry per line)\t\n\t\n\t\n\t\t\n\n\n\n\n\t\t\n\t\t\t\tof\t\t0\t\t\n\t\t\n\t\n\t\nPage Width\nWhole Page\n500%\n200%\n150%\n100%\n75%\n50%\n25%\n10%\n\t\n\t\n\t\n\t\tFind\t\t\n\t\t|\t\tNext': 'Page Width\nWhole Page\n500%\n200%\n150%\n100%\n75%\n50%\n25%\n10%'}]
+2026-09-08 13:12:14 DEBUG   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: mapped fields from row: {'emp_name': '', 'manager_name': '', 'contact_number': '', 'department': '', 'email': '', 'designation': '', 'msid': '', 'employee_id_confirmed': '', 'manager_email': '', 'manager_msid': '', 'manager_employee_id': '', 'account_enabled': ''}
+2026-09-08 13:12:14 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD lookup: report loaded but 0 usable candidates for emp_id='900290126' (raw rows=1, strategy='split-header'). Tables seen on the page were: [{'headers': ['Loading...\nCancel\n\n\n\xa0\t\t\t\xa0\t\t\t\xa0\t\t\n\t\t\t\t\t\tSearch AD for MSID, EmployeeID, or Email Address (one entry per line)\t\n\t\n\t\n\t\t\n\n\n\n\n\t\t\n\t\t\t\tof\t\t0\t\t\n\t\t\n\t\n\t\nPage Width\nWhole Page\n500%\n200%\n150%\n100%\n75%\n50%\n25%\n10%\n\t\n\t\n\t\n\t\tFind\t\t\n\t\t|\t\tNext'], 'rowCount': 1, 'matched': True}, {'headers': ['', 'Loading...\nCancel'], 'rowCount': 1, 'matched': False}, {'headers': ['', '', ''], 'rowCount': 5, 'matched': False}, {'headers': ['Search AD for MSID, EmployeeID, or Email Address (one entry per line)', '', ''], 'rowCount': 1, 'matched': True}, {'headers': ['', '', '', '', '', '', '', '', ''], 'rowCount': 2, 'matched': False}, {'headers': ['', ''], 'rowCount': 1, 'matched': False}, {'headers': ['', '', '', '', '', '', 'of', '', '0', '', '', '', ''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': ['Page Width\nWhole Page\n500%\n200%\n150%\n100%\n75%\n50%\n25%\n10%'], 'rowCount': 1, 'matched': False}, {'headers': ['Word\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tExcel\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tPowerPoint\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tPDF\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tTIFF file\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tMHTML (web archive)\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tCSV (comma delimited)\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tXML file with report data\n\t\t\t\t\t\t\t\t\t\n\t\t\t\t\t\t\t\t\t\tData Feed'], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': [''], 'rowCount': 1, 'matched': False}, {'headers': ['', '', 'Find', '', '', '', '|', '', 'Next', '', ''], 'rowCount': 1, 'matched': False}]
+2026-09-08 13:12:14 ERROR   [Thread-1 (stdin_reader)] it_asset_app: AD helper: lookup failed for request_id='a6633706472a471ca01638f5379f67a2' emp_id='900290126'
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1225, in stdin_reader
+    candidates = perform_search(emp_id)
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1091, in perform_search
+    return _perform_ssrs_search(
+        window, emp_id, button_text, header_keyword, name_column, ready_timeout
+    )
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 1018, in _perform_ssrs_search
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: The report loaded, but returned no rows for Employee ID '900290126'. Double-check the ID is correct and enabled in AD.
+2026-09-08 13:12:57 INFO    [MainThread] it_asset_app: Topaz: capture() starting
+2026-09-08 13:12:57 DEBUG   [Thread-5 (worker)] it_asset_app: Topaz: ProgID 'TOPAZSIGPLUS.SigPlusCtrl.1' failed: (-2147221005, 'Invalid class string', None, None)
+2026-09-08 13:12:57 INFO    [Thread-5 (worker)] it_asset_app: Topaz: connected via ProgID 'SigPlus.SigPlusCtrl.1'
+2026-09-08 13:12:57 DEBUG   [Thread-5 (worker)] it_asset_app: Topaz: control exposes: ['AboutBox', 'AddSerialByte', 'Annotate', 'AsciiDataMode', 'AutoKeyAddData', 'AutoKeyData', 'AutoKeyFinish', 'AutoKeyStart', 'AutoTimeStamp', 'BackColor', 'BackgroundHandle', 'BitMapBufferByte', 'BitMapBufferClose', 'BitMapBufferSize', 'BitMapBufferWrite', 'BitmapHandle', 'Buffer', 'ByteIndex', 'ClearSigWindow', 'ClearTablet', 'CmdCount', 'CmdData', 'CmdString', 'CoordToUse', 'Coords', 'Data', 'Dest', 'DisableMessageBoxes', 'DisableTabletCapture', 'DisplayAnnotate', 'DisplayAnnotatePosX', 'DisplayAnnotatePosY', 'DisplayAnnotateSize', 'DisplayMode', 'DisplayPenWidth', 'DisplayRotate', 'DisplayRotateSave', 'DisplayTimeStamp', 'DisplayTimeStampPosX', 'DisplayTimeStampPosY', 'DisplayTimeStampSize', 'DisplayWindowRes', 'Enable', 'EnableTabletCapture', 'EnableTabletEncryption', 'EncryptionMode', 'EventMask', 'ExportSigFile', 'FaceName', 'Factor', 'FileName', 'FinalFactor', 'FitToWindow', 'ForeColor', 'Format', 'GetBadPointCounter', 'GetBitmapBufferBytes', 'GetEventEnableMask', 'GetImageScreenResolution', 'GetKey', 'GetKeyReceipt', 'GetKeyReceiptAscii', 'GetLCDSize', 'GetLCDStringSize', 'GetNumPointsForStroke', 'GetNumberOfAttachedTablets', 'GetNumberOfHotSpotPoints', 'GetNumberOfStrokes', 'GetOposPointArray', 'GetOposTotalPoints', 'GetPointPValue', 'GetPointTValue', 'GetPointXValue', 'GetPointYValue', 'GetSavePressureData', 'GetSaveTimeData', 'GetSerialNumberToUse', 'GetSigData', 'GetSigPlusVersionString', 'GetSigReceipt', 'GetSigReceiptAscii', 'GetTabletModelNumber', 'GetTabletPortPath', 'GetTabletSerialNumber', 'GetTrackGemField', 'GreyGain', 'GreyOffset', 'Height', 'HexString', 'HighlightPoint', 'HighlightStroke', 'HostMode', 'IPAddress', 'ImageAnnotate', 'ImageAnnotatePosX', 'ImageAnnotatePosY', 'ImageAnnotateSize', 'ImageFileFormat', 'ImageFileName', 'ImagePenWidth', 'ImageTimeStamp', 'ImageTimeStampPosX', 'ImageTimeStampPosY', 'ImageTimeStampSize', 'ImageXSize', 'ImageYSize', 'ImportSigFile', 'Index', 'InitSigPlus', 'Inside', 'Italic', 'JustifyMode', 'JustifyX', 'JustifyY', 'KeyCode', 'KeyData', 'KeyPadAddHotSpot', 'KeyPadClearHotSpotList', 'KeyPadEnableTapOnly', 'KeyPadQueryHotSpot', 'KeyString', 'LCDCaptureMode', 'LCDCompEnable', 'LCDCompFast', 'LCDCompMode', 'LCDCompSlow', 'LCDCreateImage', 'LCDPlayVideo', 'LCDRefresh', 'LCDSendCmdString', 'LCDSendCommandData', 'LCDSendImage', 'LCDSetFont', 'LCDSetTabletMap', 'LCDSetWindow', 'LCDStopVideo', 'LCDTiffAdd', 'LCDTiffStart', 'LCDTiffWrite', 'LCDType', 'LCDWriteBitmap', 'LCDWriteFile', 'LCDWriteString', 'LCDWriteStringToImage', 'LCDWriteWindowedBitmap', 'LCDXSize', 'LCDXStart', 'LCDXStop', 'LCDYSize', 'LCDYStart', 'LCDYStop', 'LCDZCompMode', 'LineScale', 'LoadTrackGemSig', 'LogEnable', 'LogFilePath', 'MapPoints', 'Message', 'Mode', 'NewPath', 'NewPixelDepth', 'NewPortPath', 'NewValue', 'NumberOfTabletPoints', 'Offset', 'OpaqueMode', 'Param', 'PitchAndFamily', 'PointArray', 'PointIdx', 'PointNumber', 'PortNumber', 'ReplayMode', 'RetryCount', 'ReturnCount', 'SaveSigInfo', 'SerialByte', 'SetAntiAliasEnable', 'SetAntiAliasParameters', 'SetBackground', 'SetBackgroundHandle', 'SetDisplayAnnotateData', 'SetDisplayTimeStampData', 'SetDynamicPressure', 'SetEnableColor', 'SetEventEnableMask', 'SetGreyScaleParams', 'SetIPAddress', 'SetImageAnnotateData', 'SetImageScreenResolution', 'SetImageTimeStampData', 'SetKey', 'SetLCDCompression', 'SetLCDCompressionParameters', 'SetLCDPixelDepth', 'SetLCDRetryCount', 'SetLCDTransferDelay', 'SetLCDTransferSize', 'SetLCDType', 'SetLocalIniFilePath', 'SetLogEnable', 'SetLogFilePath', 'SetMultiUsbEnable', 'SetPressureMap', 'SetPressureMapPoints', 'SetSavePressureData', 'SetSaveTimeData', 'SetSerialNumberToUse', 'SetSigData', 'SetSigSocketPort', 'SetSigWindow', 'SetSpecialCloseDelay', 'SetTabletEncryptionModes', 'SetTabletPortPath', 'SetTranslateBitmapEnable', 'SetUseSHA2Hash', 'SetWMFTempPath', 'SigCompressionMode', 'SigData', 'SigMessage', 'SigSetFont', 'SigString', 'Size', 'SpotSize', 'State', 'Str', 'StrokeIdx', 'StrokeNumber', 'TabletBaudRate', 'TabletClippingMode', 'TabletComPort', 'TabletComTest', 'TabletConnectQuery', 'TabletFilterPoints', 'TabletGraphic', 'TabletGraphicFile', 'TabletIndex', 'TabletInvisible', 'TabletLCDMode', 'TabletLogicalXSize', 'TabletLogicalYSize', 'TabletMode', 'TabletModelNumber', 'TabletResolution', 'TabletRotation', 'TabletSerialNumber', 'TabletState', 'TabletText', 'TabletTextFile', 'TabletTimer', 'TabletTimingAdvance', 'TabletType', 'TabletXStart', 'TabletXStop', 'TabletYStart', 'TabletYStop', 'TestFunction', 'TimeOut', 'TimeStamp', 'TransferDelay', 'TransferSize', 'Underline', 'Value', 'Velocity0', 'VelocityRange', 'VideoNumber', 'Weight', 'Width', 'WriteImageFile', 'X', 'XPos', 'XSize', 'Y', 'YPos', 'YSize', 'ZoomPower', 'ZoomX', 'ZoomY']
+2026-09-08 13:12:57 DEBUG   [Thread-5 (worker)] it_asset_app: Topaz: arming the pad (hwnd=1578118)
+2026-09-08 13:12:59 ERROR   [Thread-5 (worker)] it_asset_app: Topaz: failed to connect/arm the pad
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 2294, in worker
+    self._set_tablet_state(sig, 1, hwnd)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 2200, in _set_tablet_state
+    raise TopazNotAvailable(
+    ...<2 lines>...
+    )
+TopazNotAvailable: This SigPlus build did not accept any known way of turning the pad on/off. Tried - SetTabletState(state, hwnd): SigPlus.SigPlusCtrl.1.SetTabletState | SetTabletState(state): SigPlus.SigPlusCtrl.1.SetTabletState | TabletState property: TabletState did not stick (wrote 1, read back 0)
+2026-09-08 13:12:59 WARNING [MainThread] it_asset_app: Topaz pad not available, falling back to on-screen signing: Topaz pad did not respond (This SigPlus build did not accept any known way of turning the pad on/off. Tried - SetTabletState(state, hwnd): SigPlus.SigPlusCtrl.1.SetTabletState | SetTabletState(state): SigPlus.SigPlusCtrl.1.SetTabletState | TabletState property: TabletState did not stick (wrote 1, read back 0)).
+2026-09-08 13:13:30 INFO    [MainThread] it_asset_app: Topaz: capture() starting
+2026-09-08 13:13:30 DEBUG   [Thread-7 (worker)] it_asset_app: Topaz: ProgID 'TOPAZSIGPLUS.SigPlusCtrl.1' failed: (-2147221005, 'Invalid class string', None, None)
+2026-09-08 13:13:30 INFO    [Thread-7 (worker)] it_asset_app: Topaz: connected via ProgID 'SigPlus.SigPlusCtrl.1'
+2026-09-08 13:13:30 DEBUG   [Thread-7 (worker)] it_asset_app: Topaz: control exposes: ['AboutBox', 'AddSerialByte', 'Annotate', 'AsciiDataMode', 'AutoKeyAddData', 'AutoKeyData', 'AutoKeyFinish', 'AutoKeyStart', 'AutoTimeStamp', 'BackColor', 'BackgroundHandle', 'BitMapBufferByte', 'BitMapBufferClose', 'BitMapBufferSize', 'BitMapBufferWrite', 'BitmapHandle', 'Buffer', 'ByteIndex', 'ClearSigWindow', 'ClearTablet', 'CmdCount', 'CmdData', 'CmdString', 'CoordToUse', 'Coords', 'Data', 'Dest', 'DisableMessageBoxes', 'DisableTabletCapture', 'DisplayAnnotate', 'DisplayAnnotatePosX', 'DisplayAnnotatePosY', 'DisplayAnnotateSize', 'DisplayMode', 'DisplayPenWidth', 'DisplayRotate', 'DisplayRotateSave', 'DisplayTimeStamp', 'DisplayTimeStampPosX', 'DisplayTimeStampPosY', 'DisplayTimeStampSize', 'DisplayWindowRes', 'Enable', 'EnableTabletCapture', 'EnableTabletEncryption', 'EncryptionMode', 'EventMask', 'ExportSigFile', 'FaceName', 'Factor', 'FileName', 'FinalFactor', 'FitToWindow', 'ForeColor', 'Format', 'GetBadPointCounter', 'GetBitmapBufferBytes', 'GetEventEnableMask', 'GetImageScreenResolution', 'GetKey', 'GetKeyReceipt', 'GetKeyReceiptAscii', 'GetLCDSize', 'GetLCDStringSize', 'GetNumPointsForStroke', 'GetNumberOfAttachedTablets', 'GetNumberOfHotSpotPoints', 'GetNumberOfStrokes', 'GetOposPointArray', 'GetOposTotalPoints', 'GetPointPValue', 'GetPointTValue', 'GetPointXValue', 'GetPointYValue', 'GetSavePressureData', 'GetSaveTimeData', 'GetSerialNumberToUse', 'GetSigData', 'GetSigPlusVersionString', 'GetSigReceipt', 'GetSigReceiptAscii', 'GetTabletModelNumber', 'GetTabletPortPath', 'GetTabletSerialNumber', 'GetTrackGemField', 'GreyGain', 'GreyOffset', 'Height', 'HexString', 'HighlightPoint', 'HighlightStroke', 'HostMode', 'IPAddress', 'ImageAnnotate', 'ImageAnnotatePosX', 'ImageAnnotatePosY', 'ImageAnnotateSize', 'ImageFileFormat', 'ImageFileName', 'ImagePenWidth', 'ImageTimeStamp', 'ImageTimeStampPosX', 'ImageTimeStampPosY', 'ImageTimeStampSize', 'ImageXSize', 'ImageYSize', 'ImportSigFile', 'Index', 'InitSigPlus', 'Inside', 'Italic', 'JustifyMode', 'JustifyX', 'JustifyY', 'KeyCode', 'KeyData', 'KeyPadAddHotSpot', 'KeyPadClearHotSpotList', 'KeyPadEnableTapOnly', 'KeyPadQueryHotSpot', 'KeyString', 'LCDCaptureMode', 'LCDCompEnable', 'LCDCompFast', 'LCDCompMode', 'LCDCompSlow', 'LCDCreateImage', 'LCDPlayVideo', 'LCDRefresh', 'LCDSendCmdString', 'LCDSendCommandData', 'LCDSendImage', 'LCDSetFont', 'LCDSetTabletMap', 'LCDSetWindow', 'LCDStopVideo', 'LCDTiffAdd', 'LCDTiffStart', 'LCDTiffWrite', 'LCDType', 'LCDWriteBitmap', 'LCDWriteFile', 'LCDWriteString', 'LCDWriteStringToImage', 'LCDWriteWindowedBitmap', 'LCDXSize', 'LCDXStart', 'LCDXStop', 'LCDYSize', 'LCDYStart', 'LCDYStop', 'LCDZCompMode', 'LineScale', 'LoadTrackGemSig', 'LogEnable', 'LogFilePath', 'MapPoints', 'Message', 'Mode', 'NewPath', 'NewPixelDepth', 'NewPortPath', 'NewValue', 'NumberOfTabletPoints', 'Offset', 'OpaqueMode', 'Param', 'PitchAndFamily', 'PointArray', 'PointIdx', 'PointNumber', 'PortNumber', 'ReplayMode', 'RetryCount', 'ReturnCount', 'SaveSigInfo', 'SerialByte', 'SetAntiAliasEnable', 'SetAntiAliasParameters', 'SetBackground', 'SetBackgroundHandle', 'SetDisplayAnnotateData', 'SetDisplayTimeStampData', 'SetDynamicPressure', 'SetEnableColor', 'SetEventEnableMask', 'SetGreyScaleParams', 'SetIPAddress', 'SetImageAnnotateData', 'SetImageScreenResolution', 'SetImageTimeStampData', 'SetKey', 'SetLCDCompression', 'SetLCDCompressionParameters', 'SetLCDPixelDepth', 'SetLCDRetryCount', 'SetLCDTransferDelay', 'SetLCDTransferSize', 'SetLCDType', 'SetLocalIniFilePath', 'SetLogEnable', 'SetLogFilePath', 'SetMultiUsbEnable', 'SetPressureMap', 'SetPressureMapPoints', 'SetSavePressureData', 'SetSaveTimeData', 'SetSerialNumberToUse', 'SetSigData', 'SetSigSocketPort', 'SetSigWindow', 'SetSpecialCloseDelay', 'SetTabletEncryptionModes', 'SetTabletPortPath', 'SetTranslateBitmapEnable', 'SetUseSHA2Hash', 'SetWMFTempPath', 'SigCompressionMode', 'SigData', 'SigMessage', 'SigSetFont', 'SigString', 'Size', 'SpotSize', 'State', 'Str', 'StrokeIdx', 'StrokeNumber', 'TabletBaudRate', 'TabletClippingMode', 'TabletComPort', 'TabletComTest', 'TabletConnectQuery', 'TabletFilterPoints', 'TabletGraphic', 'TabletGraphicFile', 'TabletIndex', 'TabletInvisible', 'TabletLCDMode', 'TabletLogicalXSize', 'TabletLogicalYSize', 'TabletMode', 'TabletModelNumber', 'TabletResolution', 'TabletRotation', 'TabletSerialNumber', 'TabletState', 'TabletText', 'TabletTextFile', 'TabletTimer', 'TabletTimingAdvance', 'TabletType', 'TabletXStart', 'TabletXStop', 'TabletYStart', 'TabletYStop', 'TestFunction', 'TimeOut', 'TimeStamp', 'TransferDelay', 'TransferSize', 'Underline', 'Value', 'Velocity0', 'VelocityRange', 'VideoNumber', 'Weight', 'Width', 'WriteImageFile', 'X', 'XPos', 'XSize', 'Y', 'YPos', 'YSize', 'ZoomPower', 'ZoomX', 'ZoomY']
+2026-09-08 13:13:30 DEBUG   [Thread-7 (worker)] it_asset_app: Topaz: arming the pad (hwnd=1578118)
+2026-09-08 13:13:30 DEBUG   [Thread-7 (worker)] it_asset_app: Topaz: tablet state set to 1 via TabletState property
+2026-09-08 13:13:30 INFO    [Thread-7 (worker)] it_asset_app: Topaz: pad armed OK
+2026-09-08 13:13:32 INFO    [Thread-7 (worker)] it_asset_app: Topaz: NumberOfTabletPoints=<bound method NumberOfTabletPoints of <COMObject SigPlus.SigPlusCtrl.1>> after Accept
+2026-09-08 13:13:32 ERROR   [Thread-7 (worker)] it_asset_app: Topaz: could not read captured signature
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 2315, in worker
+    if points < 1:
+       ^^^^^^^^^^
+TypeError: '<' not supported between instances of 'method' and 'int'
+2026-09-08 13:13:32 DEBUG   [Thread-7 (worker)] it_asset_app: Topaz: tablet state set to 0 via TabletState property
+2026-09-08 13:13:32 DEBUG   [Thread-7 (worker)] it_asset_app: Topaz: pad disarmed OK
+2026-09-08 13:13:32 ERROR   [MainThread] it_asset_app: Topaz: capture failed: Could not read the captured signature ('<' not supported between instances of 'method' and 'int').
+2026-09-08 13:13:32 WARNING [MainThread] it_asset_app: Topaz pad not available, falling back to on-screen signing: Could not read the captured signature ('<' not supported between instances of 'method' and 'int').
