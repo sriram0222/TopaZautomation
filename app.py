@@ -750,6 +750,28 @@ function __mapRow(headers, cellTexts) {
     return obj;
 }
 
+// A real results header row looks like "EmployeeID | Employee Name |
+// Manager Name | ..." - several SHORT column labels. It is NOT a single
+// cell containing a wall of concatenated text. That distinction matters
+// because the ReportViewer's own toolbar/chrome (the "Search AD for
+// MSID, EmployeeID, or Email Address" label, the zoom/export dropdowns,
+// the page-count widget, "Loading...") also renders as <table> markup on
+// the page, and that descriptive label text happens to CONTAIN the
+// header keyword ("EmployeeID") as a substring - so without this guard
+// the toolbar itself gets mistaken for the results table, especially in
+// the first instant after clicking "View Report" while the real report
+// is still loading. That produced a report that looked "ready" after
+// well under a second and then extracted zero real rows - for an
+// employee who was genuinely in AD - because it was reading the
+// toolbar, not the results.
+function __looksLikeHeaderRow(headers) {
+    if (headers.length < 2) return false;
+    for (var i = 0; i < headers.length; i++) {
+        if (!headers[i] || headers[i].length > 120) return false;
+    }
+    return true;
+}
+
 function __scanTables(headerKeyword) {
     var lower = String(headerKeyword).toLowerCase();
     var docs = __collectDocs();
@@ -760,8 +782,10 @@ function __scanTables(headerKeyword) {
             var t = tables[j];
             var headers = __rowTexts(t.rows[0]);
             var matched = false;
-            for (var k = 0; k < headers.length; k++) {
-                if (headers[k].toLowerCase().indexOf(lower) !== -1) { matched = true; break; }
+            if (__looksLikeHeaderRow(headers)) {
+                for (var k = 0; k < headers.length; k++) {
+                    if (headers[k].toLowerCase().indexOf(lower) !== -1) { matched = true; break; }
+                }
             }
             all.push({ table: t, headers: headers, matched: matched,
                        rowCount: t.rows ? t.rows.length : 0 });
@@ -1670,6 +1694,7 @@ def insert_controls(source_docx_path, output_docx_path, placeholder_image_path):
     document's layout doesn't match closely enough - this is surfaced
     directly to the person uploading the template.
     """
+    logger.info("insert_controls: starting for %r -> %r", source_docx_path, output_docx_path)
     with tempfile.TemporaryDirectory() as tmp:
         unpack_dir = os.path.join(tmp, "unpacked")
         with zipfile.ZipFile(source_docx_path) as z:
@@ -1677,6 +1702,7 @@ def insert_controls(source_docx_path, output_docx_path, placeholder_image_path):
 
         doc_xml_path = os.path.join(unpack_dir, "word", "document.xml")
         if not os.path.exists(doc_xml_path):
+            logger.error("insert_controls: %r is not a valid .docx (no word/document.xml)", source_docx_path)
             raise ControlInsertionError("This doesn't look like a valid .docx file.")
 
         with open(doc_xml_path, encoding="utf-8") as f:
@@ -1726,6 +1752,7 @@ def insert_controls(source_docx_path, output_docx_path, placeholder_image_path):
                     arcname = os.path.relpath(full, unpack_dir)
                     zf.write(full, arcname)
 
+    logger.info("insert_controls: SUCCESS -> %r", output_docx_path)
     return output_docx_path
 
 
@@ -1794,6 +1821,11 @@ def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, 
         the exported PDF visually show both signatures before the
         cryptographic signing step (sign_pdf_with_signatures) runs on it.
     """
+    logger.info(
+        "fill_docx: starting for %r -> %r (fields=%d, checked_tags=%r, signatures=%r)",
+        fillable_docx_path, output_docx_path, len(field_values), sorted(checked_tags),
+        {k: bool(v) for k, v in signature_images.items()},
+    )
     with tempfile.TemporaryDirectory() as tmp:
         unpack_dir = os.path.join(tmp, "unpacked")
         with zipfile.ZipFile(fillable_docx_path) as z:
@@ -1863,6 +1895,7 @@ def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, 
                     arcname = os.path.relpath(full, unpack_dir)
                     zf.write(full, arcname)
 
+    logger.info("fill_docx: SUCCESS -> %r", output_docx_path)
     return output_docx_path
 
 
@@ -1964,9 +1997,12 @@ def convert_docx_to_pdf_via_word(docx_path, pdf_path):
     scripted, so the exported page looks exactly like the real form. Needs
     Word installed on this machine. Adobe Acrobat is never involved.
     """
+    logger.info("Word export: starting for %r -> %r", docx_path, pdf_path)
+    start_time = time.time()
     try:
         import win32com.client as win32
     except ImportError as exc:
+        logger.error("Word export: pywin32 isn't installed")
         raise WordConversionError(
             "pywin32 isn't installed. Run: pip install pywin32"
         ) from exc
@@ -1980,15 +2016,19 @@ def convert_docx_to_pdf_via_word(docx_path, pdf_path):
     word = None
     doc = None
     try:
+        logger.debug("Word export: launching Word.Application (DispatchEx)")
         word = win32.DispatchEx("Word.Application")
         word.Visible = False
         try:
             word.DisplayAlerts = 0
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Word export: could not set DisplayAlerts=0 (%s)", exc)
+        logger.debug("Word export: opening %r", docx_abspath)
         doc = word.Documents.Open(docx_abspath, ReadOnly=True)
+        logger.debug("Word export: saving as PDF -> %r", pdf_abspath)
         doc.SaveAs(pdf_abspath, FileFormat=17)  # wdFormatPDF
     except Exception as exc:
+        logger.exception("Word export: FAILED after %.1fs", time.time() - start_time)
         raise WordConversionError(
             f"Could not convert the filled document to PDF using Microsoft Word: {exc}\n"
             "Make sure Microsoft Word is installed on this machine."
@@ -1998,18 +2038,23 @@ def convert_docx_to_pdf_via_word(docx_path, pdf_path):
             if doc is not None:
                 doc.Close(False)
         except Exception:
-            pass
+            logger.debug("Word export: doc.Close() failed (non-fatal)", exc_info=True)
         try:
             if word is not None:
                 word.Quit()
         except Exception:
-            pass
+            logger.debug("Word export: word.Quit() failed (non-fatal)", exc_info=True)
 
     if not os.path.exists(pdf_abspath):
+        logger.error(
+            "Word export: Word reported success but %r does not exist (elapsed %.1fs)",
+            pdf_abspath, time.time() - start_time,
+        )
         raise WordConversionError(
             "Word reported success but no PDF file was produced - try again, "
             "or check no other Word window is blocking a dialog."
         )
+    logger.info("Word export: SUCCESS -> %r (%.1fs)", pdf_abspath, time.time() - start_time)
     return pdf_abspath
 
 
@@ -2163,6 +2208,27 @@ class TopazSigner:
             return f"<could not enumerate control API: {exc}>"
 
     @staticmethod
+    def _call_or_get(sig, name):
+        """Reads a COM member that might be exposed as a plain property
+        OR as a zero-arg method, depending on how this particular
+        ActiveX build's type library declares it.
+
+        Confirmed in the field: on the office laptop's SigPlus build,
+        `sig.NumberOfTabletPoints` does not return a number - pywin32's
+        dynamic dispatch hands back a bound method object instead
+        (because that build's type library declares it as a callable
+        member, not a property-get), so `points < 1` blew up with
+        "'<' not supported between instances of 'method' and 'int'".
+        Calling it (`sig.NumberOfTabletPoints()`) is what actually reads
+        the value on that build. This helper does whichever is correct
+        for whatever gets passed to it, so the same code works across
+        SigPlus builds that expose a given member either way."""
+        value = getattr(sig, name)
+        if callable(value):
+            value = value()
+        return value
+
+    @staticmethod
     def _set_tablet_state(sig, value, hwnd):
         """Arms (value=1) or disarms (value=0) the pad, whichever way
         this particular SigPlus build wants it. Returns the name of the
@@ -2176,7 +2242,7 @@ class TopazSigner:
         def _set_property():
             setattr(sig, "TabletState", value)
             try:
-                readback = sig.TabletState
+                readback = TopazSigner._call_or_get(sig, "TabletState")
             except Exception:
                 return  # can't read it back; assume the put worked
             if readback != value:
@@ -2208,9 +2274,9 @@ class TopazSigner:
         control offers SigImageB64, else None (caller falls back to the
         file-based route)."""
         try:
-            value = sig.SigImageB64
+            value = TopazSigner._call_or_get(sig, "SigImageB64")
             if value:
-                logger.debug("Topaz: read signature via SigImageB64 property")
+                logger.debug("Topaz: read signature via SigImageB64")
                 return value
         except Exception as exc:
             logger.debug("Topaz: SigImageB64 not available (%s)", exc)
@@ -2228,7 +2294,10 @@ class TopazSigner:
                 ("ImageXSize", 500),
                 ("ImageYSize", 150),
                 ("ImagePenWidth", 2),
-                ("ImageJustifyMode", 5),
+                ("JustifyMode", 5),          # NOT "ImageJustifyMode" - that name
+                                              # doesn't exist on real SigPlus builds
+                                              # (confirmed against the office
+                                              # laptop's control API listing)
                 ("ImageFileName", out_path),
             ):
                 try:
@@ -2310,7 +2379,18 @@ class TopazSigner:
             if sig is not None:
                 if outcome["accepted"]:
                     try:
-                        points = sig.NumberOfTabletPoints
+                        # NOT a plain attribute read - on the office
+                        # laptop's SigPlus build, NumberOfTabletPoints is
+                        # exposed as a zero-arg METHOD, not a property,
+                        # and `sig.NumberOfTabletPoints` alone silently
+                        # returns a bound-method object rather than a
+                        # number. That made `points < 1` blow up with
+                        # "'<' not supported between instances of
+                        # 'method' and 'int'" and get miscounted as a
+                        # captured-signature read failure. _call_or_get
+                        # calls it if it's callable, reads it directly
+                        # otherwise - works for both SigPlus shapes.
+                        points = self._call_or_get(sig, "NumberOfTabletPoints")
                         logger.info("Topaz: NumberOfTabletPoints=%s after Accept", points)
                         if points < 1:
                             outcome["error"] = TopazNotAvailable("No signature was captured on the pad.")
@@ -2429,16 +2509,22 @@ class SignatureService:
         self.topaz_signer = TopazSigner(config_data.get("topaz_progid_options"))
 
     def capture(self, parent, title="Sign here"):
-        if self.config_data.get("use_topaz_pad", False):
+        use_topaz = self.config_data.get("use_topaz_pad", False)
+        logger.info("SignatureService.capture: use_topaz_pad=%s, title=%r", use_topaz, title)
+        if use_topaz:
             try:
-                return self.topaz_signer.capture(parent, title)
+                path = self.topaz_signer.capture(parent, title)
+                logger.info("SignatureService.capture: Topaz path returned %r", path)
+                return path
             except TopazNotAvailable as exc:
                 logger.warning("Topaz pad not available, falling back to on-screen signing: %s", exc)
                 messagebox.showwarning(
                     "Topaz pad not available",
                     f"{exc}\n\nFalling back to on-screen signature capture.",
                 )
-        return self.canvas_signer.capture(parent, title)
+        path = self.canvas_signer.capture(parent, title)
+        logger.info("SignatureService.capture: on-screen canvas path returned %r", path)
+        return path
 
 
 # ============================================================================
@@ -2625,12 +2711,19 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
     template was built without them), each field falls back to the old
     invisible (no on-page box) behavior so signing still succeeds.
     """
+    logger.info(
+        "Signing: starting for %r -> %r (%d signature field(s): %r)",
+        input_pdf_path, output_pdf_path, len(signatures),
+        [s.get("field_name") for s in signatures],
+    )
+    start_time = time.time()
     try:
         from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
         from pyhanko.sign import signers
         from pyhanko.sign.fields import SigFieldSpec
         from pyhanko.stamp import StaticStampStyle
     except ImportError as exc:
+        logger.error("Signing: pyhanko/cryptography aren't installed")
         raise SigningError(
             "The 'pyhanko' library (and 'cryptography') aren't installed. Run:\n"
             "    pip install pyhanko cryptography"
@@ -2640,6 +2733,7 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
     try:
         signer = signers.SimpleSigner.load(key_path, cert_path, key_passphrase=None)
     except Exception as exc:
+        logger.exception("Signing: could not load the signing certificate")
         raise SigningError(f"Could not load this app's signing certificate: {exc}") from exc
 
     # Boxes are detected once, from the original unsigned PDF - the page's
@@ -2648,6 +2742,7 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
     # objects get appended. Order matches `signatures` (Employee first,
     # then Asset Receiver), same as the top-to-bottom layout on the page.
     signature_boxes = _find_signature_field_boxes(input_pdf_path)
+    logger.debug("Signing: detected %d on-page signature box(es)", len(signature_boxes))
 
     os.makedirs(os.path.dirname(output_pdf_path) or ".", exist_ok=True)
     current_input = input_pdf_path
@@ -2680,10 +2775,15 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
                 )
                 with open(step_output, "wb") as outf:
                     pdf_signer.sign_pdf(writer, output=outf)
+            logger.debug(
+                "Signing: applied field %r (box=%r) -> %r",
+                sig["field_name"], box, step_output,
+            )
             if not is_last:
                 step_files.append(step_output)
             current_input = step_output
     except Exception as exc:
+        logger.exception("Signing: FAILED after %.1fs", time.time() - start_time)
         raise SigningError(f"Could not apply the cryptographic signature: {exc}") from exc
     finally:
         for f in step_files:
@@ -2692,6 +2792,7 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
             except OSError:
                 pass
 
+    logger.info("Signing: SUCCESS -> %r (%.1fs)", output_pdf_path, time.time() - start_time)
     return output_pdf_path
 
 
@@ -2789,6 +2890,12 @@ class WizardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.config_data = copy.deepcopy(CONFIG)  # settings live at the top of this file
+        logger.info(
+            "WizardApp: starting up. ad_lookup_mode=%r use_topaz_pad=%r bu_templates_folder=%r",
+            self.config_data.get("ad_lookup_mode"),
+            self.config_data.get("use_topaz_pad"),
+            self.config_data.get("bu_templates_folder"),
+        )
         self.browser_session = BrowserLookupSession()
         self.signature_service = SignatureService(self.config_data)
 
@@ -2808,6 +2915,8 @@ class WizardApp(tk.Tk):
 
         if _uses_webview_lookup(self.config_data):
             threading.Thread(target=self.browser_session.start, daemon=True).start()
+
+        logger.info("WizardApp: GUI ready")
 
     # ------------------------------------------------------------ shell
     def _build_shell(self):
@@ -2851,6 +2960,7 @@ class WizardApp(tk.Tk):
     def _refresh_bu_combos(self):
         self._bu_templates_cache = list_templates(_resolve_path(self.config_data, "bu_templates_folder", "bu_templates"))
         names = [t["name"] for t in self._bu_templates_cache]
+        logger.info("BU templates: loaded %d template(s): %r", len(names), names)
         if hasattr(self, "bu_combo"):
             self.bu_combo.config(values=names)
         if hasattr(self, "bulk_bu_combo"):
@@ -3343,11 +3453,17 @@ class WizardApp(tk.Tk):
         return True
 
     def _on_generate(self):
+        logger.info(
+            "Generate clicked: emp_id=%r bu=%r submission_type=%r",
+            self.emp_id_var.get().strip(), self.bu_var.get(), self.submission_type_var.get(),
+        )
         if not self._validate_form():
+            logger.info("Generate: form validation failed, stopping")
             return
 
         chosen_bu = next((t for t in self._bu_templates_cache if t["name"] == self.bu_var.get()), None)
         if not chosen_bu:
+            logger.error("Generate: chosen Business Unit %r not found in template cache", self.bu_var.get())
             messagebox.showerror("Business Unit error", "The selected Business Unit template could not be found - pick it again.")
             return
         bu_fillable_docx_path = chosen_bu["fillable_path"]
@@ -4076,8 +4192,13 @@ class WizardApp(tk.Tk):
     def _batch_save_and_complete(self):
         index = self._batch_active_index
         item = self.batch_queue[index]
+        logger.info(
+            "Batch generate clicked: index=%d emp_id=%r bu=%r",
+            index, item.get("employee_id"), getattr(self, "bulk_bu_var", None) and self.bulk_bu_var.get(),
+        )
         bu_match = self._batch_validate_active()
         if not bu_match:
+            logger.info("Batch generate: validation failed for index=%d, stopping", index)
             return
 
         today_str = date.today().strftime("%d-%b-%Y")
@@ -4192,11 +4313,13 @@ class WizardApp(tk.Tk):
 
     # ------------------------------------------------------------ close
     def _on_close(self):
+        logger.info("WizardApp: closing (user closed the window)")
         try:
             self.browser_session.shutdown()
         except Exception:
-            pass
+            logger.debug("WizardApp: browser_session.shutdown() failed (non-fatal)", exc_info=True)
         self.destroy()
+        logger.info("WizardApp: closed")
 
 
 
