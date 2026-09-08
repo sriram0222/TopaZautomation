@@ -3516,11 +3516,23 @@ class WizardApp(tk.Tk):
         def show_preview(path):
             try:
                 img = Image.open(path)
+                img.load()
+                # Topaz pads classically write 1-bit monochrome or
+                # palette bitmaps (ImageFileFormat/JustifyMode etc. don't
+                # control this) - ImageTk.PhotoImage can render those as
+                # blank/black instead of raising, which would make the
+                # preview look "not showing" with no error anywhere.
+                # Normalizing to RGB first is cheap and makes the
+                # thumbnail render correctly regardless of the source mode.
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGB")
                 img.thumbnail((280, 110))
                 photo = ImageTk.PhotoImage(img)
                 self._sig_preview_image[data_key] = photo  # keep a reference alive
-                preview_label.config(image=photo, text="")
+                preview_label.image = photo  # belt-and-suspenders against GC
+                preview_label.config(image=photo, text="", compound="image")
             except Exception:
+                logger.exception("Signature preview: could not render thumbnail for %s (%s)", data_key, path)
                 preview_label.config(text="(signature captured)")
 
         existing_path = self._signature_paths.get(data_key)
@@ -4180,11 +4192,20 @@ class WizardApp(tk.Tk):
         def show_preview(path):
             try:
                 img = Image.open(path)
+                img.load()
+                # See the matching comment in _build_signature_section -
+                # normalize away from 1-bit/palette modes a Topaz pad's
+                # bitmap can come in as, so the thumbnail actually
+                # renders instead of showing up blank with no error.
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGB")
                 img.thumbnail((280, 110))
                 photo = ImageTk.PhotoImage(img)
                 self.b_sig_preview_image[data_key] = photo
-                preview_label.config(image=photo, text="")
+                preview_label.image = photo  # belt-and-suspenders against GC
+                preview_label.config(image=photo, text="", compound="image")
             except Exception:
+                logger.exception("Signature preview (bulk): could not render thumbnail for %s (%s)", data_key, path)
                 preview_label.config(text="(signature captured)")
 
         def sign_now():
