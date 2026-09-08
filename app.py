@@ -690,16 +690,36 @@ def _send(obj):
 
 _JS_COLLECT_DOCS = """
 function __collectDocs() {
+    // Walks the ENTIRE iframe tree, not just the top document's direct
+    // children. The real SSRS/ReportViewer page nests iframes at least
+    // two deep - a report-frame iframe hangs off the main page (that's
+    // where the parameter textbox and "View Report" button live), and
+    // the actual results table renders inside a SEPARATE iframe nested
+    // inside THAT one. A one-level-only walk finds the textbox/button
+    // fine (both are one level down) but never sees the results table
+    // at all - which is exactly what field evidence showed: a screen
+    // recording with the real row plainly visible on screen, while the
+    // app timed out never finding a single matching table. A depth cap
+    // guards against a pathological/circular frame tree.
     var docs = [document];
-    try {
-        var iframes = document.querySelectorAll('iframe');
-        for (var i = 0; i < iframes.length; i++) {
-            try {
-                var d = iframes[i].contentDocument;
-                if (d) docs.push(d);
-            } catch (e) { /* cross-origin iframe, skip */ }
-        }
-    } catch (e) {}
+    var seen = new Set();
+    function walk(doc, depth) {
+        if (!doc || depth > 6 || seen.has(doc)) return;
+        seen.add(doc);
+        try {
+            var iframes = doc.querySelectorAll('iframe, frame');
+            for (var i = 0; i < iframes.length; i++) {
+                try {
+                    var d = iframes[i].contentDocument;
+                    if (d && !seen.has(d)) {
+                        docs.push(d);
+                        walk(d, depth + 1);
+                    }
+                } catch (e) { /* cross-origin iframe, skip */ }
+            }
+        } catch (e) {}
+    }
+    walk(document, 0);
     return docs;
 }
 """
@@ -2286,14 +2306,34 @@ class TopazSigner:
     def _write_signature_file(sig):
         """Fallback image route for builds without SigImageB64: ask the
         control to write a bitmap out, then hand back the path. Returns
-        None if this build doesn't support it either."""
+        None if this build doesn't support it either.
+
+        Office-laptop evidence (2026-09-08 log) settled the exact call
+        shape this build needs:
+            Topaz: image property ImageFileName not settable
+                (Property 'SigPlus.SigPlusCtrl.1.ImageFileName' can not be set.)
+            Topaz: WriteImageFile() failed
+                ((-2147352561, 'Parameter not optional.', None, None))
+            Topaz: WriteImageFile property failed
+                (Property 'SigPlus.SigPlusCtrl.1.WriteImageFile' can not be set.)
+        i.e. on THIS build ImageFileName is read-only (setting it silently
+        no-ops on other builds, but here it flat out refuses), and
+        WriteImageFile is a real method that REQUIRES its arguments to be
+        passed directly - it does not read them back off the
+        ImageFileName/ImageFileFormat/... properties the way older builds
+        do. So we now try calling it with the path (and the other image
+        settings) passed straight in as positional arguments, in a few
+        decreasing arg-count shapes, before falling back to the old
+        "set properties, call with no args" style for builds that DO
+        want it that way."""
         out_path = os.path.join(tempfile.gettempdir(), f"sig_topaz_{uuid.uuid4().hex}.bmp")
+        image_format, x_size, y_size, pen_width = 0, 500, 150, 2  # 0 = bitmap
         try:
             for prop, value in (
-                ("ImageFileFormat", 0),      # 0 = bitmap on the builds that have it
-                ("ImageXSize", 500),
-                ("ImageYSize", 150),
-                ("ImagePenWidth", 2),
+                ("ImageFileFormat", image_format),  # 0 = bitmap on the builds that have it
+                ("ImageXSize", x_size),
+                ("ImageYSize", y_size),
+                ("ImagePenWidth", pen_width),
                 ("JustifyMode", 5),          # NOT "ImageJustifyMode" - that name
                                               # doesn't exist on real SigPlus builds
                                               # (confirmed against the office
@@ -2306,21 +2346,119 @@ class TopazSigner:
                     logger.debug("Topaz: image property %s not settable (%s)", prop, exc)
             wrote = False
             for label, call in (
+                # This build: WriteImageFile() raised "Parameter not
+                # optional" when called with zero args, so the filename
+                # (and friends) must be passed directly as arguments -
+                # try the fullest documented signature first, then
+                # shorter ones, in case this build only wants the path.
+                ("WriteImageFile(path, fmt, x, y, pen)",
+                 lambda: sig.WriteImageFile(out_path, image_format, x_size, y_size, pen_width)),
+                ("WriteImageFile(path, fmt)",
+                 lambda: sig.WriteImageFile(out_path, image_format)),
+                ("WriteImageFile(path)",
+                 lambda: sig.WriteImageFile(out_path)),
+                # Older-build style: properties already set above, call
+                # with no args at all.
                 ("WriteImageFile()", lambda: sig.WriteImageFile()),
                 ("WriteImageFile property", lambda: setattr(sig, "WriteImageFile", 1)),
             ):
                 try:
                     call()
                     wrote = True
-                    logger.debug("Topaz: wrote signature bitmap via %s", label)
+                    logger.info("Topaz: wrote signature bitmap via %s", label)
                     break
                 except Exception as exc:
-                    logger.debug("Topaz: %s failed (%s)", label, exc)
+                    # INFO (not DEBUG): this is the exact detail that
+                    # settles WHICH call shape a given SigPlus build
+                    # wants, and console-only screen recordings only show
+                    # INFO+ - a DEBUG-only line here means a future field
+                    # report can show the outer "no way to read the image
+                    # back" error without any of the per-attempt detail
+                    # that explains why, forcing a round trip just to ask
+                    # for the raw log file.
+                    logger.info("Topaz: %s failed (%s)", label, exc)
             if wrote and os.path.exists(out_path):
                 return out_path
+            if wrote:
+                logger.debug(
+                    "Topaz: WriteImageFile reported success but no file appeared at %s",
+                    out_path,
+                )
         except Exception:
             logger.exception("Topaz: file-based signature export failed")
-        return None
+        return TopazSigner._write_signature_via_bitmap_buffer(sig, out_path, x_size, y_size)
+
+    @staticmethod
+    def _write_signature_via_bitmap_buffer(sig, out_path, x_size, y_size):
+        """Last-resort fallback for builds where WriteImageFile itself is
+        unusable: read the captured signature straight out of the
+        control's raw bitmap buffer (GetBitmapBufferBytes / ByteIndex /
+        BitMapBufferByte / BitMapBufferClose - all confirmed present on
+        the office laptop's control via check_topaz_api.py) and write it
+        out as a BMP by hand. Returns the path, or None if this build
+        doesn't expose that API either."""
+        try:
+            if not hasattr(sig, "GetBitmapBufferBytes"):
+                return None
+            n_bytes = TopazSigner._call_or_get(sig, "GetBitmapBufferBytes")
+            n_bytes = int(n_bytes)
+            if n_bytes <= 0:
+                logger.debug("Topaz: GetBitmapBufferBytes returned %s, nothing to read", n_bytes)
+                return None
+            # Safety caps - this runs inside the same worker thread the
+            # capture() timeout is watching, so don't let a huge/garbage
+            # byte count (or a control that's just slow per-call over COM)
+            # turn into a multi-minute read that hangs the app. A hard
+            # byte-count ceiling AND a wall-clock budget both apply; either
+            # one tripping aborts the read cleanly (falls back to on-screen
+            # signing) rather than blocking indefinitely.
+            MAX_BUFFER_BYTES = 400_000
+            TIME_BUDGET_SECONDS = 8.0
+            if n_bytes > MAX_BUFFER_BYTES:
+                logger.debug(
+                    "Topaz: GetBitmapBufferBytes=%s exceeds safety cap %s, skipping",
+                    n_bytes, MAX_BUFFER_BYTES,
+                )
+                return None
+            data = bytearray(n_bytes)
+            start = time.time()
+            for i in range(n_bytes):
+                if time.time() - start > TIME_BUDGET_SECONDS:
+                    logger.debug(
+                        "Topaz: bitmap-buffer read exceeded %.1fs budget after %d/%d bytes, aborting",
+                        TIME_BUDGET_SECONDS, i, n_bytes,
+                    )
+                    return None
+                sig.ByteIndex = i
+                data[i] = int(TopazSigner._call_or_get(sig, "BitMapBufferByte")) & 0xFF
+            try:
+                sig.BitMapBufferClose()
+            except Exception as exc:
+                logger.debug("Topaz: BitMapBufferClose() failed (%s)", exc)
+            if data[:2] == b"BM":
+                # The buffer is already a complete BMP file - write as-is.
+                with open(out_path, "wb") as fh:
+                    fh.write(bytes(data))
+            else:
+                # Raw pixel data with no file header - wrap it in a
+                # minimal BMP header ourselves (matches ImageXSize/YSize
+                # set on the control, 24-bit).
+                from PIL import Image
+                try:
+                    img = Image.frombytes("RGB", (x_size, y_size), bytes(data))
+                    img.save(out_path, "BMP")
+                except Exception:
+                    logger.exception(
+                        "Topaz: could not interpret raw bitmap buffer as an image"
+                    )
+                    return None
+            logger.info(
+                "Topaz: wrote signature via raw bitmap buffer fallback (%d bytes)", n_bytes
+            )
+            return out_path if os.path.exists(out_path) else None
+        except Exception:
+            logger.exception("Topaz: bitmap-buffer fallback failed")
+            return None
 
     def capture(self, parent, title="Sign on the pad"):
         import importlib.util
@@ -2461,10 +2599,15 @@ class TopazSigner:
 
         outcome["accepted"] = result["accepted"]
         proceed_event.set()
-        # Reading the captured points/image and disarming the pad should
-        # be near-instant - but guard it the same way, so a pad that goes
-        # unresponsive AFTER signing can't freeze the app either.
-        done_event.wait(6.0)
+        # Reading the captured points/image and disarming the pad is
+        # normally near-instant - except the raw bitmap-buffer fallback
+        # (used when neither SigImageB64 nor WriteImageFile work), which
+        # can take up to its own ~8s time budget on builds that only
+        # expose a slow, one-byte-at-a-time COM read. Give the whole
+        # read+fallback+disarm sequence enough room for that worst case
+        # plus slack, while still guarding against a truly unresponsive
+        # pad freezing the app.
+        done_event.wait(15.0)
 
         if not result["accepted"]:
             logger.info("Topaz: capture cancelled by user")
