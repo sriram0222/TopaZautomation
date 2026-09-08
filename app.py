@@ -762,10 +762,15 @@ function __rowTexts(row) {
 }
 
 function __mapRow(headers, cellTexts) {
+    // The real report's header row has "Department" as a column twice
+    // (confirmed against an actual exported copy of the page) - keep
+    // the FIRST occurrence's value rather than letting the second
+    // silently overwrite it, so a duplicate column name can't quietly
+    // drop real data.
     var obj = {};
     var n = Math.min(headers.length, cellTexts.length);
     for (var i = 0; i < n; i++) {
-        if (headers[i]) obj[headers[i]] = cellTexts[i];
+        if (headers[i] && !(headers[i] in obj)) obj[headers[i]] = cellTexts[i];
     }
     return obj;
 }
@@ -792,6 +797,27 @@ function __looksLikeHeaderRow(headers) {
     return true;
 }
 
+// SSRS-exported HTML tables commonly lead with a "sizer" row - a row of
+// mostly-empty cells whose only job is to fix column widths (colgroup
+// via <tr><td style="width:Npx">) - BEFORE the real header row. The
+// scanner used to only ever look at t.rows[0], so on any table shaped
+// that way it read the blank sizer row, __looksLikeHeaderRow correctly
+// rejected it (blank cells), and the table was never picked - even
+// though the real header (and the data under it) was sitting right
+// there one row down. This looks for the header among the first few
+// rows of a table instead of assuming it's always row 0.
+function __findHeaderRowIndex(t, lower) {
+    var maxCheck = Math.min(t.rows ? t.rows.length : 0, 4);
+    for (var idx = 0; idx < maxCheck; idx++) {
+        var headers = __rowTexts(t.rows[idx]);
+        if (!__looksLikeHeaderRow(headers)) continue;
+        for (var k = 0; k < headers.length; k++) {
+            if (headers[k].toLowerCase().indexOf(lower) !== -1) return idx;
+        }
+    }
+    return -1;
+}
+
 function __scanTables(headerKeyword) {
     var lower = String(headerKeyword).toLowerCase();
     var docs = __collectDocs();
@@ -800,15 +826,19 @@ function __scanTables(headerKeyword) {
         var tables = docs[i].querySelectorAll('table');
         for (var j = 0; j < tables.length; j++) {
             var t = tables[j];
-            var headers = __rowTexts(t.rows[0]);
-            var matched = false;
-            if (__looksLikeHeaderRow(headers)) {
-                for (var k = 0; k < headers.length; k++) {
-                    if (headers[k].toLowerCase().indexOf(lower) !== -1) { matched = true; break; }
-                }
-            }
+            var totalRows = t.rows ? t.rows.length : 0;
+            var headerIdx = __findHeaderRowIndex(t, lower);
+            var matched = headerIdx !== -1;
+            var headers = matched ? __rowTexts(t.rows[headerIdx]) : __rowTexts(t.rows[0]);
+            // "rowCount" here means rows of potential DATA available
+            // under the header we actually found (not the table's raw
+            // row count) - so a table with a sizer row + header + 5 data
+            // rows correctly scores as 5, not 7, and a header-only table
+            // (nothing but the header, real data rendered in a separate
+            // table entirely) still scores as 0 rather than 1.
+            var dataRowCount = matched ? (totalRows - headerIdx - 1) : totalRows;
             all.push({ table: t, headers: headers, matched: matched,
-                       rowCount: t.rows ? t.rows.length : 0 });
+                       headerIdx: matched ? headerIdx : 0, rowCount: dataRowCount });
         }
     }
 
@@ -824,12 +854,12 @@ function __scanTables(headerKeyword) {
     //    never beats the real inner results table.
     var best = null;
     for (var a = 0; a < all.length; a++) {
-        if (!all[a].matched || all[a].rowCount <= 1) continue;
+        if (!all[a].matched || all[a].rowCount < 1) continue;
         if (best === null || all[a].rowCount > best.rowCount) best = all[a];
     }
     if (best !== null) {
         var rows = [];
-        for (var r = 1; r < best.table.rows.length; r++) {
+        for (var r = best.headerIdx + 1; r < best.table.rows.length; r++) {
             var texts = __rowTexts(best.table.rows[r]);
             if (!texts.length) continue;
             var isBlank = true;
@@ -842,15 +872,16 @@ function __scanTables(headerKeyword) {
         }
     }
 
-    // 2. Split rendering: the header row lives in its own table and the
-    //    data rows are in a later one. Pair them up.
+    // 2. Split rendering: the header row lives in its own table (possibly
+    //    with a sizer row above it) and the data rows are in a later
+    //    table. Pair them up.
     for (var h = 0; h < all.length; h++) {
-        if (!all[h].matched || all[h].rowCount !== 1) continue;
+        if (!all[h].matched || all[h].rowCount !== 0) continue;
         var headers2 = all[h].headers;
         if (!headers2.length) continue;
         for (var d = h + 1; d < all.length; d++) {
             var cand = all[d];
-            if (!cand.rowCount) continue;
+            if (!cand.table.rows || !cand.table.rows.length) continue;
             var firstTexts = __rowTexts(cand.table.rows[0]);
             if (!firstTexts.length) continue;
             // Prefer an exact column-count match; that is almost always
@@ -1000,19 +1031,49 @@ def _perform_ssrs_search(window, emp_id, button_text, header_keyword, name_colum
     check_js = _JS_COLLECT_DOCS + _JS_SCAN_TABLES + f"""
     (function(kw) {{ return __scanTables(kw).rows.length > 0; }})({json.dumps(header_keyword)});
     """
+    diag_js = _JS_COLLECT_DOCS + _JS_SCAN_TABLES + f"""
+    (function(kw) {{ return __scanTables(kw); }})({json.dumps(header_keyword)});
+    """
     wait_start = time.time()
     deadline = wait_start + ready_timeout
     found = False
+    js_error = None
     while time.time() < deadline:
-        if window.evaluate_js(check_js):
-            found = True
-            break
+        try:
+            if window.evaluate_js(check_js):
+                found = True
+                break
+        except Exception as exc:
+            # A JS exception inside check_js (e.g. a cross-origin frame
+            # access that only fails once execution actually touches it)
+            # would otherwise look EXACTLY like "nothing ever matched" -
+            # a bare timeout with zero clue why. Surface it instead of
+            # silently retrying into the same failure for the whole
+            # timeout window.
+            js_error = exc
+            logger.debug("AD lookup: check_js raised (will keep polling): %s", exc)
         time.sleep(0.4)
     if not found:
+        # Always capture what the scanner actually saw at the moment of
+        # giving up - previously this diagnostic dump only happened on
+        # the separate "ready but 0 rows extracted" path, so a hard
+        # timeout (which is what a real header-row-detection bug
+        # produces) logged nothing more useful than "timed out", making
+        # it impossible to tell a genuinely-missing employee apart from
+        # a scanner bug without another round trip.
+        try:
+            timeout_scan = window.evaluate_js(diag_js) or {}
+        except Exception as exc:
+            timeout_scan = {}
+            if js_error is None:
+                js_error = exc
         logger.error(
             "AD lookup: TIMED OUT after %.1fs waiting for results table "
-            "(header_keyword=%r) for emp_id=%r",
+            "(header_keyword=%r) for emp_id=%r%s. Tables seen on the page "
+            "at timeout: %r",
             time.time() - wait_start, header_keyword, emp_id,
+            f" (check_js raised: {js_error})" if js_error is not None else "",
+            timeout_scan.get("tables"),
         )
         raise RuntimeError(
             "Timed out waiting for the AD lookup report results to load "
