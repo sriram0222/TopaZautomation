@@ -112,6 +112,7 @@ import tempfile
 import threading
 import time
 import uuid
+import webbrowser
 import zipfile
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
@@ -242,7 +243,22 @@ CONFIG = {
     "pdf_save_folder": "C:\\AssetForms\\Generated",
     # Where generated (signed) PDFs are saved by default (the "Choose
     # Location..." button on the review screen can override this per
-    # form).
+    # form). Each submission type gets its own subfolder underneath this
+    # automatically (e.g. ...\\Generated\\Break_Fix\\, ...\\Generated\\LWD\\).
+
+    "tracit_submission_types": ["Break Fix", "LWD", "Contractor LWD"],
+    # Submission types that show an "Open TracIT" button next to the
+    # Current Device Serial Number field.
+    "tracit_url_template": "https://tracit.optum.com/ham/view-assets",
+    # The TracIT page to open. This is the base page only - the exact
+    # query-string format for deep-linking straight to an employee ID or
+    # serial number search wasn't available yet, so the button opens this
+    # page as-is and the ID/serial are typed in there by hand, same as
+    # today. If TracIT DOES support a URL format like
+    # "https://tracit.optum.com/ham/view-assets?empId={employee_id}&serial={serial_number}",
+    # paste that real (working) URL here instead - the {employee_id} and
+    # {serial_number} placeholders will be filled in automatically from
+    # the form.
 
     "signing_identity_folder": "signing_identity",
     # Where this app's own self-signed signing certificate + private key
@@ -1313,6 +1329,16 @@ def _run_webview_helper():
             request_id = req.get("request_id")
             emp_id = (req.get("emp_id") or "").strip()
             logger.info("AD helper: received lookup request_id=%r emp_id=%r", request_id, emp_id)
+
+            # The window may have been auto-hidden after the previous
+            # successful lookup (see below) - bring it back so the user can
+            # see this new search happen (and log in again if a session
+            # expired in the meantime).
+            try:
+                window.show()
+            except Exception:
+                logger.exception("AD helper: window.show() failed (request_id=%r)", request_id)
+
             if not emp_id:
                 logger.warning("AD helper: empty employee ID in request_id=%r", request_id)
                 _send({"request_id": request_id, "error": "Empty employee ID."})
@@ -1333,6 +1359,17 @@ def _run_webview_helper():
                     len(candidates), request_id,
                 )
                 _send({"request_id": request_id, "candidates": candidates})
+                # Lookup succeeded and the app now has the data it needs -
+                # tuck the lookup window out of the way automatically instead
+                # of leaving it sitting on top of the main form. It stays
+                # alive in the background (not destroyed) so the next lookup
+                # is instant and window.show() above can bring it right back.
+                if candidates:
+                    try:
+                        window.hide()
+                        logger.info("AD helper: auto-hid lookup window after successful result (request_id=%r)", request_id)
+                    except Exception:
+                        logger.exception("AD helper: window.hide() failed (request_id=%r)", request_id)
             except Exception as exc:
                 logger.exception("AD helper: lookup failed for request_id=%r emp_id=%r", request_id, emp_id)
                 _send({"request_id": request_id, "error": str(exc)})
@@ -3085,6 +3122,18 @@ def _is_email_draft_type(config_data, submission_type):
     return submission_type in config_data.get("email_draft_submission_types", [])
 
 
+def _safe_folder_name(name, fallback="Unspecified"):
+    """Turns a submission type label ("Break Fix", "Contractor LWD", ...)
+    into a filesystem-safe subfolder name, so generated PDFs land in
+    generated_forms/<Submission Type>/ instead of all together in one
+    flat folder."""
+    name = (name or "").strip()
+    if not name:
+        return fallback
+    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in name).strip()
+    return safe.replace(" ", "_") or fallback
+
+
 class WizardApp(tk.Tk):
     """Two-tab app: 'Single Person' (one-off form, everything on one
     scrollable page) and 'Bulk Batch' (import an Excel list, see everyone
@@ -3104,8 +3153,24 @@ class WizardApp(tk.Tk):
         self.signature_service = SignatureService(self.config_data)
 
         self.title("IT Asset Submission Acknowledgement")
-        self.geometry("950x860")
-        self.minsize(860, 620)
+        # Size to the ACTUAL screen instead of a fixed "950x860" - on a
+        # laptop with a smaller or scaled display, a hardcoded height can
+        # end up taller than the visible screen, pushing the bottom
+        # Save/Generate button bar off-screen with no way to reach it
+        # (see _set_windows_dpi_awareness for the other half of this fix).
+        # Opening maximized by default is the most robust guarantee that
+        # the bottom bar is always visible, whatever the screen size.
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        want_w, want_h = 950, 860
+        fit_w = min(want_w, screen_w - 40)
+        fit_h = min(want_h, screen_h - 80)  # leave room for the taskbar
+        self.geometry(f"{fit_w}x{fit_h}")
+        self.minsize(min(860, fit_w), min(620, fit_h))
+        try:
+            self.state("zoomed")  # Windows: start maximized
+        except Exception:
+            logger.debug("WizardApp: could not start maximized (non-fatal)", exc_info=True)
 
         self._bu_templates_cache = []
 
@@ -3425,6 +3490,7 @@ class WizardApp(tk.Tk):
             if not self.output_path_override:
                 self._save_location_var.set(self._compute_default_output_path())
 
+        self._refresh_save_path = _refresh_save_path  # reused when submission type changes too
         self.emp_id_var.trace_add("write", _refresh_save_path)
         self.emp_name_var.trace_add("write", _refresh_save_path)
 
@@ -3505,6 +3571,8 @@ class WizardApp(tk.Tk):
     def _on_submission_type_changed(self):
         self.submission_type_hint.config(text="")
         self._rebuild_asset_details()
+        if hasattr(self, "_refresh_save_path"):
+            self._refresh_save_path()  # picks up the per-submission-type subfolder
 
     # ------------------------------------------------ 5: asset info
     def _rebuild_asset_details(self):
@@ -3533,6 +3601,11 @@ class WizardApp(tk.Tk):
         row1.pack(anchor="w", pady=4)
         ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
         ttk.Entry(row1, textvariable=self.current_serial_var, width=30).pack(side="left", padx=8)
+        if sub_type in self.config_data.get("tracit_submission_types", []):
+            ttk.Button(
+                row1, text="Open TracIT",
+                command=lambda: self._open_tracit(self.emp_id_var.get().strip(), self.current_serial_var.get().strip()),
+            ).pack(side="left", padx=(4, 0))
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
@@ -3623,9 +3696,30 @@ class WizardApp(tk.Tk):
         save_folder = _resolve_path(self.config_data, "pdf_save_folder", "generated_forms")
         emp_name = self.emp_name_var.get().strip() if hasattr(self, "emp_name_var") else ""
         emp_id = self.emp_id_var.get().strip() if hasattr(self, "emp_id_var") else ""
+        sub_type = self.submission_type_var.get().strip() if hasattr(self, "submission_type_var") else ""
         safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (emp_name or "employee"))
         filename = f"{emp_id or 'unknown'}_{safe_name}_{today_str}.pdf".replace(" ", "_")
-        return os.path.join(save_folder, filename)
+        return os.path.join(save_folder, _safe_folder_name(sub_type), filename)
+
+    def _open_tracit(self, employee_id, serial_number):
+        """Opens the configured TracIT page. If tracit_url_template
+        contains {employee_id}/{serial_number} placeholders (once a real
+        deep-link URL format is confirmed), they're filled in; otherwise
+        the plain base page opens as-is, same as clicking a bookmark."""
+        template = self.config_data.get("tracit_url_template", "").strip()
+        if not template:
+            messagebox.showwarning(
+                "TracIT not configured",
+                "tracit_url_template isn't set in CONFIG yet.",
+            )
+            return
+        try:
+            url = template.format(employee_id=employee_id or "", serial_number=serial_number or "")
+        except Exception:
+            logger.debug("TracIT: URL template has no/invalid placeholders, opening as-is", exc_info=True)
+            url = template
+        logger.info("TracIT: opening %s (employee_id=%r, serial_number=%r)", url, employee_id, serial_number)
+        webbrowser.open(url)
 
     def _choose_save_location(self):
         default_path = self.output_path_override or self._compute_default_output_path()
@@ -4125,7 +4219,7 @@ class WizardApp(tk.Tk):
         for i, label in enumerate(all_types):
             ttk.Radiobutton(
                 type_box, text=label, value=label, variable=self.b_submission_type_var,
-                command=self._batch_rebuild_asset_details,
+                command=self._batch_on_submission_type_changed,
             ).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=4)
         self.b_type_hint = ttk.Label(
             parent,
@@ -4166,6 +4260,7 @@ class WizardApp(tk.Tk):
         def _batch_refresh_save_path(*_args):
             if not self.b_output_path_override:
                 self.b_save_location_var.set(self._batch_compute_default_output_path(item))
+        self._batch_refresh_save_path = _batch_refresh_save_path
         self.b_emp_name_var.trace_add("write", _batch_refresh_save_path)
 
         action_row = ttk.Frame(parent)
@@ -4180,6 +4275,11 @@ class WizardApp(tk.Tk):
             self._batch_run_lookup_for_active()
         else:
             self._batch_check_identity_resolved()
+
+    def _batch_on_submission_type_changed(self):
+        self._batch_rebuild_asset_details()
+        if hasattr(self, "_batch_refresh_save_path"):
+            self._batch_refresh_save_path()
 
     def _batch_rebuild_asset_details(self):
         for child in self.b_asset_details_frame.winfo_children():
@@ -4216,6 +4316,11 @@ class WizardApp(tk.Tk):
         row1.pack(anchor="w", pady=4)
         ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
         ttk.Entry(row1, textvariable=self.b_current_serial_var, width=30).pack(side="left", padx=8)
+        if sub_type in self.config_data.get("tracit_submission_types", []):
+            ttk.Button(
+                row1, text="Open TracIT",
+                command=lambda: self._open_tracit(self.b_emp_id_var.get().strip(), self.b_current_serial_var.get().strip()),
+            ).pack(side="left", padx=(4, 0))
         if prefill_note:
             ttk.Label(row1, text=prefill_note, foreground="#888").pack(side="left")
 
@@ -4371,7 +4476,8 @@ class WizardApp(tk.Tk):
         emp_id = item["employee_id"]
         safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (emp_name or "employee"))
         filename = f"{emp_id}_{safe_name}_{today_str}.pdf".replace(" ", "_")
-        return os.path.join(save_folder, filename)
+        sub_type = self.b_submission_type_var.get().strip() if hasattr(self, "b_submission_type_var") else (item.get("type") or "")
+        return os.path.join(save_folder, _safe_folder_name(sub_type), filename)
 
     def _batch_choose_save_location(self):
         item = self.batch_queue[self._batch_active_index]
@@ -4551,6 +4657,31 @@ class WizardApp(tk.Tk):
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
+def _set_windows_dpi_awareness():
+    """Without this, Tkinter is NOT DPI-aware on Windows, so Windows
+    applies its own bitmap-stretching compatibility scaling to the whole
+    window on any scaled display (125%/150%/etc. - extremely common on
+    laptops). A window created at a nominal "950x860" then actually
+    renders much taller in real screen pixels than that number implies,
+    which was pushing the Save/Generate button bar below the visible
+    screen area entirely - looking exactly like "the Save button isn't
+    there" even though it's in the layout the whole time. Declaring
+    DPI-awareness up front (must happen before any Tk window is created)
+    makes Windows hand Tkinter real pixels 1:1 instead of scaling it,
+    which is the standard fix for this class of bug. Safe to skip
+    silently on non-Windows or older Windows without these APIs."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()  # older Windows fallback
+    except Exception:
+        logger.debug("Could not set Windows DPI awareness (non-fatal)", exc_info=True)
+
+
 if __name__ == "__main__":
     _log_path = _setup_logging()
     if len(sys.argv) > 1 and sys.argv[1] == "--webview-helper":
@@ -4558,5 +4689,6 @@ if __name__ == "__main__":
         # BrowserLookupSession._build_command() above for how/why.
         _run_webview_helper()
     else:
+        _set_windows_dpi_awareness()
         app = WizardApp()
         app.mainloop()
