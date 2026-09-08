@@ -704,6 +704,135 @@ function __collectDocs() {
 }
 """
 
+# ----------------------------------------------------------------------
+# ONE shared table scanner used by BOTH the "are the results ready yet?"
+# poll and the "now pull the rows out" extraction below.
+#
+# It is deliberately a single function so the two steps can never
+# disagree about WHICH table on the page is the results table - which is
+# exactly the bug this replaced. The old code had two separate loops:
+# the readiness check accepted only a matching table with >1 rows, while
+# the extractor returned from the FIRST matching table it saw whether or
+# not it had any data rows. SSRS/ReportViewer renders the same report as
+# several nested tables (an outer layout table wrapping the real one, and
+# frequently a separate "fixed header" table holding just the header row,
+# with the data rows in a table of their own). So the check would happily
+# find the real data table and report "ready", then the extractor would
+# hit the header-only/layout table first, find zero data rows under it,
+# and give up - producing "The report loaded, but returned no rows" for
+# an employee who is plainly right there on screen.
+#
+# The scanner therefore looks at EVERY table, and:
+#   1. prefers a matching table that carries its own data rows (picking
+#      the one with the most, so an outer wrapper never wins over the
+#      real inner table), and
+#   2. falls back to pairing a header-only matching table with the next
+#      table that actually holds rows, for the split-header rendering.
+# It also returns what it saw in every table, so a failure gets logged
+# with the real column headers instead of a bare "no rows".
+# ----------------------------------------------------------------------
+_JS_SCAN_TABLES = """
+function __rowTexts(row) {
+    var out = [];
+    if (!row || !row.cells) return out;
+    for (var i = 0; i < row.cells.length; i++) {
+        out.push((row.cells[i].innerText || row.cells[i].textContent || '').trim());
+    }
+    return out;
+}
+
+function __mapRow(headers, cellTexts) {
+    var obj = {};
+    var n = Math.min(headers.length, cellTexts.length);
+    for (var i = 0; i < n; i++) {
+        if (headers[i]) obj[headers[i]] = cellTexts[i];
+    }
+    return obj;
+}
+
+function __scanTables(headerKeyword) {
+    var lower = String(headerKeyword).toLowerCase();
+    var docs = __collectDocs();
+    var all = [];
+    for (var i = 0; i < docs.length; i++) {
+        var tables = docs[i].querySelectorAll('table');
+        for (var j = 0; j < tables.length; j++) {
+            var t = tables[j];
+            var headers = __rowTexts(t.rows[0]);
+            var matched = false;
+            for (var k = 0; k < headers.length; k++) {
+                if (headers[k].toLowerCase().indexOf(lower) !== -1) { matched = true; break; }
+            }
+            all.push({ table: t, headers: headers, matched: matched,
+                       rowCount: t.rows ? t.rows.length : 0 });
+        }
+    }
+
+    var summary = [];
+    for (var s = 0; s < all.length; s++) {
+        summary.push({ headers: all[s].headers, rowCount: all[s].rowCount,
+                       matched: all[s].matched });
+    }
+
+    // 1. Best case: a matching table that holds its own data rows. Pick
+    //    the one with the MOST rows so an outer wrapper table (which can
+    //    also "match", because the real header text is nested inside it)
+    //    never beats the real inner results table.
+    var best = null;
+    for (var a = 0; a < all.length; a++) {
+        if (!all[a].matched || all[a].rowCount <= 1) continue;
+        if (best === null || all[a].rowCount > best.rowCount) best = all[a];
+    }
+    if (best !== null) {
+        var rows = [];
+        for (var r = 1; r < best.table.rows.length; r++) {
+            var texts = __rowTexts(best.table.rows[r]);
+            if (!texts.length) continue;
+            var isBlank = true;
+            for (var b = 0; b < texts.length; b++) { if (texts[b]) { isBlank = false; break; } }
+            if (isBlank) continue;
+            rows.push(__mapRow(best.headers, texts));
+        }
+        if (rows.length) {
+            return { rows: rows, tables: summary, strategy: 'single-table' };
+        }
+    }
+
+    // 2. Split rendering: the header row lives in its own table and the
+    //    data rows are in a later one. Pair them up.
+    for (var h = 0; h < all.length; h++) {
+        if (!all[h].matched || all[h].rowCount !== 1) continue;
+        var headers2 = all[h].headers;
+        if (!headers2.length) continue;
+        for (var d = h + 1; d < all.length; d++) {
+            var cand = all[d];
+            if (!cand.rowCount) continue;
+            var firstTexts = __rowTexts(cand.table.rows[0]);
+            if (!firstTexts.length) continue;
+            // Prefer an exact column-count match; that is almost always
+            // the real data table for this header.
+            if (firstTexts.length !== headers2.length) continue;
+            var rows2 = [];
+            for (var r2 = 0; r2 < cand.table.rows.length; r2++) {
+                var texts2 = __rowTexts(cand.table.rows[r2]);
+                if (!texts2.length) continue;
+                var blank2 = true;
+                for (var b2 = 0; b2 < texts2.length; b2++) { if (texts2[b2]) { blank2 = false; break; } }
+                if (blank2) continue;
+                // Skip a repeat of the header row itself.
+                if (texts2.join('\\u0001') === headers2.join('\\u0001')) continue;
+                rows2.push(__mapRow(headers2, texts2));
+            }
+            if (rows2.length) {
+                return { rows: rows2, tables: summary, strategy: 'split-header' };
+            }
+        }
+    }
+
+    return { rows: [], tables: summary, strategy: 'none' };
+}
+"""
+
 
 def _map_ssrs_row_to_fields(row, name_column):
     """Maps one raw {column_header: cell_text} row from the SSRS AD Search
@@ -730,6 +859,7 @@ def _map_ssrs_row_to_fields(row, name_column):
         "corporate email box", "userprincipalname", "uht-identitymanagement-mail", "email"
     )
     fields["designation"] = get_ci("employee type")
+    fields["department"] = get_ci("department")
     # Extra columns from this specific report - not part of FIELD_LABEL_MAP
     # and not shown on the wizard screen today, but harmless to carry
     # along in case a future screen wants them.
@@ -820,25 +950,11 @@ def _perform_ssrs_search(window, emp_id, button_text, header_keyword, name_colum
     # look at the report by hand). Waiting for a real data row here closes
     # that race without changing behavior for a truly-not-found ID, which
     # still correctly times out below.
-    check_js = _JS_COLLECT_DOCS + f"""
-    (function(headerKeyword) {{
-        var docs = __collectDocs();
-        var lower = headerKeyword.toLowerCase();
-        for (var i = 0; i < docs.length; i++) {{
-            var tables = docs[i].querySelectorAll('table');
-            for (var j = 0; j < tables.length; j++) {{
-                var headerRow = tables[j].rows[0];
-                if (!headerRow) continue;
-                var isMatch = false;
-                for (var k = 0; k < headerRow.cells.length; k++) {{
-                    var txt = (headerRow.cells[k].innerText || headerRow.cells[k].textContent || '');
-                    if (txt.toLowerCase().indexOf(lower) !== -1) {{ isMatch = true; break; }}
-                }}
-                if (isMatch && tables[j].rows.length > 1) return true;
-            }}
-        }}
-        return false;
-    }})({json.dumps(header_keyword)});
+    # "Ready" is now defined as "the scanner can actually pull rows out",
+    # using the very same scanner the extraction step uses - so the two
+    # can no longer pick different tables and disagree.
+    check_js = _JS_COLLECT_DOCS + _JS_SCAN_TABLES + f"""
+    (function(kw) {{ return __scanTables(kw).rows.length > 0; }})({json.dumps(header_keyword)});
     """
     wait_start = time.time()
     deadline = wait_start + ready_timeout
@@ -864,51 +980,27 @@ def _perform_ssrs_search(window, emp_id, button_text, header_keyword, name_colum
         )
     logger.debug("AD lookup: results table ready after %.1fs", time.time() - wait_start)
 
-    extract_js = _JS_COLLECT_DOCS + f"""
-    (function(headerKeyword) {{
-        var docs = __collectDocs();
-        var lower = headerKeyword.toLowerCase();
-        for (var i = 0; i < docs.length; i++) {{
-            var tables = docs[i].querySelectorAll('table');
-            for (var j = 0; j < tables.length; j++) {{
-                var headerRow = tables[j].rows[0];
-                if (!headerRow) continue;
-                var headers = [];
-                var matched = false;
-                for (var k = 0; k < headerRow.cells.length; k++) {{
-                    var txt = (headerRow.cells[k].innerText || headerRow.cells[k].textContent || '').trim();
-                    headers.push(txt);
-                    if (txt.toLowerCase().indexOf(lower) !== -1) matched = true;
-                }}
-                if (!matched) continue;
-                var rows = [];
-                for (var r = 1; r < tables[j].rows.length; r++) {{
-                    var cells = tables[j].rows[r].cells;
-                    if (!cells || cells.length === 0) continue;
-                    var rowObj = {{}};
-                    for (var c = 0; c < cells.length && c < headers.length; c++) {{
-                        rowObj[headers[c]] = (cells[c].innerText || cells[c].textContent || '').trim();
-                    }}
-                    rows.push(rowObj);
-                }}
-                return rows;
-            }}
-        }}
-        return [];
-    }})({json.dumps(header_keyword)});
+    extract_js = _JS_COLLECT_DOCS + _JS_SCAN_TABLES + f"""
+    (function(kw) {{ return __scanTables(kw); }})({json.dumps(header_keyword)});
     """
     # Belt-and-suspenders against the same race the check above guards
     # against: if the table got re-rendered in the instant between the
     # check succeeding and this extraction running, retry a few times
     # before giving up, rather than reporting "no rows" on one bad read.
     rows = []
+    scan = {}
     for _attempt in range(5):
-        rows = window.evaluate_js(extract_js) or []
+        scan = window.evaluate_js(extract_js) or {}
+        rows = scan.get("rows") or []
         if rows:
             break
         time.sleep(0.4)
 
-    logger.debug("AD lookup: raw extracted rows (%d): %r", len(rows), rows)
+    logger.debug(
+        "AD lookup: extracted %d row(s) via strategy=%r; tables seen on page: %r",
+        len(rows), scan.get("strategy"), scan.get("tables"),
+    )
+    logger.debug("AD lookup: raw extracted rows: %r", rows)
 
     candidates = []
     for row in rows:
@@ -920,7 +1012,8 @@ def _perform_ssrs_search(window, emp_id, button_text, header_keyword, name_colum
     if not candidates:
         logger.error(
             "AD lookup: report loaded but 0 usable candidates for emp_id=%r "
-            "(raw rows=%d)", emp_id, len(rows),
+            "(raw rows=%d, strategy=%r). Tables seen on the page were: %r",
+            emp_id, len(rows), scan.get("strategy"), scan.get("tables"),
         )
         raise RuntimeError(
             f"The report loaded, but returned no rows for Employee ID "
@@ -2033,6 +2126,133 @@ class TopazSigner:
             "Check the SigPlus SDK is installed and the pad is plugged in."
         )
 
+    # ------------------------------------------------------------------
+    # SigPlus builds do NOT all expose the same API, which is what broke
+    # signing on the real office machine: the control connected fine via
+    # ProgID 'SigPlus.SigPlusCtrl.1', then arming it blew up with
+    #
+    #   AttributeError: SigPlus.SigPlusCtrl.1.SetTabletState.
+    #   Did you mean: 'SetTabletPortPath'?
+    #
+    # i.e. that build exposes TabletState as a PROPERTY (sig.TabletState
+    # = 1), not as a SetTabletState(state, hwnd) METHOD. Older/other
+    # builds do have the method. Rather than hard-coding either shape,
+    # the helpers below try the known variants in turn and remember which
+    # one worked, so the app adapts to whichever SigPlus is installed.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _describe_api(sig):
+        """Best-effort list of the method/property names the connected
+        control actually exposes, for the log. Never raises."""
+        try:
+            type_info = sig._oleobj_.GetTypeInfo()
+            attr = type_info.GetTypeAttr()
+            names = set()
+            for i in range(attr.cFuncs):
+                try:
+                    names.update(type_info.GetNames(type_info.GetFuncDesc(i).memid))
+                except Exception:
+                    pass
+            for i in range(attr.cVars):
+                try:
+                    names.update(type_info.GetNames(type_info.GetVarDesc(i).memid))
+                except Exception:
+                    pass
+            return sorted(n for n in names if n)
+        except Exception as exc:
+            return f"<could not enumerate control API: {exc}>"
+
+    @staticmethod
+    def _set_tablet_state(sig, value, hwnd):
+        """Arms (value=1) or disarms (value=0) the pad, whichever way
+        this particular SigPlus build wants it. Returns the name of the
+        variant that worked."""
+        # Order matters: try the METHOD forms first. A missing method
+        # fails loudly with AttributeError, whereas assigning a missing
+        # property can silently succeed (it would just create a new
+        # attribute), which would look like it worked while leaving the
+        # pad untouched. So the property form is the last resort, and it
+        # is read back afterwards to confirm it actually stuck.
+        def _set_property():
+            setattr(sig, "TabletState", value)
+            try:
+                readback = sig.TabletState
+            except Exception:
+                return  # can't read it back; assume the put worked
+            if readback != value:
+                raise TopazNotAvailable(
+                    f"TabletState did not stick (wrote {value!r}, read back {readback!r})"
+                )
+
+        attempts = (
+            ("SetTabletState(state, hwnd)", lambda: sig.SetTabletState(value, hwnd)),
+            ("SetTabletState(state)", lambda: sig.SetTabletState(value)),
+            ("TabletState property", _set_property),
+        )
+        errors = []
+        for label, call in attempts:
+            try:
+                call()
+                logger.debug("Topaz: tablet state set to %s via %s", value, label)
+                return label
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+        raise TopazNotAvailable(
+            "This SigPlus build did not accept any known way of turning "
+            "the pad on/off. Tried - " + " | ".join(errors)
+        )
+
+    @staticmethod
+    def _read_signature_b64(sig):
+        """Returns the captured signature as base64 PNG/BMP bytes if the
+        control offers SigImageB64, else None (caller falls back to the
+        file-based route)."""
+        try:
+            value = sig.SigImageB64
+            if value:
+                logger.debug("Topaz: read signature via SigImageB64 property")
+                return value
+        except Exception as exc:
+            logger.debug("Topaz: SigImageB64 not available (%s)", exc)
+        return None
+
+    @staticmethod
+    def _write_signature_file(sig):
+        """Fallback image route for builds without SigImageB64: ask the
+        control to write a bitmap out, then hand back the path. Returns
+        None if this build doesn't support it either."""
+        out_path = os.path.join(tempfile.gettempdir(), f"sig_topaz_{uuid.uuid4().hex}.bmp")
+        try:
+            for prop, value in (
+                ("ImageFileFormat", 0),      # 0 = bitmap on the builds that have it
+                ("ImageXSize", 500),
+                ("ImageYSize", 150),
+                ("ImagePenWidth", 2),
+                ("ImageJustifyMode", 5),
+                ("ImageFileName", out_path),
+            ):
+                try:
+                    setattr(sig, prop, value)
+                except Exception as exc:
+                    logger.debug("Topaz: image property %s not settable (%s)", prop, exc)
+            wrote = False
+            for label, call in (
+                ("WriteImageFile()", lambda: sig.WriteImageFile()),
+                ("WriteImageFile property", lambda: setattr(sig, "WriteImageFile", 1)),
+            ):
+                try:
+                    call()
+                    wrote = True
+                    logger.debug("Topaz: wrote signature bitmap via %s", label)
+                    break
+                except Exception as exc:
+                    logger.debug("Topaz: %s failed (%s)", label, exc)
+            if wrote and os.path.exists(out_path):
+                return out_path
+        except Exception:
+            logger.exception("Topaz: file-based signature export failed")
+        return None
+
     def capture(self, parent, title="Sign on the pad"):
         import importlib.util
         if importlib.util.find_spec("win32com.client") is None:
@@ -2062,16 +2282,20 @@ class TopazSigner:
         proceed_event = threading.Event()
         done_event = threading.Event()
         state = {"sig": None, "connect_error": None}
-        outcome = {"accepted": False, "b64": None, "error": None}
+        outcome = {"accepted": False, "b64": None, "path": None, "error": None}
 
         def worker():
             pythoncom.CoInitialize()
             try:
                 try:
                     sig = self._connect()
-                    logger.debug("Topaz: calling SetTabletState(1, hwnd=%s) to arm the pad", hwnd)
-                    sig.SetTabletState(1, hwnd)
-                    sig.ClearTablet()
+                    logger.debug("Topaz: control exposes: %r", self._describe_api(sig))
+                    logger.debug("Topaz: arming the pad (hwnd=%s)", hwnd)
+                    self._set_tablet_state(sig, 1, hwnd)
+                    try:
+                        sig.ClearTablet()
+                    except Exception as exc:
+                        logger.debug("Topaz: ClearTablet() unavailable/failed (%s)", exc)
                     logger.info("Topaz: pad armed OK")
                 except Exception as exc:
                     logger.exception("Topaz: failed to connect/arm the pad")
@@ -2091,12 +2315,22 @@ class TopazSigner:
                         if points < 1:
                             outcome["error"] = TopazNotAvailable("No signature was captured on the pad.")
                         else:
-                            outcome["b64"] = sig.SigImageB64
+                            outcome["b64"] = self._read_signature_b64(sig)
+                            if not outcome["b64"]:
+                                # Build without SigImageB64 - have the
+                                # control write a bitmap out instead.
+                                outcome["path"] = self._write_signature_file(sig)
+                                if not outcome["path"]:
+                                    outcome["error"] = TopazNotAvailable(
+                                        "The pad captured a signature, but this SigPlus build "
+                                        "offered no way to read the image back (no SigImageB64 "
+                                        "property and no working WriteImageFile)."
+                                    )
                     except Exception as exc:
                         logger.exception("Topaz: could not read captured signature")
                         outcome["error"] = TopazNotAvailable(f"Could not read the captured signature ({exc}).")
                 try:
-                    sig.SetTabletState(0, hwnd)
+                    self._set_tablet_state(sig, 0, hwnd)
                     logger.debug("Topaz: pad disarmed OK")
                 except Exception:
                     logger.exception("Topaz: failed to disarm the pad (non-fatal)")
@@ -2158,13 +2392,20 @@ class TopazSigner:
         if outcome["error"] is not None:
             logger.error("Topaz: capture failed: %s", outcome["error"])
             raise outcome["error"]
-        if outcome["b64"] is None:
+        if outcome["b64"] is None and outcome["path"] is None:
             logger.error("Topaz: no response from pad after Accept")
             raise TopazNotAvailable("Could not read the captured signature (no response from the pad).")
 
         try:
-            raw = base64.b64decode(outcome["b64"])
-            img = Image.open(io.BytesIO(raw))
+            if outcome["b64"] is not None:
+                raw = base64.b64decode(outcome["b64"])
+                img = Image.open(io.BytesIO(raw))
+            else:
+                # File-based route (build without SigImageB64): the
+                # control wrote a bitmap, load it and convert to PNG so
+                # the rest of the app sees the same thing either way.
+                img = Image.open(outcome["path"])
+                img.load()
         except Exception as exc:
             logger.exception("Topaz: could not decode captured signature image")
             raise TopazNotAvailable(f"Could not decode the captured signature image ({exc}).") from exc
