@@ -1,5 +1,5 @@
 
-
+https://orbit-ssrs-prod-int.optum.com/ReportServer?/Optum%20ET/EUTS%20Dev%20Ops/EUTSDReporting/TransferredFromPowerBIReportServer/CheckInTool-ShippingCenterReports/DDT%20Open%20Requests%20by%20Status%20Raw%20Data&rs:Format=EXCELOPENXML
 Yes, this is the best design. I'd implement it as a one-time configuration per user/BU, then the application automatically creates the folder structure.
 
 Recommended Folder Structure
