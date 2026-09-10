@@ -1,0 +1,195 @@
+
+
+Yes, this is the best design. I'd implement it as a one-time configuration per user/BU, then the application automatically creates the folder structure.
+
+Recommended Folder Structure
+D:\IT Asset Documents\
+│
+├── New Hire
+│   ├── 10-Sep-2026
+│   │   ├── Raja Amuthan
+│   │   │   ├── 123456_NewHire_20260910_101500.pdf
+│   │   │   └── 123457_NewHire_20260910_102300.pdf
+│
+├── LWD
+│   ├── 11-Sep-2026
+│   │   ├── Raja Amuthan
+│   │   │   └── 123458_LWD_20260911_083000.pdf
+│
+├── Break Fix
+│
+├── Contractor LWD
+│
+├── Additional Laptop
+│
+├── Site Transfer
+│
+└── Mixed Build
+
+First-Time User Experience
+
+When the application starts for the first time:
+
+No save location configured.
+
+Please choose the root folder
+where generated documents should be stored.
+
+[Browse]
+
+
+User selects:
+
+D:\IT Asset Documents
+
+
+Click:
+
+Save Settings
+
+
+Store in:
+
+user_settings.json
+
+
+Example:
+
+{
+    "root_save_folder": "D:\\IT Asset Documents",
+    "operator_name": "Raja Amuthan",
+    "last_bu": "Chennai"
+}
+
+Future Launches
+
+Application opens:
+
+Settings already found.
+
+
+No prompt.
+
+Uses existing path automatically.
+
+Settings Screen
+
+Add menu:
+
+Settings
+   ↓
+Document Storage
+
+
+User can change anytime:
+
+Current Path
+
+D:\IT Asset Documents
+
+[Browse]
+[Save]
+
+Automatic Folder Creation Logic
+
+When PDF is generated:
+
+submission_type = "New Hire"
+operator = "Raja Amuthan"
+today = "10-Sep-2026"
+
+
+Create path:
+
+D:\IT Asset Documents\
+     New Hire\
+     10-Sep-2026\
+     Raja Amuthan\
+
+
+If folders don't exist:
+
+os.makedirs(path, exist_ok=True)
+
+Recommended File Name Format
+<EmployeeID>_<SubmissionType>_<Timestamp>.pdf
+
+
+Example:
+
+123456_NewHire_20260910_101523.pdf
+
+123457_NewHire_20260910_102614.pdf
+
+123458_LWD_20260910_153001.pdf
+
+
+Using timestamp avoids duplicate filename issues.
+
+Optional BU Structure
+
+If multiple BUs use the same application:
+
+D:\IT Asset Documents
+
+├── Chennai
+│   ├── New Hire
+│   ├── LWD
+│
+├── Hyderabad
+│   ├── New Hire
+│   ├── LWD
+│
+└── Bangalore
+    ├── New Hire
+    ├── LWD
+
+
+Generated path:
+
+D:\IT Asset Documents\
+    Chennai\
+    New Hire\
+    10-Sep-2026\
+    Raja Amuthan\
+
+Code Logic
+save_path = os.path.join(
+    settings["root_save_folder"],
+    submission_type,
+    datetime.now().strftime("%d-%b-%Y"),
+    operator_name
+)
+
+os.makedirs(save_path, exist_ok=True)
+
+
+Filename:
+
+filename = (
+    f"{employee_id}_"
+    f"{submission_type.replace(' ', '')}_"
+    f"{datetime.now():%Y%m%d_%H%M%S}.pdf"
+)
+
+My Recommendation
+
+Implement these enhancements:
+
+✅ One-time folder configuration
+
+✅ Settings saved locally (user_settings.json)
+
+✅ User can change path from Settings menu
+
+✅ Auto-create folders by Submission Type
+
+✅ Auto-create daily folder (10-Sep-2026)
+
+✅ Auto-create operator folder (Raja Amuthan)
+
+✅ Timestamp-based filenames
+
+✅ No "Choose Location" popup for every PDF
+
+This will make the application much more user-friendly and eliminate repetitive save-location selection while maintaining a clean audit-ready folder structure.
