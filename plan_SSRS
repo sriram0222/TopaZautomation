@@ -1,0 +1,692 @@
+IT Asset Submission Acknowledgement Application
+Proposed Enhancements & Future Roadmap
+Purpose
+
+The objective is to enhance the existing IT Asset Submission Acknowledgement application while keeping the current workflow intact. The application is already functional and widely usable, so the focus is on improving automation, usability, audit compliance, document management, and future integration capabilities.
+
+The proposal below is intended for discussion and design review with management and development teams.
+
+Current Design Principles
+
+The following existing functionality must remain unchanged:
+
+AD Lookup functionality
+Business Unit (BU) template management
+Word template processing
+PDF generation
+Digital signature workflow
+Topaz signature support
+Email draft generation
+Bulk processing
+Existing user experience
+
+All enhancements should be additive and backward compatible.
+
+Enhancement 1: Application Branding
+Objective
+
+Add Optum branding to the application UI.
+
+Requirements
+
+Display Optum logo in the application header:
+
+Plain Text
+1
+OPTUM LOGO
+2
+ 
+3
+IT Asset Submission Acknowledgement System
+Show more lines
+Notes
+Do not modify existing PDF templates.
+Generated PDFs already contain the required Optum logo.
+Branding is only for the application interface.
+Enhancement 2: Persistent User Configuration
+Objective
+
+Users should configure the application only once.
+
+Requirement
+
+Create a local settings file:
+
+Plain Text
+1
+user_settings.json
+Show more lines
+
+Store:
+
+JSON
+1
+{
+2
+"root_save_folder": "",
+3
+"operator_name": "",
+4
+"location": "",
+5
+"business_unit": ""
+6
+}
+Show more lines
+Benefits
+No repeated setup
+Better user experience
+Consistent document storage
+Enhancement 3: One-Time Save Location Configuration
+First Launch
+
+Prompt user to select a root document location:
+
+Plain Text
+1
+Select Root Save Folder
+2
+ 
+3
+[Browse]
+Show more lines
+
+Example:
+
+Plain Text
+1
+D:\IT Asset Documents
+Show more lines
+Subsequent Launches
+
+The application should automatically use the saved path.
+
+No repeated prompts.
+
+Enhancement 4: Operator Profile
+Requirement
+
+Collect operator information once:
+
+Plain Text
+1
+Operator Name
+2
+Location
+3
+Business Unit
+4
+Email Address
+Show more lines
+
+Store locally and reuse automatically.
+
+Usage
+
+Information can be used for:
+
+Folder creation
+Audit logs
+Signature metadata
+Reporting
+Enhancement 5: Automatic Folder Structure Management
+Objective
+
+Users should only select one root folder.
+
+The application should automatically create and manage all subfolders.
+
+Folder Structure
+Plain Text
+1
+<Root Folder>
+2
+ 
+3
+├── New Hire
+4
+│ └── 10-Sep-2026
+5
+│ └── Raja Amuthan
+6
+ 
+7
+├── LWD
+8
+│ └── 10-Sep-2026
+9
+│ └── Raja Amuthan
+10
+ 
+11
+├── Contractor LWD
+12
+ 
+13
+├── Break Fix
+14
+ 
+15
+├── Additional Laptop
+16
+ 
+17
+├── Mixed Build
+18
+ 
+19
+└── Site Transfer
+Show more lines
+Benefits
+Organized storage
+Easy document retrieval
+Better audit readiness
+Enhancement 6: PDF Naming Convention
+Standard Format
+Plain Text
+1
+<EmployeeID>_<SubmissionType>_<YYYYMMDD_HHMMSS>.pdf
+Show more lines
+Examples
+Plain Text
+1
+123456_NewHire_20260910_101530.pdf
+2
+ 
+3
+123456_LWD_20260910_154015.pdf
+4
+ 
+5
+123456_BreakFix_20260910_160040.pdf
+Show more lines
+Benefits
+Unique filenames
+No overwrite issues
+Easier search and audit tracking
+Enhancement 7: SSRS-Based Asset Auto Population
+Objective
+
+Reduce manual data entry for New Hire requests.
+
+Existing Flow
+Plain Text
+1
+Employee ID
+2
+↓
+3
+AD Lookup
+4
+↓
+5
+Employee Name
+6
+Manager Name
+Show more lines
+Proposed Flow
+Plain Text
+1
+Employee ID
+2
+↓
+3
+AD Lookup
+4
+↓
+5
+Employee Name
+6
+Manager Name
+7
+↓
+8
+SSRS Lookup
+9
+↓
+10
+Asset Details Auto-Populated
+Show more lines
+UI Option
+
+For New Hire requests:
+
+Plain Text
+1
+☐ Auto-fill Asset Details from SSRS Report
+Show more lines
+Enhancement 8: SSRS Authentication
+Requirement
+
+Use current Windows login session.
+
+No hardcoded credentials.
+
+No stored passwords.
+
+No authentication prompts during normal operation.
+
+Enhancement 9: SSRS Daily Download and Cache
+Objective
+
+Avoid downloading the report every time the application starts.
+
+Startup Logic
+Plain Text
+1
+Report Exists?
+2
+↓
+3
+NO → Download
+4
+ 
+5
+YES
+6
+↓
+7
+ 
+8
+Downloaded Today?
+9
+ 
+10
+YES → Use Existing Copy
+11
+ 
+12
+NO → Download New Copy
+Show more lines
+Benefits
+Faster startup
+Reduced SSRS load
+Better user experience
+Enhancement 10: SSRS Status Dashboard
+Requirement
+
+Display SSRS report status inside the application.
+
+Example
+Plain Text
+1
+SSRS Asset Report
+2
+ 
+3
+Status: Available
+4
+ 
+5
+Records Loaded: 2548
+6
+ 
+7
+Last Updated:
+8
+10-Sep-2026 09:15 AM
+9
+ 
+10
+[Refresh Data]
+Show more lines
+Status Options
+Plain Text
+1
+Available
+2
+Not Available
+3
+Download Failed
+4
+Stale
+Show more lines
+Enhancement 11: Manual Refresh
+Requirement
+
+Provide a button:
+
+Plain Text
+1
+[Refresh Data]
+2
+``
+Show more lines
+Functionality
+Plain Text
+1
+Download Latest Report
+2
+↓
+3
+Replace Existing File
+4
+↓
+5
+Reload Dataset
+6
+↓
+7
+Update Status
+Show more lines
+Enhancement 12: SSRS Data Mapping
+
+The following data should be auto-populated from SSRS:
+
+Application Field	SSRS ColumnEmployee ID	Empl ID
+Employee Name	Recipient Name
+Email Address	Email Address
+Serial Number	New SN
+Hostname	Hostname New
+Device Model	Described Model New
+Ticket Number	Prob Ticket
+Monitor	Monitor Type
+Dock	Peripherals Dock
+Keyboard & Mouse	Peripherals Keyb Mouse
+Power Adapter	Peripherals Power Chords
+Battery	Peripherals Battery
+Enhancement 13: Startup Health Check
+
+Display system readiness during startup.
+
+Example
+Plain Text
+1
+✓ Microsoft Word
+2
+ 
+3
+✓ Signing Certificate
+4
+ 
+5
+✓ SSRS Report
+6
+ 
+7
+✓ Save Folder
+8
+ 
+9
+✓ BU Templates
+Show more lines
+Benefits
+
+Quickly identify environmental issues before processing forms.
+
+Enhancement 14: Audit Logging
+Create
+Plain Text
+1
+logs\application.log
+2
+ 
+3
+logs\audit.log
+Show more lines
+Capture
+Plain Text
+1
+Date / Time
+2
+Operator
+3
+Employee ID
+4
+Submission Type
+5
+SSRS Match Status
+6
+PDF Generated
+7
+PDF Location
+8
+Email Draft Created
+9
+``
+Show more lines
+Benefits
+Compliance
+Troubleshooting
+Audit reporting
+Enhancement 15: Generated Document History
+Add New Screen
+Plain Text
+1
+Generated Documents
+Show more lines
+
+Display:
+
+Plain Text
+1
+Employee ID
+2
+Submission Type
+3
+Generated Date
+4
+PDF Location
+5
+``
+Show more lines
+
+Actions:
+
+Plain Text
+1
+Open PDF
+2
+Open Folder
+3
+Search
+Show more lines
+Enhancement 16: Email Templates by Submission Type
+
+Current email functionality remains unchanged.
+
+Enhance by using dedicated templates.
+
+New Hire
+Plain Text
+1
+Asset Issued
+Show more lines
+LWD
+Plain Text
+1
+Asset Returned
+Show more lines
+Break Fix
+Plain Text
+1
+Replacement Asset Issued
+Show more lines
+Site Transfer
+Plain Text
+1
+Asset Transfer
+Show more lines
+Enhancement 17: Digital Signature Improvements
+Current Observation
+
+Adobe Acrobat shows:
+
+Plain Text
+1
+Signature Validity Unknown
+Show more lines
+
+and signer details are not fully visible.
+
+Proposed Improvements
+
+Store metadata such as:
+
+Plain Text
+1
+Employee Name
+2
+Employee ID
+3
+Asset Receiver Name
+4
+Location
+5
+Signing Time
+6
+Signing Reason
+Show more lines
+Signing Reason Example
+Plain Text
+1
+IT Asset Acknowledgement
+Show more lines
+Enhancement 18: Visible Signature Timestamp
+
+Display below signatures:
+
+Plain Text
+1
+Signed On:
+2
+10-Sep-2026 10:15 AM
+Show more lines
+
+For both:
+
+Employee Signature
+Asset Receiver Signature
+Benefits
+
+Improved readability and audit compliance.
+
+Enhancement 19: PDF Metadata
+
+Embed metadata within the PDF.
+
+Fields
+Plain Text
+1
+Employee Name
+2
+Employee ID
+3
+Manager Name
+4
+Submission Type
+5
+Generated By
+6
+Generated Date
+7
+Prob Ticket
+8
+SCID
+Show more lines
+Enhancement 20: Future ServiceNow Readiness
+Objective
+
+Prepare architecture for future integration.
+
+Add configuration placeholder:
+
+Python
+1
+"servicenow": {
+2
+"enabled": false
+3
+}
+Show more lines
+
+No implementation required at this stage.
+
+Expected Future Workflow
+Plain Text
+1
+Application Opens
+2
+↓
+3
+Load User Settings
+4
+↓
+5
+Health Check
+6
+↓
+7
+Load Cached SSRS Report
+8
+↓
+9
+Show SSRS Status
+10
+↓
+11
+User Selects New Hire
+12
+↓
+13
+Enter Employee ID
+14
+↓
+15
+AD Lookup
+16
+↓
+17
+Employee Name + Manager
+18
+↓
+19
+(Optional)
+20
+SSRS Asset Lookup
+21
+↓
+22
+Asset Details Auto-Populated
+23
+↓
+24
+Capture Signatures
+25
+↓
+26
+Generate PDF
+27
+↓
+28
+Auto Save Into
+29
+ 
+30
+Root Folder
+31
+↓
+32
+Submission Type
+33
+↓
+34
+Date
+35
+↓
+36
+Operator
+37
+ 
+38
+<EmployeeID>_<SubmissionType>_<Timestamp>.pdf
+Show more lines
+Expected Benefits
+Reduced manual asset entry
+Faster document generation
+Consistent file organization
+Improved compliance and auditability
+Better user experience
+Reduced support effort
+Future-ready architecture for ServiceNow integration
+Easier adoption across multiple teams and locations
