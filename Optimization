@@ -1,0 +1,501 @@
+UI Optimization for 14-Inch Laptops
+Requirement
+
+Reduce vertical space usage and minimize scrolling.
+
+Move all instructional/help text into ℹ Information icons or tooltips.
+
+Business Unit
+
+Replace:
+
+Plain Text
+1
+Select the Business Unit for this form
+2
+(its Word template supplies the letterhead,
+3
+address, and layout).
+Show more lines
+
+With:
+
+Plain Text
+1
+Business Unit ℹ
+Show more lines
+Add New BU Template
+
+Replace:
+
+Plain Text
+1
+Upload a BU's base Word (.docx) form once...
+Show more lines
+
+With:
+
+Plain Text
+1
+[Add New BU Template] ℹ
+Show more lines
+Employee ID
+
+Replace:
+
+Plain Text
+1
+Scan or type the Employee ID,
+2
+then press Enter or click Lookup.
+Show more lines
+
+With:
+
+Plain Text
+1
+Employee ID ℹ
+Show more lines
+Goal
+
+The majority of the form should fit on a standard 14-inch laptop screen without excessive scrolling.
+
+2. Remove Save To Section
+
+Since the application already:
+
+Stores root folder in Settings
+Creates folders automatically
+Generates filenames automatically
+
+Remove:
+
+Plain Text
+1
+Save To:
+2
+[Path]
+3
+ 
+4
+[Choose Location]
+Show more lines
+
+from the main screen.
+
+The application should save PDFs automatically.
+
+3. Fix Scrolling Behavior
+
+Current issue:
+
+Plain Text
+1
+Mouse wheel scrolling is inconsistent.
+Show more lines
+
+Required:
+
+Mouse wheel should work anywhere in the form.
+Touchpad scrolling should work.
+Scroll should not require clicking on the scrollbar first.
+
+Apply to:
+
+Single Person tab
+Bulk Batch tab
+Generated Documents tab
+4. Lookup Source Rules
+New Hire
+
+Use:
+
+Plain Text
+1
+Primary Source = SSRS
+Show more lines
+
+Retrieve:
+
+Plain Text
+1
+Employee Name
+2
+Email Address
+3
+Asset Information
+4
+Device Model
+5
+Serial Number
+6
+Hostname
+7
+Ticket Number
+Show more lines
+
+If Manager information is not available:
+
+Plain Text
+1
+Fallback = AD Lookup
+Show more lines
+
+Retrieve:
+
+Plain Text
+1
+Manager Name
+2
+``
+Show more lines
+Break Fix
+
+Use:
+
+Plain Text
+1
+Primary Source = SSRS
+2
+Fallback = AD Lookup
+Show more lines
+Mixed Build
+
+Use:
+
+Plain Text
+1
+Primary Source = SSRS
+2
+Fallback = AD Lookup
+Show more lines
+Additional Laptop
+
+Use:
+
+Plain Text
+1
+Primary Source = SSRS
+2
+Fallback = AD Lookup
+Show more lines
+LWD / Exit
+
+Use:
+
+Plain Text
+1
+Primary Source = AD Lookup
+Show more lines
+
+Retrieve:
+
+Plain Text
+1
+Employee Name
+2
+Manager Name
+3
+Email Address
+Show more lines
+
+SSRS should not be the primary source.
+
+Contractor LWD
+
+Use:
+
+Plain Text
+1
+Primary Source = AD Lookup
+Show more lines
+Site Transfer
+
+Use:
+
+Plain Text
+1
+Primary Source = AD Lookup
+2
+Secondary Source = SSRS
+Show more lines
+5. SSRS Match Display
+
+Current display contains too much information.
+
+Display only:
+
+Plain Text
+1
+✅ Device Model: EliteBook 8 G1a 14"
+2
+✅ Ticket Number: SCTASK8131294
+Show more lines
+
+or
+
+Plain Text
+1
+✅ EliteBook 8 G1a 14" | SCTASK8131294
+Show more lines
+
+Do not display:
+
+Plain Text
+1
+Employee Name
+2
+Email
+3
+Serial Number
+4
+Hostname
+Show more lines
+
+in the match status section.
+
+Keep the display compact.
+
+6. Friendly Error Messages
+
+Do not show technical errors such as:
+
+Plain Text
+1
+CONFIG -> ad_lookup_ssrs.search_page_url
+Show more lines
+
+Show:
+
+Plain Text
+1
+⚠ Employee lookup unavailable.
+2
+ 
+3
+Please enter details manually.
+4
+``
+Show more lines
+
+Store technical details in:
+
+Plain Text
+1
+application.log
+Show more lines
+
+only.
+
+7. Auto Lookup
+
+Allow:
+
+Plain Text
+1
+Enter Employee ID
+2
+↓
+3
+Press Enter
+4
+↓
+5
+Automatically trigger lookup
+Show more lines
+
+Reduce unnecessary button clicks.
+
+8. Improved Keyboard Navigation
+
+Support:
+
+Plain Text
+1
+Tab
+2
+Shift + Tab
+3
+Enter
+Show more lines
+
+through the entire form.
+
+Optimize for operational users using keyboards.
+
+9. PDF Generation Success Screen
+
+After PDF generation show:
+
+Plain Text
+1
+✅ PDF Generated Successfully
+2
+ 
+3
+[Open PDF]
+4
+ 
+5
+[Open Folder]
+6
+ 
+7
+[Start Next Employee]
+Show more lines
+
+This helps users quickly verify the document and continue processing.
+
+10. Recent Activity Panel
+
+Display:
+
+Plain Text
+1
+Recent Documents
+2
+ 
+3
+900311850 - New Hire
+4
+ 
+5
+900311851 - LWD
+6
+ 
+7
+900311852 - Break Fix
+Show more lines
+
+Allow quick access to recently generated PDFs.
+
+11. Audit Logging
+
+Capture:
+
+Plain Text
+1
+Date/Time
+2
+Operator
+3
+Employee ID
+4
+Submission Type
+5
+Lookup Source
+6
+PDF Location
+7
+Email Draft Status
+Show more lines
+
+Store in:
+
+Plain Text
+1
+logs\application.log
+2
+logs\audit.log
+Show more lines
+12. Digital Signature Improvements
+
+When viewing Signature Properties in Adobe Acrobat, display:
+
+Plain Text
+1
+Employee Name
+2
+Employee ID
+3
+Signing Time
+4
+Location
+5
+Reason
+Show more lines
+
+instead of missing or incomplete signer information.
+
+13. Visible Signature Timestamp
+
+Display beneath signatures:
+
+Plain Text
+1
+Signed On:
+2
+12-Sep-2026 01:30 PM
+Show more lines
+
+For:
+
+Employee Signature
+Asset Receiver Signature
+14. PDF Metadata Improvements
+
+Embed:
+
+Plain Text
+1
+Employee Name
+2
+Employee ID
+3
+Manager Name
+4
+Submission Type
+5
+Generated By
+6
+Generated Date
+7
+Ticket Number
+8
+SCID
+Show more lines
+
+inside PDF properties.
+
+Future Enhancement
+ServiceNow Integration
+
+Prepare the design for future integration:
+
+Plain Text
+1
+Employee ID
+2
+↓
+3
+Lookup Employee
+4
+↓
+5
+SSRS Asset Details
+6
+↓
+7
+Generate PDF
+8
+↓
+9
+Attach PDF to ServiceNow Ticket
+10
+↓
+11
+Update Request Status
+Show more lines
+
+No implementation required at this stage.
+
+Expected Outcome
+Cleaner UI
+Reduced scrolling on 14-inch laptops
+Better lookup accuracy
+Automatic Manager lookup through AD when SSRS lacks data
+Compact SSRS status display
+Improved user experience
+Better audit trail
+Improved PDF signing metadata
+Future-ready architecture for ServiceNow integration
