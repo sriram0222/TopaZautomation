@@ -102,6 +102,7 @@ WHAT YOU NEED ON THE MACHINE RUNNING THIS
 
 import base64
 import io
+import csv
 import json
 import os
 import re
@@ -249,6 +250,12 @@ CONFIG = {
     "tracit_submission_types": ["Break Fix", "LWD", "Contractor LWD"],
     # Submission types that show an "Open TracIT" button next to the
     # Current Device Serial Number field.
+
+    "no_current_asset_submission_types": ["New Hire"],
+    # Submission types where the person has no existing/old device, so
+    # the "Current Device Serial Number" field is hidden entirely (only
+    # "New Device Serial Number" applies). New Hire is the obvious case;
+    # add others here if they ever come up.
     "tracit_url_template": "https://tracit.optum.com/ham/view-assets",
     # The TracIT page to open. This is the base page only - the exact
     # query-string format for deep-linking straight to an employee ID or
@@ -279,6 +286,69 @@ CONFIG = {
     "asset_receiver_display_name": "Asset Receiver",
     # Name recorded against the second cryptographic signature (the
     # employee's own name is used automatically for the first).
+
+    "signing_reason": "IT Asset Acknowledgement",
+    # Recorded as the cryptographic signature's "Reason" (shown in Adobe
+    # Acrobat's Signature Properties panel for both signature fields).
+    # This does NOT make the certificate itself "Trusted" in Acrobat -
+    # that still requires your IT team to install it as a Trusted
+    # Certificate (see the README) - it only adds readable context to an
+    # otherwise-unlabeled signature.
+
+    "email_templates": {
+        # Per-submission-type label used in the pre-filled Outlook draft's
+        # subject/body (see build_email_body). Falls back to the
+        # submission type's own name if not listed here. Only types also
+        # listed in "email_draft_submission_types" above actually get a
+        # draft opened.
+        "New Hire": "Asset Issued",
+        "Break Fix": "Replacement Asset Issued",
+        "LWD": "Asset Returned",
+        "Contractor LWD": "Asset Returned",
+        "Site Transfer": "Asset Transfer",
+    },
+
+    "ssrs_asset_report": {
+        # The SSRS report this app can download (via the current Windows
+        # login session - see requests_negotiate_sspi above, no stored
+        # password) to auto-populate New Hire asset details from Employee
+        # ID, instead of typing them in by hand every time.
+        "url": (
+            "https://orbit-ssrs-prod-int.optum.com/ReportServer?/Optum%20ET/"
+            "EUTS%20Dev%20Ops/EUTSDReporting/TransferredFromPowerBIReportServer/"
+            "CheckInTool-ShippingCenterReports/DDT%20Open%20Requests%20by%20"
+            "Status%20Raw%20Data&rs:Format=EXCELOPENXML"
+        ),
+        # Only re-downloaded once per calendar day automatically (see
+        # Enhancement 9) - "Refresh Data" in the app always forces a fresh
+        # download regardless of this cache.
+        "cache_max_age_hours": 24,
+        # Submission types that show the "Auto-fill Asset Details from
+        # SSRS Report" checkbox.
+        "new_hire_submission_types": ["New Hire"],
+        # SSRS column name -> app field. Edit the right-hand column names
+        # here if the real report's headers differ slightly (e.g. a
+        # trailing space, or a renamed column) - nothing else needs to
+        # change.
+        "column_map": {
+            "employee_id": "Empl ID",
+            "employee_name": "Recipient Name",
+            "email": "Email Address",
+            "serial_number": "New SN",
+            "hostname": "Hostname New",
+            "device_model": "Described Model New",
+            "ticket_number": "Prob Ticket",
+            "monitor": "Monitor Type",
+            "dock": "Peripherals Dock",
+            "keyboard_mouse": "Peripherals Keyb Mouse",
+            "power_adapter": "Peripherals Power Chords",
+            "battery": "Peripherals Battery",
+        },
+    },
+
+    "servicenow": {"enabled": False},
+    # Placeholder for a future ServiceNow integration - not implemented
+    # yet, kept here so the shape of that config already exists.
 }
 
 
@@ -3002,8 +3072,16 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
                 # structure that Acrobat/Reader read from Word every day.
                 writer = IncrementalPdfFileWriter(inf, strict=False)
                 field_spec = SigFieldSpec(sig["field_name"], on_page=0, box=box)
+                # Enhancement 17: reason/location, so Adobe's Signature
+                # Properties panel shows real context instead of nothing -
+                # this does NOT change whether the certificate itself
+                # shows as "Trusted" (that still needs your IT team to
+                # install it as a Trusted Certificate; see the README).
+                sig_reason = sig.get("reason") or config_data.get("signing_reason") or None
+                sig_location = sig.get("location") or None
                 meta = signers.PdfSignatureMetadata(
-                    field_name=sig["field_name"], name=sig.get("display_name") or None
+                    field_name=sig["field_name"], name=sig.get("display_name") or None,
+                    reason=sig_reason, location=sig_location,
                 )
                 # Blank appearance: box=None means an invisible field (no
                 # appearance is drawn regardless), and a real box means
@@ -3058,6 +3136,7 @@ def build_email_body(data):
         f"Employee Name: {data.get('emp_name', '')}",
         f"Manager Name: {data.get('manager_name', '')}",
         f"Submission Type: {data.get('submission_type', '')}",
+        f"Action: {data.get('email_action_label') or 'Asset Return'}",
         f"Date: {data.get('date', '')}",
         "",
         f"Device Serial Number Returned: {data.get('current_device_serial', '')}",
@@ -3072,7 +3151,11 @@ def build_email_body(data):
 
 
 def build_email_subject(data):
-    return f"IT Asset Return - {data.get('emp_name', '')} ({data.get('emp_id', '')})"
+    # Enhancement 16: dedicated wording per submission type (CONFIG's
+    # email_templates dict), while still defaulting to the exact original
+    # text ("IT Asset Return - ...") when no action label was supplied.
+    action_label = data.get("email_action_label") or "Return"
+    return f"IT Asset {action_label} - {data.get('emp_name', '')} ({data.get('emp_id', '')})"
 
 
 def open_draft(data, to_addresses="", attachment_path=None):
@@ -3134,6 +3217,426 @@ def _safe_folder_name(name, fallback="Unspecified"):
     return safe.replace(" ", "_") or fallback
 
 
+# ============================================================================
+# PERSISTENT USER SETTINGS (Enhancements 2/3/4) - configured once (root
+# save folder, operator name/location/BU/email), then reused automatically
+# on every later launch instead of asking again. Stored per-Windows-user
+# (their own profile folder), not next to app.py, so it survives an app.py
+# update/replace and doesn't collide between different people sharing the
+# same machine.
+# ============================================================================
+
+DEFAULT_USER_SETTINGS = {
+    "root_save_folder": "",
+    "operator_name": "",
+    "location": "",
+    "business_unit": "",
+    "email": "",
+}
+
+
+def _user_settings_dir():
+    """Where per-user settings live: %APPDATA%\\ITAssetSubmissionForm on
+    Windows - the standard per-user, no-admin-required location.
+
+    This is deliberately independent of _app_dir() (where logs/cache/
+    signing_identity/bu_templates live, next to app.py or the .exe).
+    That matters once this ships as a single-file .exe:
+      - PyInstaller's --onefile build extracts itself to a throwaway
+        temp folder (sys._MEIPASS) on every run and deletes it on exit -
+        _app_dir() already correctly resolves to the real .exe's own
+        folder instead (via sys.executable when sys.frozen is True), but
+        settings still shouldn't live there.
+      - The .exe itself gets replaced with a newer build periodically.
+        %APPDATA% survives that untouched, since it isn't "next to the
+        exe" at all.
+      - The .exe may be deployed to a location normal users can't write
+        to (e.g. Program Files) - %APPDATA% is always writable by the
+        signed-in user, no admin rights needed.
+      - Multiple people can share one machine/exe and each still gets
+        their own settings, since %APPDATA% is already per-Windows-login.
+    Falls back to the home directory on non-Windows (there is no APPDATA
+    there)."""
+    appdata = os.environ.get("APPDATA")
+    base = appdata if appdata else os.path.expanduser("~")
+    path = os.path.join(base, "ITAssetSubmissionForm")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _user_settings_path():
+    return os.path.join(_user_settings_dir(), "user_settings.json")
+
+
+# Where earlier builds of this app (before the %APPDATA% move above) used
+# to store this file. _load_user_settings() migrates it automatically on
+# first run after an update, so nobody who already ran the app loses
+# their saved root folder/operator profile.
+_LEGACY_USER_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".it_asset_form_user_settings.json")
+
+
+def _load_user_settings():
+    path = _user_settings_path()
+    if not os.path.exists(path) and os.path.exists(_LEGACY_USER_SETTINGS_PATH):
+        try:
+            with open(_LEGACY_USER_SETTINGS_PATH, encoding="utf-8") as f:
+                legacy_data = json.load(f)
+            logger.info(
+                "User settings: migrating from legacy path %r -> %r",
+                _LEGACY_USER_SETTINGS_PATH, path,
+            )
+            return _save_user_settings(legacy_data)
+        except Exception:
+            logger.exception("User settings: found a legacy settings file but could not migrate it, ignoring")
+    if not os.path.exists(path):
+        return dict(DEFAULT_USER_SETTINGS)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        logger.exception("User settings: could not read %r, using defaults", path)
+        return dict(DEFAULT_USER_SETTINGS)
+    merged = dict(DEFAULT_USER_SETTINGS)
+    merged.update({k: v for k, v in data.items() if k in DEFAULT_USER_SETTINGS})
+    return merged
+
+
+def _save_user_settings(data):
+    path = _user_settings_path()
+    to_write = dict(DEFAULT_USER_SETTINGS)
+    to_write.update({k: v for k, v in data.items() if k in DEFAULT_USER_SETTINGS})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(to_write, f, indent=2)
+    logger.info(
+        "User settings: saved to %r (root_save_folder=%r, operator_name=%r, business_unit=%r)",
+        path, to_write.get("root_save_folder"), to_write.get("operator_name"), to_write.get("business_unit"),
+    )
+    return to_write
+
+
+def _user_settings_configured(data):
+    """True once the one piece of information every later launch actually
+    depends on (root_save_folder) has been set. The rest (name/location/
+    BU/email) are asked for on the same first-run screen but don't
+    individually gate it - matching Enhancement 3's 'no repeated prompts'
+    requirement."""
+    return bool((data or {}).get("root_save_folder", "").strip())
+
+
+# ============================================================================
+# AUDIT LOG (Enhancement 14) - one line per PDF-generation attempt
+# (success or failure), separate from the diagnostic app.log above and
+# never rotated/truncated automatically. Plain CSV so it opens directly
+# in Excel for a quick audit review.
+# ============================================================================
+
+AUDIT_LOG_COLUMNS = [
+    "timestamp", "operator", "employee_id", "submission_type",
+    "ssrs_match_status", "pdf_generated", "pdf_location", "email_draft_created",
+]
+
+
+def _audit_log_path():
+    log_dir = os.path.join(_app_dir(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, "audit.log")
+
+
+def _write_audit_log_entry(operator="", employee_id="", submission_type="",
+                            ssrs_match_status="", pdf_generated=False,
+                            pdf_location="", email_draft_created=False):
+    path = _audit_log_path()
+    is_new = not os.path.exists(path)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if is_new:
+                writer.writerow(AUDIT_LOG_COLUMNS)
+            writer.writerow([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                operator, employee_id, submission_type, ssrs_match_status,
+                "Yes" if pdf_generated else "No", pdf_location,
+                "Yes" if email_draft_created else "No",
+            ])
+    except Exception:
+        logger.exception("Audit log: could not write entry (employee_id=%r)", employee_id)
+
+
+def _read_audit_log_entries():
+    """Returns a list of dicts (one per row), newest first, for the
+    Generated Documents history screen. Never raises - returns [] on any
+    problem reading the file (e.g. it doesn't exist yet)."""
+    path = _audit_log_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        rows.reverse()
+        return rows
+    except Exception:
+        logger.exception("Audit log: could not read %r", path)
+        return []
+
+
+# ============================================================================
+# PDF METADATA (Enhancement 19) - embedded via pypdf, on the UNSIGNED pdf
+# only (see the call site in _on_generate/_batch_save_and_complete) -
+# editing bytes after the cryptographic signature has been applied would
+# invalidate it.
+# ============================================================================
+
+def _set_pdf_metadata(pdf_path, meta):
+    """Writes standard PDF /Info metadata into pdf_path IN PLACE. Any
+    error here is logged, never raised - metadata is a nice-to-have, not
+    something that should ever block getting a signed PDF out the door."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        logger.warning("PDF metadata: pypdf not installed, skipping")
+        return
+    try:
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        writer.append(reader)
+        writer.add_metadata({f"/{k}": str(v) for k, v in meta.items() if v})
+        tmp_path = pdf_path + ".metatmp"
+        with open(tmp_path, "wb") as f:
+            writer.write(f)
+        os.replace(tmp_path, pdf_path)
+        logger.debug("PDF metadata: wrote %d field(s) into %r", len(meta), pdf_path)
+    except Exception:
+        logger.exception("PDF metadata: failed to write into %r (non-fatal)", pdf_path)
+
+
+# ============================================================================
+# SSRS ASSET REPORT (Enhancements 7-12) - downloaded once per day (or on
+# demand via "Refresh Data"), cached locally, and indexed by Employee ID
+# so New Hire asset details can be auto-filled instead of typed in by
+# hand. Uses the current Windows login session (SSPI) - no stored
+# password, same mechanism as the existing "direct" AD Lookup mode above.
+# ============================================================================
+
+SSRS_STATUS_NOT_AVAILABLE = "Not Available"
+SSRS_STATUS_AVAILABLE = "Available"
+SSRS_STATUS_DOWNLOAD_FAILED = "Download Failed"
+SSRS_STATUS_STALE = "Stale"
+
+
+def _ssrs_cache_path():
+    cache_dir = os.path.join(_app_dir(), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "ssrs_asset_report.xlsx")
+
+
+def _ssrs_cache_is_fresh(path, max_age_hours=24):
+    """Matches Enhancement 9's 'Downloaded Today?' check: fresh only if
+    the cached file exists, was last modified today, AND within
+    max_age_hours - so a file from just before midnight still counts as
+    stale first thing the next morning even though max_age_hours alone
+    wouldn't have expired it yet."""
+    if not os.path.exists(path):
+        return False
+    mtime = datetime.fromtimestamp(os.path.getmtime(path))
+    if mtime.date() != datetime.now().date():
+        return False
+    age_hours = (datetime.now() - mtime).total_seconds() / 3600.0
+    return age_hours <= max_age_hours
+
+
+def download_ssrs_asset_report(url, dest_path, timeout=60):
+    """Downloads the SSRS report (an .xlsx, via rs:Format=EXCELOPENXML) to
+    dest_path using the current Windows login session - no credentials
+    are ever entered or stored by this app. Raises RuntimeError with a
+    clear, human-readable message on any failure."""
+    if requests is None:
+        raise RuntimeError(
+            "The 'requests' library is not installed. Run:\n    pip install requests"
+        )
+    if not HAS_SSPI:
+        raise RuntimeError(
+            "The 'requests_negotiate_sspi' library is not installed, so this app "
+            "can't authenticate to SSRS with your current Windows login. Run:\n"
+            "    pip install requests-negotiate-sspi\n"
+            "(Windows only - this lets the download reuse your existing network "
+            "login instead of a password prompt.)"
+        )
+    auth = HttpNegotiateAuth()
+    try:
+        resp = requests.get(url, auth=auth, timeout=timeout)
+        resp.raise_for_status()
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            f"Could not reach the SSRS report server:\n{url}\n\n"
+            "Check that you're connected to the corporate network/VPN."
+        ) from exc
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError("The SSRS report server took too long to respond.") from exc
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        raise RuntimeError(
+            f"SSRS report server returned an error (HTTP {status}). You may not "
+            "have permission to run this report, or the URL may have changed - "
+            "check with the report owner."
+        ) from exc
+    except Exception as exc:
+        raise RuntimeError(f"SSRS download failed: {exc}") from exc
+
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    tmp_path = dest_path + ".part"
+    with open(tmp_path, "wb") as f:
+        f.write(resp.content)
+    os.replace(tmp_path, dest_path)
+    return dest_path
+
+
+def _find_ssrs_header_row(rows, required_columns, max_scan_rows=6):
+    """Same lesson learned from the AD lookup 'sizer row' bug: don't
+    assume row 0 of an SSRS export is always the real header row - scan
+    the first few rows for the one that actually contains at least one of
+    the expected column names. Returns the 0-based row index, or None."""
+    wanted = {str(c).strip().lower() for c in required_columns}
+    for i, row in enumerate(rows[:max_scan_rows]):
+        cells = {str(c).strip().lower() for c in row if c is not None}
+        if wanted & cells:
+            return i
+    return None
+
+
+def parse_ssrs_asset_workbook(xlsx_path, column_map):
+    """Reads xlsx_path (an SSRS EXCELOPENXML export) and returns
+    (index, record_count) where index is {employee_id_string: {app_field:
+    value, ...}}, built from column_map ({app_field: "SSRS Column Name"}).
+    Each row is indexed under both its literal Employee ID text AND a
+    digits-only variant, so a lookup by either '0012345' or '12345' finds
+    the same row - the same lesson learned from the AD Lookup Employee ID
+    field."""
+    wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        header_scan_rows = [list(r) for r in ws.iter_rows(min_row=1, max_row=6, values_only=True)]
+
+        header_row_idx = _find_ssrs_header_row(header_scan_rows, column_map.values())
+        if header_row_idx is None:
+            raise RuntimeError(
+                "Downloaded the SSRS report, but couldn't find the expected column "
+                f"headers ({', '.join(column_map.values())}) in its first few rows. "
+                "The report layout may have changed - check ssrs_asset_report."
+                "column_map in CONFIG against the real file."
+            )
+
+        header_cells = [str(c).strip() if c is not None else "" for c in header_scan_rows[header_row_idx]]
+        col_index = {}
+        for app_field, ssrs_col in column_map.items():
+            try:
+                col_index[app_field] = header_cells.index(ssrs_col)
+            except ValueError:
+                continue  # column not present in this export - field left unpopulated
+
+        if "employee_id" not in col_index:
+            raise RuntimeError(
+                f"Downloaded the SSRS report, but its Employee ID column "
+                f"({column_map.get('employee_id')!r}) wasn't found among the "
+                f"headers: {header_cells}"
+            )
+
+        index = {}
+        count = 0
+        for row in ws.iter_rows(min_row=header_row_idx + 2, values_only=True):
+            if row is None or all(v is None or str(v).strip() == "" for v in row):
+                continue
+            emp_idx = col_index["employee_id"]
+            emp_id_cell = row[emp_idx] if emp_idx < len(row) else None
+            emp_id = str(emp_id_cell).strip() if emp_id_cell is not None else ""
+            if not emp_id:
+                continue
+            record = {}
+            for app_field, idx in col_index.items():
+                if app_field == "employee_id" or idx >= len(row):
+                    continue
+                val = row[idx]
+                record[app_field] = "" if val is None else str(val).strip()
+            index[emp_id] = record
+            digits_only = "".join(c for c in emp_id if c.isdigit())
+            if digits_only and digits_only != emp_id:
+                index.setdefault(digits_only, record)
+            count += 1
+        return index, count
+    finally:
+        wb.close()
+
+
+# ============================================================================
+# STARTUP HEALTH CHECK (Enhancement 13)
+# ============================================================================
+
+def _check_word_installed():
+    """Best-effort, non-invasive check - reads the registry, does NOT
+    launch Word. True if Microsoft Word's COM ProgID is registered.
+    Always returns False (never raises) on non-Windows or on any error -
+    this is a startup diagnostic, not something that should crash the
+    app."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, "Word.Application")
+        return True
+    except Exception:
+        return False
+
+
+def run_startup_health_check(config_data, user_settings, ssrs_status):
+    """Returns an ordered list of (label, ok, detail) tuples for the
+    startup health-check panel. Every check is wrapped in its own
+    try/except so one failing check can never prevent the others (or the
+    app itself) from proceeding."""
+    checks = []
+
+    try:
+        word_ok = _check_word_installed()
+        checks.append((
+            "Microsoft Word", word_ok,
+            "" if word_ok else "Word.Application COM ProgID not found in the registry.",
+        ))
+    except Exception as exc:
+        checks.append(("Microsoft Word", False, str(exc)))
+
+    try:
+        _, cert_path = _signing_identity_paths(config_data)
+        ok = os.path.exists(cert_path)
+        checks.append((
+            "Signing Certificate", ok,
+            "" if ok else f"Not created yet at {cert_path} (generated automatically on first use).",
+        ))
+    except Exception as exc:
+        checks.append(("Signing Certificate", False, str(exc)))
+
+    checks.append(("SSRS Asset Report", ssrs_status == SSRS_STATUS_AVAILABLE, ssrs_status))
+
+    try:
+        root = (user_settings or {}).get("root_save_folder") or _resolve_path(
+            config_data, "pdf_save_folder", "generated_forms"
+        )
+        os.makedirs(root, exist_ok=True)
+        ok = os.access(root, os.W_OK)
+        checks.append(("Save Folder", ok, root if ok else f"{root} is not writable."))
+    except Exception as exc:
+        checks.append(("Save Folder", False, str(exc)))
+
+    try:
+        templates = list_templates(_resolve_path(config_data, "bu_templates_folder", "bu_templates"))
+        ok = len(templates) > 0
+        checks.append((
+            "BU Templates", ok,
+            f"{len(templates)} loaded" if ok else "None configured yet - add one via 'Add New BU Template...'.",
+        ))
+    except Exception as exc:
+        checks.append(("BU Templates", False, str(exc)))
+
+    return checks
+
+
 class WizardApp(tk.Tk):
     """Two-tab app: 'Single Person' (one-off form, everything on one
     scrollable page) and 'Bulk Batch' (import an Excel list, see everyone
@@ -3143,11 +3646,19 @@ class WizardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.config_data = copy.deepcopy(CONFIG)  # settings live at the top of this file
+        self.user_settings = _load_user_settings()
+        self.ssrs_state = {
+            "status": SSRS_STATUS_NOT_AVAILABLE, "records": 0,
+            "last_updated": None, "index": {}, "error": "",
+        }
         logger.info(
-            "WizardApp: starting up. ad_lookup_mode=%r use_topaz_pad=%r bu_templates_folder=%r",
+            "WizardApp: starting up. ad_lookup_mode=%r use_topaz_pad=%r bu_templates_folder=%r "
+            "root_save_folder=%r operator_name=%r",
             self.config_data.get("ad_lookup_mode"),
             self.config_data.get("use_topaz_pad"),
             self.config_data.get("bu_templates_folder"),
+            self.user_settings.get("root_save_folder"),
+            self.user_settings.get("operator_name"),
         )
         self.browser_session = BrowserLookupSession()
         self.signature_service = SignatureService(self.config_data)
@@ -3181,9 +3692,22 @@ class WizardApp(tk.Tk):
         self._build_form()
 
         self._build_bulk_tab_shell()
+        self._build_history_tab_shell()
 
         if _uses_webview_lookup(self.config_data):
             threading.Thread(target=self.browser_session.start, daemon=True).start()
+
+        # First-run setup (Enhancements 2-4) happens after the shell/tabs
+        # exist (so the dialog has a real parent window and _refresh_save_path
+        # is already wired up) but before the person starts using the form.
+        if not _user_settings_configured(self.user_settings):
+            self.after(200, lambda: self._show_settings_dialog(first_run=True))
+
+        # Kicks off a background thread; the SSRS status panel and startup
+        # health check update live as soon as it finishes - neither blocks
+        # the app from being usable in the meantime.
+        self._ssrs_refresh(force=False)
+        self.after(400, self._show_startup_health_check)
 
         logger.info("WizardApp: GUI ready")
 
@@ -3192,13 +3716,278 @@ class WizardApp(tk.Tk):
         self.status_var = tk.StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w").pack(fill="x", side="bottom")
 
+        self._build_header_bar()
+
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
         self.single_tab = ttk.Frame(self.notebook)
         self.bulk_tab = ttk.Frame(self.notebook)
+        self.history_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.single_tab, text="Single Person")
         self.notebook.add(self.bulk_tab, text="Bulk Batch")
+        self.notebook.add(self.history_tab, text="Generated Documents")
+
+    # ------------------------------------------------------- branding/header
+    def _build_header_bar(self):
+        """Enhancement 1 (Optum branding) + the SSRS Asset Report status
+        dashboard (Enhancements 10/11) + a 'Settings...' button to reopen
+        the one-time setup dialog (Enhancement 2-4) any time."""
+        header = ttk.Frame(self, padding=(10, 6))
+        header.pack(fill="x", side="top")
+
+        brand = ttk.Frame(header)
+        brand.pack(side="left")
+        self._header_logo_image = None  # kept as an attribute so Tk doesn't GC it
+        logo_path = os.path.join(_app_dir(), "assets", "optum_logo.png")
+        if os.path.exists(logo_path):
+            try:
+                img = Image.open(logo_path)
+                img.thumbnail((140, 40))
+                self._header_logo_image = ImageTk.PhotoImage(img)
+                ttk.Label(brand, image=self._header_logo_image).pack(side="left", padx=(0, 10))
+            except Exception:
+                logger.exception("Header: could not load logo at %r (falling back to text)", logo_path)
+        if self._header_logo_image is None:
+            # No real logo file provided yet - drop assets/optum_logo.png next
+            # to app.py to show the actual logo here instead of this text
+            # fallback. PDF templates already contain the real logo and are
+            # untouched either way.
+            ttk.Label(brand, text="OPTUM", font=("Segoe UI", 16, "bold"), foreground="#EB690B").pack(
+                side="left", padx=(0, 10)
+            )
+        title_box = ttk.Frame(brand)
+        title_box.pack(side="left")
+        ttk.Label(
+            title_box, text="IT Asset Submission Acknowledgement System", font=("Segoe UI", 11, "bold")
+        ).pack(anchor="w")
+        self.header_operator_var = tk.StringVar(value=self._format_operator_line())
+        ttk.Label(title_box, textvariable=self.header_operator_var, foreground="#666").pack(anchor="w")
+
+        right = ttk.Frame(header)
+        right.pack(side="right")
+
+        ssrs_box = ttk.LabelFrame(right, text="SSRS Asset Report", padding=6)
+        ssrs_box.pack(side="left", padx=(0, 10))
+        self.ssrs_status_var = tk.StringVar(value=f"Status: {SSRS_STATUS_NOT_AVAILABLE}")
+        self.ssrs_records_var = tk.StringVar(value="Records Loaded: 0")
+        self.ssrs_updated_var = tk.StringVar(value="Last Updated: never")
+        ttk.Label(ssrs_box, textvariable=self.ssrs_status_var).pack(anchor="w")
+        ttk.Label(ssrs_box, textvariable=self.ssrs_records_var).pack(anchor="w")
+        ttk.Label(ssrs_box, textvariable=self.ssrs_updated_var).pack(anchor="w")
+        ttk.Button(ssrs_box, text="Refresh Data", command=lambda: self._ssrs_refresh(force=True)).pack(
+            anchor="w", pady=(4, 0)
+        )
+
+        ttk.Button(right, text="Settings...", command=lambda: self._show_settings_dialog(first_run=False)).pack(
+            side="left"
+        )
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x", side="top")
+
+    def _format_operator_line(self):
+        name = self.user_settings.get("operator_name") or ""
+        location = self.user_settings.get("location") or ""
+        if not name and not location:
+            return "Operator not set up yet - click Settings to configure."
+        return "Operator: " + name + (f"  |  {location}" if location else "")
+
+    def _refresh_header_operator_label(self):
+        if hasattr(self, "header_operator_var"):
+            self.header_operator_var.set(self._format_operator_line())
+
+    def _refresh_ssrs_status_labels(self):
+        if not hasattr(self, "ssrs_status_var"):
+            return
+        state = self.ssrs_state
+        self.ssrs_status_var.set(f"Status: {state.get('status', SSRS_STATUS_NOT_AVAILABLE)}")
+        self.ssrs_records_var.set(f"Records Loaded: {state.get('records', 0)}")
+        last_updated = state.get("last_updated")
+        self.ssrs_updated_var.set(
+            "Last Updated: " + (last_updated.strftime("%d-%b-%Y %I:%M %p") if last_updated else "never")
+        )
+        self.status_var.set(
+            f"SSRS asset report: {state.get('status')}"
+            + (f" - {state['error']}" if state.get("error") else "")
+        )
+
+    def _ssrs_refresh(self, force=False):
+        """Downloads/re-parses the SSRS asset report in a background
+        thread (Enhancements 9/11) so the UI never blocks on the network
+        call, then hops back to the main thread (self.after) to update
+        state and the status labels - Tkinter widgets must only be
+        touched from the main thread."""
+
+        def worker():
+            cfg = self.config_data.get("ssrs_asset_report", {})
+            url = cfg.get("url", "")
+            column_map = cfg.get("column_map", {})
+            max_age = cfg.get("cache_max_age_hours", 24)
+            cache_path = _ssrs_cache_path()
+            error_detail = ""
+
+            if force or not _ssrs_cache_is_fresh(cache_path, max_age):
+                try:
+                    if not url:
+                        raise RuntimeError("ssrs_asset_report.url is not configured.")
+                    logger.info("SSRS asset report: downloading (force=%r) -> %r", force, cache_path)
+                    download_ssrs_asset_report(url, cache_path)
+                except Exception as exc:
+                    logger.exception("SSRS asset report: download failed (will try existing cache, if any)")
+                    error_detail = str(exc)
+
+            index, records, status, last_updated = {}, 0, SSRS_STATUS_NOT_AVAILABLE, None
+            if os.path.exists(cache_path):
+                try:
+                    index, records = parse_ssrs_asset_workbook(cache_path, column_map)
+                    fresh = _ssrs_cache_is_fresh(cache_path, max_age)
+                    status = SSRS_STATUS_AVAILABLE if (fresh and not error_detail) else SSRS_STATUS_STALE
+                    last_updated = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                except Exception as exc:
+                    logger.exception("SSRS asset report: could not parse cached file %r", cache_path)
+                    error_detail = error_detail or str(exc)
+                    status = SSRS_STATUS_DOWNLOAD_FAILED
+            else:
+                status = SSRS_STATUS_DOWNLOAD_FAILED if error_detail else SSRS_STATUS_NOT_AVAILABLE
+
+            def apply():
+                self.ssrs_state = {
+                    "status": status, "records": records,
+                    "last_updated": last_updated, "index": index, "error": error_detail,
+                }
+                self._refresh_ssrs_status_labels()
+                logger.info(
+                    "SSRS asset report: status=%r records=%d error=%r",
+                    status, records, error_detail,
+                )
+
+            self.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_startup_health_check(self):
+        """Enhancement 13 - a quick, non-blocking startup readiness panel.
+        The SSRS line reflects whatever the local cache looks like right
+        now (a fast, synchronous, no-network check) rather than waiting
+        on the background download kicked off above - the SSRS Asset
+        Report box in the header is the live/authoritative status."""
+        cache_path = _ssrs_cache_path()
+        max_age = self.config_data.get("ssrs_asset_report", {}).get("cache_max_age_hours", 24)
+        if not os.path.exists(cache_path):
+            ssrs_snapshot = SSRS_STATUS_NOT_AVAILABLE
+        elif _ssrs_cache_is_fresh(cache_path, max_age):
+            ssrs_snapshot = SSRS_STATUS_AVAILABLE
+        else:
+            ssrs_snapshot = SSRS_STATUS_STALE
+
+        checks = run_startup_health_check(self.config_data, self.user_settings, ssrs_snapshot)
+        logger.info("Startup health check: %r", checks)
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Startup Health Check")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="System Readiness", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(0, 8))
+        for label, ok, detail in checks:
+            row = ttk.Frame(frm)
+            row.pack(fill="x", anchor="w", pady=2)
+            mark = "✓" if ok else "✗"
+            color = "#1a7f37" if ok else "#a05a00"
+            ttk.Label(row, text=f"{mark} {label}", foreground=color, width=24, anchor="w").pack(side="left")
+            if detail:
+                ttk.Label(row, text=detail, foreground="#888").pack(side="left")
+        ttk.Button(frm, text="OK", command=dlg.destroy).pack(anchor="e", pady=(10, 0))
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+
+    def _show_settings_dialog(self, first_run=False):
+        """Enhancements 2-4: one-time (or reopenable via 'Settings...')
+        collection of the root save folder + operator profile."""
+        dlg = tk.Toplevel(self)
+        dlg.title("First-Time Setup" if first_run else "Settings")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        pad = {"padx": 10, "pady": 6}
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+
+        row = 0
+        if first_run:
+            ttk.Label(
+                frm,
+                text="Welcome! Set these up once - the app remembers them on every future launch.",
+                wraplength=420, foreground="#444",
+            ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 10))
+            row += 1
+
+        ttk.Label(frm, text="Root Save Folder:").grid(row=row, column=0, sticky="w", **pad)
+        root_var = tk.StringVar(value=self.user_settings.get("root_save_folder", ""))
+        ttk.Entry(frm, textvariable=root_var, width=42).grid(row=row, column=1, **pad)
+
+        def browse():
+            chosen = filedialog.askdirectory(title="Select Root Save Folder", parent=dlg)
+            if chosen:
+                root_var.set(chosen)
+
+        ttk.Button(frm, text="Browse...", command=browse).grid(row=row, column=2, **pad)
+        row += 1
+
+        ttk.Label(frm, text="Operator Name:").grid(row=row, column=0, sticky="w", **pad)
+        op_var = tk.StringVar(value=self.user_settings.get("operator_name", ""))
+        ttk.Entry(frm, textvariable=op_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+
+        ttk.Label(frm, text="Location:").grid(row=row, column=0, sticky="w", **pad)
+        loc_var = tk.StringVar(value=self.user_settings.get("location", ""))
+        ttk.Entry(frm, textvariable=loc_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+
+        ttk.Label(frm, text="Business Unit:").grid(row=row, column=0, sticky="w", **pad)
+        bu_var = tk.StringVar(value=self.user_settings.get("business_unit", ""))
+        bu_names = [t["name"] for t in self._bu_templates_cache] if self._bu_templates_cache else []
+        if bu_names:
+            ttk.Combobox(frm, textvariable=bu_var, values=bu_names, state="readonly", width=39).grid(
+                row=row, column=1, columnspan=2, sticky="w", **pad
+            )
+        else:
+            ttk.Entry(frm, textvariable=bu_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+
+        ttk.Label(frm, text="Email Address:").grid(row=row, column=0, sticky="w", **pad)
+        email_var = tk.StringVar(value=self.user_settings.get("email", ""))
+        ttk.Entry(frm, textvariable=email_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=row, column=0, columnspan=3, pady=(10, 0))
+
+        def do_save():
+            if not root_var.get().strip():
+                messagebox.showwarning("Root Save Folder required", "Please choose a root save folder.", parent=dlg)
+                return
+            self.user_settings = _save_user_settings({
+                "root_save_folder": root_var.get().strip(),
+                "operator_name": op_var.get().strip(),
+                "location": loc_var.get().strip(),
+                "business_unit": bu_var.get().strip(),
+                "email": email_var.get().strip(),
+            })
+            if hasattr(self, "_refresh_save_path"):
+                self._refresh_save_path()
+            if hasattr(self, "_batch_refresh_save_path"):
+                self._batch_refresh_save_path()
+            self._refresh_header_operator_label()
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Save", command=do_save).pack(side="left", padx=6)
+        if not first_run:
+            ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.grab_set()
+        self.wait_window(dlg)
 
     def _make_scrollable(self, container):
         """Wraps `container` in a vertically-scrolling canvas and returns
@@ -3465,7 +4254,11 @@ class WizardApp(tk.Tk):
         row.pack(anchor="w")
         ttk.Label(row, text="Employee ID:").pack(side="left")
         self.emp_id_var = tk.StringVar(value="")
-        emp_id_entry = ttk.Entry(row, textvariable=self.emp_id_var, width=24)
+        digits_only_vcmd = (self.register(self._validate_digits_only), "%P")
+        emp_id_entry = ttk.Entry(
+            row, textvariable=self.emp_id_var, width=24,
+            validate="key", validatecommand=digits_only_vcmd,
+        )
         emp_id_entry.pack(side="left", padx=8)
         self.lookup_button = ttk.Button(row, text="Lookup (AD)", command=self._do_lookup)
         self.lookup_button.pack(side="left", padx=4)
@@ -3595,17 +4388,43 @@ class WizardApp(tk.Tk):
             return
 
         # The real production form always shows every asset field, for
-        # every submission type - so the wizard does the same, rather
-        # than showing a different subset depending on what was picked.
-        row1 = ttk.Frame(parent)
-        row1.pack(anchor="w", pady=4)
-        ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
-        ttk.Entry(row1, textvariable=self.current_serial_var, width=30).pack(side="left", padx=8)
-        if sub_type in self.config_data.get("tracit_submission_types", []):
-            ttk.Button(
-                row1, text="Open TracIT",
-                command=lambda: self._open_tracit(self.emp_id_var.get().strip(), self.current_serial_var.get().strip()),
-            ).pack(side="left", padx=(4, 0))
+        # every submission type that HAS an old/current device - a New
+        # Hire has no existing device to return, so "Current Device
+        # Serial Number" is hidden entirely for those types (see
+        # no_current_asset_submission_types in CONFIG) rather than shown
+        # blank and confusing.
+        show_current_serial = sub_type not in self.config_data.get("no_current_asset_submission_types", [])
+        if show_current_serial:
+            row1 = ttk.Frame(parent)
+            row1.pack(anchor="w", pady=4)
+            ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
+            ttk.Entry(row1, textvariable=self.current_serial_var, width=30).pack(side="left", padx=8)
+            if sub_type in self.config_data.get("tracit_submission_types", []):
+                ttk.Button(
+                    row1, text="Open TracIT",
+                    command=lambda: self._open_tracit(self.emp_id_var.get().strip(), self.current_serial_var.get().strip()),
+                ).pack(side="left", padx=(4, 0))
+
+        # Enhancement 7 - SSRS-based asset auto-population, for New Hire
+        # (configurable via ssrs_asset_report.new_hire_submission_types).
+        # The SSRS 'New SN' column is the device being ISSUED, so it fills
+        # "New Device Serial Number" below - not "Current", which doesn't
+        # apply to a New Hire at all (see show_current_serial above).
+        # The rest of the SSRS row (hostname/model/ticket/monitor/dock/
+        # etc.) is appended as a readable block into "Others (specify)",
+        # since this app's Word templates don't have dedicated cells for
+        # them yet - see the chat reply for how to get those added as
+        # real fields instead.
+        if sub_type in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
+            ssrs_row = ttk.Frame(parent)
+            ssrs_row.pack(anchor="w", pady=(0, 4))
+            self.ssrs_autofill_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                ssrs_row, text="Auto-fill Asset Details from SSRS Report",
+                variable=self.ssrs_autofill_var, command=self._ssrs_autofill_toggled,
+            ).pack(side="left")
+            self.ssrs_autofill_hint = ttk.Label(ssrs_row, text="", foreground="#888")
+            self.ssrs_autofill_hint.pack(side="left", padx=(8, 0))
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
@@ -3632,6 +4451,47 @@ class WizardApp(tk.Tk):
         row4.pack(anchor="w", pady=4)
         ttk.Label(row4, text="Asset Pending for Submission (if any):").pack(side="left")
         ttk.Entry(row4, textvariable=self.asset_pending_var, width=40).pack(side="left", padx=8)
+
+    @staticmethod
+    def _format_ssrs_record(record):
+        """Turns a parsed SSRS asset row into a readable multi-line block
+        (used to append into the 'Others (specify)' free-text field, since
+        the Word templates don't have dedicated cells for these fields
+        yet)."""
+        labels = [
+            ("hostname", "Hostname"), ("device_model", "Device Model"),
+            ("ticket_number", "Ticket Number"), ("monitor", "Monitor"),
+            ("dock", "Dock"), ("keyboard_mouse", "Keyboard & Mouse"),
+            ("power_adapter", "Power Adapter"), ("battery", "Battery"),
+        ]
+        lines = [f"{label}: {record.get(key, '')}" for key, label in labels if record.get(key)]
+        return " | ".join(lines)
+
+    def _ssrs_autofill_toggled(self):
+        if not self.ssrs_autofill_var.get():
+            self._ssrs_match_status = ""
+            self.ssrs_autofill_hint.config(text="")
+            return
+        emp_id = self.emp_id_var.get().strip()
+        index = self.ssrs_state.get("index", {})
+        record = index.get(emp_id) or index.get("".join(c for c in emp_id if c.isdigit()))
+        if not record:
+            self._ssrs_match_status = "Not Found"
+            self.ssrs_autofill_hint.config(
+                text=f"No SSRS row found for Employee ID '{emp_id}'.", foreground="#a05a00",
+            )
+            self.ssrs_autofill_var.set(False)
+            return
+        self._ssrs_match_status = "Matched"
+        if record.get("serial_number"):
+            # The device being ISSUED, not an old/current one - see the
+            # comment above on why New Hire has no "current" device.
+            self.new_serial_var.set(record["serial_number"])
+        summary = self._format_ssrs_record(record)
+        if summary:
+            existing = self.assets_other_var.get().strip()
+            self.assets_other_var.set(f"{existing}; {summary}" if existing else summary)
+        self.ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
     # ---------------------------------------------- 6/7: signatures
     def _build_signature_section(self, parent, data_key, title, capture_title):
@@ -3692,14 +4552,33 @@ class WizardApp(tk.Tk):
 
     # ------------------------------------------------- save location
     def _compute_default_output_path(self):
-        today_str = date.today().strftime("%d-%b-%Y")
-        save_folder = _resolve_path(self.config_data, "pdf_save_folder", "generated_forms")
-        emp_name = self.emp_name_var.get().strip() if hasattr(self, "emp_name_var") else ""
+        # Enhancement 5 folder structure + Enhancement 6 filename
+        # convention: <Root>/<SubmissionType>/<Date>/<Operator>/
+        # <EmployeeID>_<SubmissionType>_<YYYYMMDD_HHMMSS>.pdf
+        # Root comes from the one-time Settings dialog (Enhancements 2-4)
+        # once configured; falls back to CONFIG's pdf_save_folder until
+        # then, so nothing breaks for anyone who hasn't set it up yet.
+        root = (self.user_settings.get("root_save_folder") or "").strip() or _resolve_path(
+            self.config_data, "pdf_save_folder", "generated_forms"
+        )
         emp_id = self.emp_id_var.get().strip() if hasattr(self, "emp_id_var") else ""
         sub_type = self.submission_type_var.get().strip() if hasattr(self, "submission_type_var") else ""
-        safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (emp_name or "employee"))
-        filename = f"{emp_id or 'unknown'}_{safe_name}_{today_str}.pdf".replace(" ", "_")
-        return os.path.join(save_folder, _safe_folder_name(sub_type), filename)
+        operator = self.user_settings.get("operator_name") or "Unspecified_Operator"
+        today_str = date.today().strftime("%d-%b-%Y")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        compact_type = SUBMISSION_TYPE_TAGS.get(sub_type) or _safe_folder_name(sub_type)
+        filename = f"{emp_id or 'unknown'}_{compact_type}_{timestamp}.pdf"
+        return os.path.join(
+            root, _safe_folder_name(sub_type), today_str, _safe_folder_name(operator), filename
+        )
+
+    @staticmethod
+    def _validate_digits_only(proposed_value):
+        """Tkinter entry validatecommand: only digits (or an empty box, so
+        backspace/select-all-delete still work) are allowed in the Employee
+        ID field - keystrokes and pastes of anything else are rejected
+        outright rather than accepted and then complained about."""
+        return proposed_value == "" or proposed_value.isdigit()
 
     def _open_tracit(self, employee_id, serial_number):
         """Opens the configured TracIT page. If tracit_url_template
@@ -3741,6 +4620,13 @@ class WizardApp(tk.Tk):
             return False
         if not self.emp_id_var.get().strip():
             messagebox.showwarning("Missing Employee ID", "Please enter an Employee ID.")
+            return False
+        if not self.emp_id_var.get().strip().isdigit():
+            # Belt-and-suspenders alongside the digits-only entry
+            # validation (registered in _build_employee_section) - this
+            # catches anything that slips past keystroke validation, e.g.
+            # a value set programmatically.
+            messagebox.showwarning("Invalid Employee ID", "Employee ID must contain numbers only.")
             return False
         if not self.emp_name_var.get().strip():
             messagebox.showwarning(
@@ -3814,6 +4700,10 @@ class WizardApp(tk.Tk):
         output_path = self.output_path_override or self._compute_default_output_path()
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+        operator_name = self.user_settings.get("operator_name") or ""
+        operator_location = self.user_settings.get("location") or ""
+        ssrs_match_status = getattr(self, "_ssrs_match_status", "") or ""
+
         tmp_dir = tempfile.mkdtemp(prefix="itasset_")
         filled_docx = os.path.join(tmp_dir, "filled.docx")
         unsigned_pdf = os.path.join(tmp_dir, "unsigned.pdf")
@@ -3827,14 +4717,28 @@ class WizardApp(tk.Tk):
             self.update_idletasks()
             convert_docx_to_pdf_via_word(filled_docx, unsigned_pdf)
 
+            # Enhancement 19 - PDF metadata. Must happen BEFORE signing:
+            # editing bytes after the cryptographic signature is applied
+            # would invalidate it.
+            _set_pdf_metadata(unsigned_pdf, {
+                "Title": f"IT Asset Submission Acknowledgement - {emp_name}",
+                "Author": operator_name or "IT Asset Submission Acknowledgement System",
+                "Subject": chosen_type,
+                "EmployeeName": emp_name, "EmployeeID": emp_id, "ManagerName": manager_name,
+                "SubmissionType": chosen_type, "GeneratedBy": operator_name,
+                "GeneratedDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ProbTicket": "", "SCID": "",
+            })
+
             self.status_var.set("Applying cryptographic signatures...")
             self.update_idletasks()
             sign_pdf_with_signatures(
                 unsigned_pdf, output_path,
                 [
-                    {"field_name": "EmployeeSignature", "display_name": emp_name},
+                    {"field_name": "EmployeeSignature", "display_name": emp_name, "location": operator_location},
                     {"field_name": "AssetReceiverSignature",
-                     "display_name": self.config_data.get("asset_receiver_display_name", "Asset Receiver")},
+                     "display_name": self.config_data.get("asset_receiver_display_name", "Asset Receiver"),
+                     "location": operator_location},
                 ],
                 self.config_data,
             )
@@ -3842,11 +4746,21 @@ class WizardApp(tk.Tk):
             logger.error("Generate failed for emp_id=%r: %s", emp_id, exc)
             messagebox.showerror("Generation Error", str(exc))
             self.status_var.set("Generation failed.")
+            _write_audit_log_entry(
+                operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
+                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
+                email_draft_created=False,
+            )
             return
         except Exception as exc:
             logger.exception("Generate failed unexpectedly for emp_id=%r", emp_id)
             messagebox.showerror("Generation Error", f"Unexpected error: {exc}")
             self.status_var.set("Generation failed.")
+            _write_audit_log_entry(
+                operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
+                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
+                email_draft_created=False,
+            )
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -3855,17 +4769,28 @@ class WizardApp(tk.Tk):
 
         self.status_var.set(f"Saved (signed): {output_path}")
 
+        email_draft_created = False
         if _is_email_draft_type(self.config_data, chosen_type):
             email_data = {
                 "emp_id": emp_id, "emp_name": emp_name, "manager_name": manager_name,
                 "submission_type": chosen_type, "date": today_str,
                 "current_device_serial": current_serial, "assets_issued": assets_issued,
                 "assets_other": assets_other, "asset_pending": asset_pending,
+                "email_action_label": self.config_data.get("email_templates", {}).get(chosen_type, chosen_type),
             }
             try:
                 open_draft(email_data, to_addresses=self.config_data.get("lwd_email_to", ""), attachment_path=output_path)
+                email_draft_created = True
             except RuntimeError as exc:
                 messagebox.showwarning("Email draft not opened", str(exc))
+
+        _write_audit_log_entry(
+            operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
+            ssrs_match_status=ssrs_match_status, pdf_generated=True, pdf_location=output_path,
+            email_draft_created=email_draft_created,
+        )
+        if hasattr(self, "_history_refresh"):
+            self._history_refresh()
 
         finish_note = (
             "\n\nThis PDF is filled AND cryptographically signed - nothing further to do in Acrobat. "
@@ -3995,6 +4920,112 @@ class WizardApp(tk.Tk):
         self.batch_person_frame = ttk.Frame(self.batch_panel_content)
 
         self._batch_refresh_tree()
+
+    # =====================================================================
+    # GENERATED DOCUMENTS TAB (Enhancement 15) - a read-only, searchable
+    # view over the audit log's successful-generation rows, with quick
+    # actions to open the PDF or its containing folder.
+    # =====================================================================
+    def _build_history_tab_shell(self):
+        tab = self.history_tab
+        ttk.Label(tab, text="Generated Documents", font=("Segoe UI", 13, "bold")).pack(
+            anchor="w", padx=16, pady=(14, 2)
+        )
+        ttk.Label(
+            tab,
+            text="Every PDF this app has generated on this machine, newest first.",
+            foreground="#666",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        toolbar = ttk.Frame(tab)
+        toolbar.pack(fill="x", padx=16, pady=(0, 8))
+        ttk.Label(toolbar, text="Search:").pack(side="left")
+        self.history_search_var = tk.StringVar(value="")
+        search_entry = ttk.Entry(toolbar, textvariable=self.history_search_var, width=30)
+        search_entry.pack(side="left", padx=6)
+        search_entry.bind("<KeyRelease>", lambda e: self._history_refresh())
+        ttk.Button(toolbar, text="Refresh", command=self._history_refresh).pack(side="left", padx=(6, 0))
+
+        columns = ("employee_id", "submission_type", "timestamp", "pdf_location")
+        self.history_tree = ttk.Treeview(tab, columns=columns, show="headings", height=16)
+        self.history_tree.heading("employee_id", text="Employee ID")
+        self.history_tree.heading("submission_type", text="Submission Type")
+        self.history_tree.heading("timestamp", text="Generated Date")
+        self.history_tree.heading("pdf_location", text="PDF Location")
+        self.history_tree.column("employee_id", width=110, anchor="w")
+        self.history_tree.column("submission_type", width=140, anchor="w")
+        self.history_tree.column("timestamp", width=150, anchor="w")
+        self.history_tree.column("pdf_location", width=420, anchor="w")
+        self.history_tree.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+        action_row = ttk.Frame(tab)
+        action_row.pack(anchor="w", padx=16, pady=(0, 14))
+        ttk.Button(action_row, text="Open PDF", command=self._history_open_pdf).pack(side="left")
+        ttk.Button(action_row, text="Open Folder", command=self._history_open_folder).pack(side="left", padx=8)
+
+        self._history_refresh()
+
+    def _history_refresh(self):
+        if not hasattr(self, "history_tree"):
+            return
+        for row_id in self.history_tree.get_children():
+            self.history_tree.delete(row_id)
+        query = (self.history_search_var.get() if hasattr(self, "history_search_var") else "").strip().lower()
+        for entry in _read_audit_log_entries():
+            if (entry.get("pdf_generated") or "").strip().lower() != "yes":
+                continue
+            haystack = " ".join([
+                entry.get("employee_id", ""), entry.get("submission_type", ""), entry.get("pdf_location", ""),
+            ]).lower()
+            if query and query not in haystack:
+                continue
+            self.history_tree.insert(
+                "", "end",
+                values=(
+                    entry.get("employee_id", ""), entry.get("submission_type", ""),
+                    entry.get("timestamp", ""), entry.get("pdf_location", ""),
+                ),
+            )
+
+    def _history_selected_pdf_path(self):
+        selection = self.history_tree.selection()
+        if not selection:
+            messagebox.showinfo("No row selected", "Select a row in the list first.")
+            return None
+        values = self.history_tree.item(selection[0], "values")
+        return values[3] if len(values) > 3 else None
+
+    def _history_open_pdf(self):
+        path = self._history_selected_pdf_path()
+        if not path:
+            return
+        if not os.path.exists(path):
+            messagebox.showwarning("File not found", f"This PDF no longer exists at:\n{path}")
+            return
+        self._open_with_os_default(path)
+
+    def _history_open_folder(self):
+        path = self._history_selected_pdf_path()
+        if not path:
+            return
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            messagebox.showwarning("Folder not found", f"This folder no longer exists:\n{folder}")
+            return
+        self._open_with_os_default(folder)
+
+    @staticmethod
+    def _open_with_os_default(path):
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # noqa: S606 - intentional, opens in Explorer/the default PDF viewer
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=False)
+            else:
+                subprocess.run(["xdg-open", path], check=False)
+        except Exception:
+            logger.exception("Generated Documents: could not open %r", path)
+            messagebox.showerror("Could not open", f"Could not open:\n{path}")
 
     # ---------------------------------------------------------- import
     def _batch_import_excel(self):
@@ -4289,19 +5320,23 @@ class WizardApp(tk.Tk):
         sub_type = self.b_submission_type_var.get()
 
         known_serial = ""
+        active_emp_id = ""
         if self._batch_active_index is not None:
-            known_serial = self.batch_queue[self._batch_active_index].get("laptop_serial_number") or ""
+            active_item = self.batch_queue[self._batch_active_index]
+            known_serial = active_item.get("laptop_serial_number") or ""
+            active_emp_id = active_item.get("employee_id") or ""
 
         ttk.Label(parent, text="Asset Details", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(6, 2))
 
-        # The real production form always shows every asset field, for
-        # every submission type. When a laptop serial number was imported
-        # from the bulk Excel file, prefill it into "Current Device Serial
-        # Number" - that's the field a real device serial maps to whatever
-        # the submission type is; "New Device Serial Number" is left blank
-        # for the person to fill in (or type "Nill") when there isn't one.
-        self.b_current_serial_var = tk.StringVar(value=known_serial)
-        self.b_new_serial_var = tk.StringVar(value="")
+        # A New Hire has no existing device to return, so an imported
+        # laptop_serial_number for that type is the device being ISSUED -
+        # it prefills "New Device Serial Number" instead of "Current",
+        # which is hidden entirely for New Hire (see show_current_serial
+        # below and no_current_asset_submission_types in CONFIG).
+        no_current_types = self.config_data.get("no_current_asset_submission_types", [])
+        show_current_serial = sub_type not in no_current_types
+        self.b_current_serial_var = tk.StringVar(value=known_serial if show_current_serial else "")
+        self.b_new_serial_var = tk.StringVar(value=known_serial if not show_current_serial else "")
         self.b_assets_other_var = tk.StringVar(value="")
         self.b_asset_pending_var = tk.StringVar(value="")
         self.b_asset_checkbox_vars = {}
@@ -4312,17 +5347,31 @@ class WizardApp(tk.Tk):
 
         prefill_note = " (from the imported file - check it, then edit if needed)" if known_serial else ""
 
-        row1 = ttk.Frame(parent)
-        row1.pack(anchor="w", pady=4)
-        ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
-        ttk.Entry(row1, textvariable=self.b_current_serial_var, width=30).pack(side="left", padx=8)
-        if sub_type in self.config_data.get("tracit_submission_types", []):
-            ttk.Button(
-                row1, text="Open TracIT",
-                command=lambda: self._open_tracit(self.b_emp_id_var.get().strip(), self.b_current_serial_var.get().strip()),
-            ).pack(side="left", padx=(4, 0))
-        if prefill_note:
-            ttk.Label(row1, text=prefill_note, foreground="#888").pack(side="left")
+        if show_current_serial:
+            row1 = ttk.Frame(parent)
+            row1.pack(anchor="w", pady=4)
+            ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
+            ttk.Entry(row1, textvariable=self.b_current_serial_var, width=30).pack(side="left", padx=8)
+            if sub_type in self.config_data.get("tracit_submission_types", []):
+                ttk.Button(
+                    row1, text="Open TracIT",
+                    command=lambda: self._open_tracit(active_emp_id, self.b_current_serial_var.get().strip()),
+                ).pack(side="left", padx=(4, 0))
+            if prefill_note:
+                ttk.Label(row1, text=prefill_note, foreground="#888").pack(side="left")
+
+        # Enhancement 7 - same SSRS auto-fill as the single-tab form.
+        if sub_type in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
+            ssrs_row = ttk.Frame(parent)
+            ssrs_row.pack(anchor="w", pady=(0, 4))
+            self.b_ssrs_autofill_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                ssrs_row, text="Auto-fill Asset Details from SSRS Report",
+                variable=self.b_ssrs_autofill_var,
+                command=lambda: self._batch_ssrs_autofill_toggled(active_emp_id),
+            ).pack(side="left")
+            self.b_ssrs_autofill_hint = ttk.Label(ssrs_row, text="", foreground="#888")
+            self.b_ssrs_autofill_hint.pack(side="left", padx=(8, 0))
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
@@ -4349,6 +5398,31 @@ class WizardApp(tk.Tk):
         row4.pack(anchor="w", pady=4)
         ttk.Label(row4, text="Asset Pending for Submission (if any):").pack(side="left")
         ttk.Entry(row4, textvariable=self.b_asset_pending_var, width=40).pack(side="left", padx=8)
+
+    def _batch_ssrs_autofill_toggled(self, active_emp_id):
+        if not self.b_ssrs_autofill_var.get():
+            self._b_ssrs_match_status = ""
+            self.b_ssrs_autofill_hint.config(text="")
+            return
+        index = self.ssrs_state.get("index", {})
+        record = index.get(active_emp_id) or index.get("".join(c for c in active_emp_id if c.isdigit()))
+        if not record:
+            self._b_ssrs_match_status = "Not Found"
+            self.b_ssrs_autofill_hint.config(
+                text=f"No SSRS row found for Employee ID '{active_emp_id}'.", foreground="#a05a00",
+            )
+            self.b_ssrs_autofill_var.set(False)
+            return
+        self._b_ssrs_match_status = "Matched"
+        if record.get("serial_number"):
+            # Device being ISSUED, not an old/current one - see the
+            # comment in _batch_rebuild_asset_details.
+            self.b_new_serial_var.set(record["serial_number"])
+        summary = self._format_ssrs_record(record)
+        if summary:
+            existing = self.b_assets_other_var.get().strip()
+            self.b_assets_other_var.set(f"{existing}; {summary}" if existing else summary)
+        self.b_ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
     def _batch_build_signature_widget(self, parent, data_key, title, capture_title):
         ttk.Label(parent, text=title, font=("Segoe UI", 11, "bold")).pack(anchor="w")
@@ -4458,6 +5532,8 @@ class WizardApp(tk.Tk):
         self.b_bu_value_label.config(
             text=(bu_match["name"] if bu_match else "(none - pick one at the top of this tab)")
         )
+        if hasattr(self, "_batch_refresh_save_path"):
+            self._batch_refresh_save_path()
 
     # ---------------------------------------------------------- save/skip
     def _batch_resolve_bu(self, item):
@@ -4470,14 +5546,21 @@ class WizardApp(tk.Tk):
         return None
 
     def _batch_compute_default_output_path(self, item):
-        today_str = date.today().strftime("%d-%b-%Y")
-        save_folder = _resolve_path(self.config_data, "pdf_save_folder", "generated_forms")
-        emp_name = self.b_emp_name_var.get().strip() if hasattr(self, "b_emp_name_var") else (item.get("employee_name") or "employee")
+        # Same Enhancement 5/6 structure and filename convention as the
+        # single-tab version above - kept in sync deliberately.
+        root = (self.user_settings.get("root_save_folder") or "").strip() or _resolve_path(
+            self.config_data, "pdf_save_folder", "generated_forms"
+        )
         emp_id = item["employee_id"]
-        safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (emp_name or "employee"))
-        filename = f"{emp_id}_{safe_name}_{today_str}.pdf".replace(" ", "_")
         sub_type = self.b_submission_type_var.get().strip() if hasattr(self, "b_submission_type_var") else (item.get("type") or "")
-        return os.path.join(save_folder, _safe_folder_name(sub_type), filename)
+        operator = self.user_settings.get("operator_name") or "Unspecified_Operator"
+        today_str = date.today().strftime("%d-%b-%Y")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        compact_type = SUBMISSION_TYPE_TAGS.get(sub_type) or _safe_folder_name(sub_type)
+        filename = f"{emp_id}_{compact_type}_{timestamp}.pdf"
+        return os.path.join(
+            root, _safe_folder_name(sub_type), today_str, _safe_folder_name(operator), filename
+        )
 
     def _batch_choose_save_location(self):
         item = self.batch_queue[self._batch_active_index]
@@ -4495,6 +5578,14 @@ class WizardApp(tk.Tk):
 
     def _batch_validate_active(self):
         item = self.batch_queue[self._batch_active_index]
+        emp_id = (item.get("employee_id") or "").strip()
+        if not emp_id.isdigit():
+            messagebox.showwarning(
+                "Invalid Employee ID",
+                f"Row {item.get('row_number')}'s Employee ID ({emp_id!r}) contains something other than "
+                "digits - fix it in the imported Excel file and re-import, or Skip this person.",
+            )
+            return None
         bu_match = self._batch_resolve_bu(item)
         if not bu_match:
             messagebox.showwarning(
@@ -4566,6 +5657,10 @@ class WizardApp(tk.Tk):
         output_path = self.b_output_path_override or self._batch_compute_default_output_path(item)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+        operator_name = self.user_settings.get("operator_name") or ""
+        operator_location = self.user_settings.get("location") or ""
+        ssrs_match_status = getattr(self, "_b_ssrs_match_status", "") or ""
+
         tmp_dir = tempfile.mkdtemp(prefix="itasset_")
         filled_docx = os.path.join(tmp_dir, "filled.docx")
         unsigned_pdf = os.path.join(tmp_dir, "unsigned.pdf")
@@ -4577,14 +5672,28 @@ class WizardApp(tk.Tk):
             self.status_var.set("Exporting to PDF via Word...")
             self.update_idletasks()
             convert_docx_to_pdf_via_word(filled_docx, unsigned_pdf)
+
+            # Enhancement 19 - PDF metadata, before signing (see the
+            # single-tab _on_generate for why the ordering matters).
+            _set_pdf_metadata(unsigned_pdf, {
+                "Title": f"IT Asset Submission Acknowledgement - {emp_name}",
+                "Author": operator_name or "IT Asset Submission Acknowledgement System",
+                "Subject": chosen_type,
+                "EmployeeName": emp_name, "EmployeeID": emp_id, "ManagerName": manager_name,
+                "SubmissionType": chosen_type, "GeneratedBy": operator_name,
+                "GeneratedDate": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ProbTicket": "", "SCID": "",
+            })
+
             self.status_var.set("Applying cryptographic signatures...")
             self.update_idletasks()
             sign_pdf_with_signatures(
                 unsigned_pdf, output_path,
                 [
-                    {"field_name": "EmployeeSignature", "display_name": emp_name},
+                    {"field_name": "EmployeeSignature", "display_name": emp_name, "location": operator_location},
                     {"field_name": "AssetReceiverSignature",
-                     "display_name": self.config_data.get("asset_receiver_display_name", "Asset Receiver")},
+                     "display_name": self.config_data.get("asset_receiver_display_name", "Asset Receiver"),
+                     "location": operator_location},
                 ],
                 self.config_data,
             )
@@ -4592,11 +5701,21 @@ class WizardApp(tk.Tk):
             logger.error("Batch generate failed for emp_id=%r: %s", emp_id, exc)
             messagebox.showerror("Generation Error", str(exc))
             self.status_var.set("Generation failed.")
+            _write_audit_log_entry(
+                operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
+                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
+                email_draft_created=False,
+            )
             return
         except Exception as exc:
             logger.exception("Batch generate failed unexpectedly for emp_id=%r", emp_id)
             messagebox.showerror("Generation Error", f"Unexpected error: {exc}")
             self.status_var.set("Generation failed.")
+            _write_audit_log_entry(
+                operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
+                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
+                email_draft_created=False,
+            )
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -4608,17 +5727,28 @@ class WizardApp(tk.Tk):
         item["type"] = chosen_type
         item["type_recognized"] = True
 
+        email_draft_created = False
         if _is_email_draft_type(self.config_data, chosen_type):
             email_data = {
                 "emp_id": emp_id, "emp_name": emp_name, "manager_name": manager_name,
                 "submission_type": chosen_type, "date": today_str,
                 "current_device_serial": current_serial, "assets_issued": assets_issued,
                 "assets_other": assets_other, "asset_pending": asset_pending,
+                "email_action_label": self.config_data.get("email_templates", {}).get(chosen_type, chosen_type),
             }
             try:
                 open_draft(email_data, to_addresses=self.config_data.get("lwd_email_to", ""), attachment_path=output_path)
+                email_draft_created = True
             except RuntimeError as exc:
                 messagebox.showwarning("Email draft not opened", str(exc))
+
+        _write_audit_log_entry(
+            operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
+            ssrs_match_status=ssrs_match_status, pdf_generated=True, pdf_location=output_path,
+            email_draft_created=email_draft_created,
+        )
+        if hasattr(self, "_history_refresh"):
+            self._history_refresh()
 
         self.status_var.set(f"Completed: {emp_name} -> {output_path}")
         self._batch_clear_panel()
