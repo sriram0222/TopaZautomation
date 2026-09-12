@@ -133,6 +133,29 @@ try:
 except ImportError:
     HAS_SSPI = False
 
+try:
+    import truststore
+    HAS_TRUSTSTORE = True
+except ImportError:
+    HAS_TRUSTSTORE = False
+
+
+def _enable_os_trust_store():
+    """Make ssl/requests trust the Windows OS certificate store (Trusted Root CAs)
+    instead of only the bundled certifi list. Internal corporate root CAs (e.g. a
+    company's internal SSRS/reporting servers) are typically installed into the
+    OS store by IT policy and trusted by the browser, but NOT present in certifi's
+    public CA bundle, causing 'self-signed certificate in certificate chain' SSL
+    errors from Python even though the same URL opens fine in Chrome/Edge.
+    Safe no-op if the truststore package isn't installed."""
+    if not HAS_TRUSTSTORE:
+        return False
+    try:
+        truststore.inject_into_ssl()
+        return True
+    except Exception:
+        return False
+
 from PIL import Image, ImageDraw, ImageTk
 import openpyxl
 
@@ -1224,7 +1247,12 @@ def _run_webview_helper():
 
     # Single-file app: settings live in the CONFIG dict at the top of this
     # file, not a separate config.json - same values, just one less file.
+    # This subprocess is launched fresh (re-imports this module) and never
+    # sees a running WizardApp's self.config_data, so any admin_settings.json
+    # override (e.g. a changed AD Lookup URL) must be re-applied here
+    # independently, or it would silently keep using the CONFIG default.
     config = CONFIG
+    _apply_admin_settings_overrides(config)
     mode = config.get("ad_lookup_mode", "ssrs_report")
     profile_dir = os.path.join(os.path.expanduser("~"), ".it_asset_form_webview_profile")
 
@@ -3324,6 +3352,90 @@ def _user_settings_configured(data):
 
 
 # ============================================================================
+# ADMIN / INSTALLATION SETTINGS - shared endpoints (SSRS report URL, AD
+# Lookup URL, TracIT URL, ...) that apply to EVERYONE using this copy of the
+# app, unlike user_settings.json above (which is per-Windows-login and lives
+# in %APPDATA%). These live in admin_settings.json NEXT TO app.py/the .exe
+# (via _app_dir(), same folder as bu_templates/, signing_identity/, logs/),
+# so one edit there (or one edit in Settings by whoever manages the shared
+# install) applies to every person who runs that copy.
+#
+# IMPORTANT: the AD-lookup helper is launched as a completely separate
+# subprocess (--webview-helper, see _run_webview_helper()) that re-imports
+# this module fresh and reads the module-level CONFIG dict directly - it has
+# no access to a running WizardApp's self.config_data. So these overrides
+# are applied at the MODULE level (mutating CONFIG in place) via
+# _apply_admin_settings_overrides(), and that function is called from BOTH
+# WizardApp.__init__ (main GUI process) and _run_webview_helper() (helper
+# subprocess) independently - see each call site for why.
+# ============================================================================
+
+ADMIN_SETTINGS_FIELDS = {
+    # admin_settings.json key -> (CONFIG dict path, human label)
+    "ssrs_report_url": (("ssrs_asset_report", "url"), "SSRS Asset Report URL"),
+    "ad_lookup_url_template": (("ad_lookup_url_template",), "AD Lookup URL template"),
+    "tracit_url_template": (("tracit_url_template",), "TracIT URL template"),
+    "ssrs_cache_max_age_hours": (("ssrs_asset_report", "cache_max_age_hours"), "SSRS cache max age (hours)"),
+}
+
+
+def _admin_settings_path():
+    return os.path.join(_app_dir(), "admin_settings.json")
+
+
+def _load_admin_settings():
+    """Reads admin_settings.json next to the exe. Missing file or missing
+    individual keys are both fine - _apply_admin_settings_overrides() only
+    overrides what's actually present, so CONFIG's built-in defaults keep
+    working until someone deliberately sets something in Settings."""
+    path = _admin_settings_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return {k: v for k, v in (data or {}).items() if k in ADMIN_SETTINGS_FIELDS}
+    except Exception:
+        logger.exception("Admin settings: could not read %r, ignoring overrides", path)
+        return {}
+
+
+def _save_admin_settings(data):
+    path = _admin_settings_path()
+    to_write = {k: v for k, v in (data or {}).items() if k in ADMIN_SETTINGS_FIELDS and str(v).strip() != ""}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(to_write, f, indent=2)
+    logger.info("Admin settings: saved to %r (%s)", path, ", ".join(sorted(to_write.keys())) or "no overrides set")
+    return to_write
+
+
+def _apply_admin_settings_overrides(config, admin_data=None):
+    """Mutates `config` in place, overriding the built-in default endpoints
+    with anything set in admin_settings.json. Safe to call with an empty/
+    missing admin_data (a no-op) so every startup path can call it
+    unconditionally."""
+    admin_data = admin_data if admin_data is not None else _load_admin_settings()
+    for key, value in (admin_data or {}).items():
+        if value is None or str(value).strip() == "":
+            continue
+        mapping = ADMIN_SETTINGS_FIELDS.get(key)
+        if not mapping:
+            continue
+        path, _label = mapping
+        node = config
+        for part in path[:-1]:
+            node = node.setdefault(part, {})
+        leaf = path[-1]
+        if leaf == "cache_max_age_hours":
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+        node[leaf] = value
+    return config
+
+
+# ============================================================================
 # AUDIT LOG (Enhancement 14) - one line per PDF-generation attempt
 # (success or failure), separate from the diagnostic app.log above and
 # never rotated/truncated automatically. Plain CSV so it opens directly
@@ -3465,6 +3577,26 @@ def download_ssrs_asset_report(url, dest_path, timeout=60):
     try:
         resp = requests.get(url, auth=auth, timeout=timeout)
         resp.raise_for_status()
+    except requests.exceptions.SSLError as exc:
+        # NOTE: must be caught BEFORE requests.exceptions.ConnectionError below,
+        # since SSLError is a subclass of it - otherwise this more specific,
+        # more actionable message would never be reached.
+        truststore_hint = (
+            "" if HAS_TRUSTSTORE else
+            "\n\nThis app tried to install the 'truststore' package fix for this "
+            "automatically but it isn't installed. Ask IT/your admin to run:\n"
+            "    pip install truststore\n"
+            "then restart the app."
+        )
+        raise RuntimeError(
+            "SSRS download failed because of a certificate trust problem, not a "
+            "network/VPN problem:\n\n"
+            f"{exc}\n\n"
+            "This usually means your company's internal root certificate is "
+            "trusted by Windows/your browser (which is why the report downloads "
+            "fine in Chrome) but is not in Python's separate list of trusted "
+            f"certificates.{truststore_hint}"
+        ) from exc
     except requests.exceptions.ConnectionError as exc:
         raise RuntimeError(
             f"Could not reach the SSRS report server:\n{url}\n\n"
@@ -3646,6 +3778,8 @@ class WizardApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.config_data = copy.deepcopy(CONFIG)  # settings live at the top of this file
+        self.admin_settings = _load_admin_settings()
+        _apply_admin_settings_overrides(self.config_data, self.admin_settings)
         self.user_settings = _load_user_settings()
         self.ssrs_state = {
             "status": SSRS_STATUS_NOT_AVAILABLE, "records": 0,
@@ -3685,6 +3819,7 @@ class WizardApp(tk.Tk):
 
         self._bu_templates_cache = []
 
+        self._apply_ui_theme()
         self._build_shell()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -3711,10 +3846,82 @@ class WizardApp(tk.Tk):
 
         logger.info("WizardApp: GUI ready")
 
+    # ------------------------------------------------------------ look & feel
+    def _apply_ui_theme(self):
+        """A bounded visual-polish pass: consistent fonts, an Optum-orange
+        accent color on primary actions/headers, and light section framing.
+        Deliberately NOT a layout rewrite - every existing widget, grid/pack
+        call and callback is untouched; this only changes ttk.Style
+        defaults, so nothing about how the form behaves changes."""
+        ACCENT = "#EB690B"       # Optum orange
+        ACCENT_DARK = "#C4550A"
+        BG = "#F7F7F5"
+        SURFACE = "#FFFFFF"
+        TEXT = "#222222"
+        MUTED = "#666666"
+        BORDER = "#DDDDDD"
+
+        try:
+            self.configure(background=BG)
+        except Exception:
+            pass
+
+        style = ttk.Style(self)
+        try:
+            # 'clam' renders custom colors far more reliably on Windows than
+            # the default 'vista'/'winnative' theme, which ignores most
+            # ttk.Style color overrides.
+            style.theme_use("clam")
+        except Exception:
+            logger.debug("UI theme: 'clam' unavailable, keeping default theme", exc_info=True)
+
+        base_font = ("Segoe UI", 10)
+        try:
+            self.option_add("*Font", base_font)
+        except Exception:
+            pass
+
+        style.configure(".", background=BG, foreground=TEXT, font=base_font)
+        style.configure("TFrame", background=BG)
+        style.configure("TLabelframe", background=BG, bordercolor=BORDER)
+        style.configure("TLabelframe.Label", background=BG, foreground=ACCENT_DARK, font=("Segoe UI", 10, "bold"))
+        style.configure("TLabel", background=BG, foreground=TEXT)
+        style.configure("TCheckbutton", background=BG)
+        style.configure("TRadiobutton", background=BG)
+        style.configure("TSeparator", background=BORDER)
+
+        style.configure("TEntry", fieldbackground=SURFACE, bordercolor=BORDER)
+        style.configure("TCombobox", fieldbackground=SURFACE)
+
+        style.configure(
+            "TButton", background=ACCENT, foreground="white",
+            font=("Segoe UI", 10, "bold"), padding=(10, 5), borderwidth=0,
+        )
+        style.map(
+            "TButton",
+            background=[("active", ACCENT_DARK), ("disabled", "#C9C9C9")],
+            foreground=[("disabled", "#888888")],
+        )
+
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure(
+            "TNotebook.Tab", background="#EDEDEA", foreground=TEXT,
+            font=("Segoe UI", 10, "bold"), padding=(16, 8),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", SURFACE)],
+            foreground=[("selected", ACCENT_DARK)],
+        )
+
+        # Status bar at the bottom - kept visually distinct/muted rather
+        # than looking like an editable field.
+        style.configure("Status.TLabel", background="#EDEDEA", foreground=MUTED, padding=(6, 3))
+
     # ------------------------------------------------------------ shell
     def _build_shell(self):
         self.status_var = tk.StringVar(value="Ready.")
-        ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w").pack(fill="x", side="bottom")
+        ttk.Label(self, textvariable=self.status_var, anchor="w", style="Status.TLabel").pack(fill="x", side="bottom")
 
         self._build_header_bar()
 
@@ -3960,6 +4167,48 @@ class WizardApp(tk.Tk):
         ttk.Entry(frm, textvariable=email_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
         row += 1
 
+        admin_vars = {}
+        if not first_run:
+            # Admin / shared-install settings: SSRS Report URL, AD Lookup URL,
+            # TracIT URL template, SSRS cache lifetime. These are saved to
+            # admin_settings.json NEXT TO the app (not %APPDATA%), so unlike
+            # the profile fields above, a change here applies to EVERYONE who
+            # runs this same copy of the app - see _apply_admin_settings_overrides.
+            ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+            row += 1
+            ttk.Label(
+                frm, text="Admin / Shared Settings", font=("Segoe UI", 10, "bold"),
+            ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10)
+            row += 1
+            ttk.Label(
+                frm,
+                text="Applies to everyone using this installation - leave blank to keep the built-in default.",
+                wraplength=420, foreground="#666",
+            ).grid(row=row, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+            row += 1
+
+            admin_data = _load_admin_settings()
+            admin_field_specs = [
+                ("ssrs_report_url", "SSRS Report URL:", self.config_data.get("ssrs_asset_report", {}).get("url", "")),
+                ("ad_lookup_url_template", "AD Lookup URL template:", self.config_data.get("ad_lookup_url_template", "")),
+                ("tracit_url_template", "TracIT URL:", self.config_data.get("tracit_url_template", "")),
+                ("ssrs_cache_max_age_hours", "SSRS cache max age (hours):",
+                 str(self.config_data.get("ssrs_asset_report", {}).get("cache_max_age_hours", 24))),
+            ]
+            for key, label, current_value in admin_field_specs:
+                ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", **pad)
+                v = tk.StringVar(value=admin_data.get(key, "") or "")
+                entry = ttk.Entry(frm, textvariable=v, width=42)
+                entry.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+                # Show the effective (default or already-overridden) value as
+                # placeholder-ish helper text below when the field is empty.
+                if not v.get().strip():
+                    ttk.Label(
+                        frm, text=f"(current default: {current_value})", foreground="#888",
+                    ).grid(row=row, column=1, columnspan=2, sticky="w", padx=(12, 0), pady=(24, 0))
+                admin_vars[key] = v
+                row += 1
+
         btn_row = ttk.Frame(frm)
         btn_row.grid(row=row, column=0, columnspan=3, pady=(10, 0))
 
@@ -3974,6 +4223,17 @@ class WizardApp(tk.Tk):
                 "business_unit": bu_var.get().strip(),
                 "email": email_var.get().strip(),
             })
+            if admin_vars:
+                old_ssrs_url = self.config_data.get("ssrs_asset_report", {}).get("url", "")
+                self.admin_settings = _save_admin_settings({k: v.get().strip() for k, v in admin_vars.items()})
+                _apply_admin_settings_overrides(self.config_data, self.admin_settings)
+                new_ssrs_url = self.config_data.get("ssrs_asset_report", {}).get("url", "")
+                if hasattr(self, "_refresh_ssrs_status_labels"):
+                    self._refresh_ssrs_status_labels()
+                if new_ssrs_url != old_ssrs_url and hasattr(self, "_ssrs_refresh"):
+                    # URL changed - the day-cache from the OLD url is no
+                    # longer relevant, force a fresh download from the new one.
+                    self._ssrs_refresh(force=True)
             if hasattr(self, "_refresh_save_path"):
                 self._refresh_save_path()
             if hasattr(self, "_batch_refresh_save_path"):
@@ -4264,6 +4524,18 @@ class WizardApp(tk.Tk):
         self.lookup_button.pack(side="left", padx=4)
         emp_id_entry.bind("<Return>", lambda e: self._do_lookup())
 
+        # Enhancement 7 (relocated) - checked automatically the moment an
+        # Employee ID is entered, right next to Lookup (AD), instead of a
+        # separate checkbox buried in Asset Details further down. If SSRS
+        # has a match it fills instantly (no network call - it's checked
+        # against the already-downloaded/cached report); if not, this just
+        # goes quiet and the normal Lookup (AD) button above still works
+        # exactly as before.
+        self.ssrs_check_label = ttk.Label(row, text="", foreground="#888")
+        self.ssrs_check_label.pack(side="left", padx=(10, 0))
+        self._ssrs_matched_record = None
+        self._ssrs_check_after_id = None
+
         result_box = ttk.LabelFrame(parent, text="Employee Details", padding=10)
         result_box.pack(fill="x", pady=16)
 
@@ -4286,6 +4558,65 @@ class WizardApp(tk.Tk):
         self._refresh_save_path = _refresh_save_path  # reused when submission type changes too
         self.emp_id_var.trace_add("write", _refresh_save_path)
         self.emp_name_var.trace_add("write", _refresh_save_path)
+        self.emp_id_var.trace_add("write", self._schedule_ssrs_autocheck)
+
+    def _schedule_ssrs_autocheck(self, *_args):
+        """Debounced (600ms after typing stops) so this doesn't re-check on
+        every single keystroke - only once the operator pauses or finishes
+        typing/scanning the Employee ID."""
+        if self._ssrs_check_after_id:
+            try:
+                self.after_cancel(self._ssrs_check_after_id)
+            except Exception:
+                pass
+        self._ssrs_check_after_id = self.after(600, self._ssrs_autocheck_now)
+
+    def _ssrs_autocheck_now(self):
+        self._ssrs_check_after_id = None
+        self._ssrs_matched_record = None
+        emp_id = self.emp_id_var.get().strip()
+        if not hasattr(self, "ssrs_check_label"):
+            return
+        if not emp_id or not emp_id.isdigit():
+            self.ssrs_check_label.config(text="")
+            self._ssrs_match_status = ""
+            return
+        index = self.ssrs_state.get("index", {})
+        record = index.get(emp_id) or index.get("".join(c for c in emp_id if c.isdigit()))
+        if not record:
+            self._ssrs_match_status = "Not Found" if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE else ""
+            if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE:
+                self.ssrs_check_label.config(text="SSRS: no match - use Lookup (AD)", foreground="#a05a00")
+            else:
+                self.ssrs_check_label.config(text="")
+            return
+        self._ssrs_match_status = "Matched"
+        self._ssrs_matched_record = record
+        self.ssrs_check_label.config(
+            text=f"SSRS: matched - {record.get('employee_name', '') or emp_id}", foreground="#1a7f37",
+        )
+        if record.get("employee_name") and not self.emp_name_var.get().strip():
+            self.emp_name_var.set(record["employee_name"])
+            self.manual_entry_hint.config(text="Employee name auto-filled from SSRS Report.")
+        self._apply_ssrs_record_to_asset_fields(record)
+
+    def _apply_ssrs_record_to_asset_fields(self, record):
+        """Fills the asset-detail fields (New Device Serial Number, Others)
+        from a matched SSRS row - only meaningful for New Hire-type
+        submissions, since that's the only case SSRS has issued-asset data
+        for. Safe to call even if the asset-details widgets don't exist yet
+        (e.g. no submission type picked yet) - it just no-ops via hasattr."""
+        sub_type = self.submission_type_var.get() if hasattr(self, "submission_type_var") else ""
+        if sub_type not in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
+            return
+        if record.get("serial_number") and hasattr(self, "new_serial_var"):
+            self.new_serial_var.set(record["serial_number"])
+        summary = self._format_ssrs_record(record)
+        if summary and hasattr(self, "assets_other_var"):
+            existing = self.assets_other_var.get().strip()
+            self.assets_other_var.set(f"{existing}; {summary}" if existing else summary)
+        if hasattr(self, "ssrs_autofill_hint"):
+            self.ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
     def _do_lookup(self):
         emp_id = self.emp_id_var.get().strip()
@@ -4418,13 +4749,15 @@ class WizardApp(tk.Tk):
         if sub_type in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
             ssrs_row = ttk.Frame(parent)
             ssrs_row.pack(anchor="w", pady=(0, 4))
-            self.ssrs_autofill_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                ssrs_row, text="Auto-fill Asset Details from SSRS Report",
-                variable=self.ssrs_autofill_var, command=self._ssrs_autofill_toggled,
-            ).pack(side="left")
+            ttk.Label(ssrs_row, text="SSRS Report:", foreground="#666").pack(side="left")
             self.ssrs_autofill_hint = ttk.Label(ssrs_row, text="", foreground="#888")
-            self.ssrs_autofill_hint.pack(side="left", padx=(8, 0))
+            self.ssrs_autofill_hint.pack(side="left", padx=(6, 0))
+            # Auto-fill is checked automatically near the Employee ID field
+            # above the moment the ID is entered (see _ssrs_autocheck_now) -
+            # if a match was already found for the current Employee ID,
+            # re-apply it here too since these fields were just rebuilt.
+            if self._ssrs_matched_record:
+                self._apply_ssrs_record_to_asset_fields(self._ssrs_matched_record)
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
@@ -4466,32 +4799,6 @@ class WizardApp(tk.Tk):
         ]
         lines = [f"{label}: {record.get(key, '')}" for key, label in labels if record.get(key)]
         return " | ".join(lines)
-
-    def _ssrs_autofill_toggled(self):
-        if not self.ssrs_autofill_var.get():
-            self._ssrs_match_status = ""
-            self.ssrs_autofill_hint.config(text="")
-            return
-        emp_id = self.emp_id_var.get().strip()
-        index = self.ssrs_state.get("index", {})
-        record = index.get(emp_id) or index.get("".join(c for c in emp_id if c.isdigit()))
-        if not record:
-            self._ssrs_match_status = "Not Found"
-            self.ssrs_autofill_hint.config(
-                text=f"No SSRS row found for Employee ID '{emp_id}'.", foreground="#a05a00",
-            )
-            self.ssrs_autofill_var.set(False)
-            return
-        self._ssrs_match_status = "Matched"
-        if record.get("serial_number"):
-            # The device being ISSUED, not an old/current one - see the
-            # comment above on why New Hire has no "current" device.
-            self.new_serial_var.set(record["serial_number"])
-        summary = self._format_ssrs_record(record)
-        if summary:
-            existing = self.assets_other_var.get().strip()
-            self.assets_other_var.set(f"{existing}; {summary}" if existing else summary)
-        self.ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
     # ---------------------------------------------- 6/7: signatures
     def _build_signature_section(self, parent, data_key, title, capture_title):
@@ -5233,6 +5540,13 @@ class WizardApp(tk.Tk):
         ttk.Entry(details_box, textvariable=self.b_manager_name_var, width=40).grid(row=1, column=1, sticky="w", padx=6)
         self.b_identity_hint = ttk.Label(details_box, text="", foreground="#a05a00", wraplength=620)
         self.b_identity_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # Same automatic SSRS check as the Single Person tab, near the
+        # identity fields here since bulk rows don't have their own manual
+        # "Lookup (AD)" button - AD lookup already runs automatically for a
+        # row with no name yet (see below); this just tries the faster/
+        # no-network SSRS cache first, before falling back to it.
+        self.b_ssrs_check_label = ttk.Label(details_box, text="", foreground="#888")
+        self.b_ssrs_check_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         contact_row = ttk.Frame(parent)
         contact_row.pack(anchor="w", pady=(0, 10))
@@ -5303,9 +5617,60 @@ class WizardApp(tk.Tk):
         self._batch_refresh_tree()
 
         if not item.get("employee_name"):
-            self._batch_run_lookup_for_active()
+            # SSRS check first (Enhancement 7 relocation, no network call -
+            # checked against the already-downloaded/cached report): only
+            # fall through to the slower AD Lookup if SSRS has no match.
+            if self._batch_try_ssrs_autofill_identity(index):
+                self._batch_check_identity_resolved()
+            else:
+                self._batch_run_lookup_for_active()
         else:
             self._batch_check_identity_resolved()
+
+    def _batch_try_ssrs_autofill_identity(self, index):
+        """Returns True (and fills the name/asset fields immediately) if the
+        SSRS asset report cache has a row for this employee_id; False if
+        not, so the caller falls back to AD Lookup exactly as before."""
+        item = self.batch_queue[index]
+        emp_id = (item.get("employee_id") or "").strip()
+        ssrs_idx = self.ssrs_state.get("index", {})
+        record = ssrs_idx.get(emp_id) or ssrs_idx.get("".join(c for c in emp_id if c.isdigit()))
+        if not hasattr(self, "b_ssrs_check_label"):
+            return False
+        if not record:
+            self._b_ssrs_match_status = "Not Found" if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE else ""
+            if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE:
+                self.b_ssrs_check_label.config(text="SSRS: no match - checking AD...", foreground="#888")
+            else:
+                self.b_ssrs_check_label.config(text="")
+            return False
+        self._b_ssrs_match_status = "Matched"
+        item["_ssrs_record"] = record
+        if record.get("employee_name"):
+            self.b_emp_name_var.set(record["employee_name"])
+        self.b_ssrs_check_label.config(
+            text=f"SSRS: matched - {record.get('employee_name', '') or emp_id}", foreground="#1a7f37",
+        )
+        self.status_var.set(f"Batch: {self.b_emp_name_var.get() or emp_id} found via SSRS.")
+        self._apply_ssrs_record_to_batch_asset_fields(record)
+        return True
+
+    def _apply_ssrs_record_to_batch_asset_fields(self, record):
+        """Bulk-tab equivalent of _apply_ssrs_record_to_asset_fields - only
+        meaningful for New Hire-type submissions, since that's the only
+        case SSRS has issued-asset data for. Safe to call before a
+        submission type/asset-details widgets exist yet (hasattr-guarded)."""
+        sub_type = self.b_submission_type_var.get() if hasattr(self, "b_submission_type_var") else ""
+        if sub_type not in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
+            return
+        if record.get("serial_number") and hasattr(self, "b_new_serial_var"):
+            self.b_new_serial_var.set(record["serial_number"])
+        summary = self._format_ssrs_record(record)
+        if summary and hasattr(self, "b_assets_other_var"):
+            existing = self.b_assets_other_var.get().strip()
+            self.b_assets_other_var.set(f"{existing}; {summary}" if existing else summary)
+        if hasattr(self, "b_ssrs_autofill_hint"):
+            self.b_ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
     def _batch_on_submission_type_changed(self):
         self._batch_rebuild_asset_details()
@@ -5360,18 +5725,22 @@ class WizardApp(tk.Tk):
             if prefill_note:
                 ttk.Label(row1, text=prefill_note, foreground="#888").pack(side="left")
 
-        # Enhancement 7 - same SSRS auto-fill as the single-tab form.
+        # Enhancement 7 (relocated) - same automatic SSRS check as the
+        # single-tab form; matching is done as soon as the row loads (see
+        # _batch_try_ssrs_autofill_identity), this just re-displays/
+        # re-applies that cached result whenever these fields are rebuilt
+        # (e.g. after a submission type change).
         if sub_type in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
             ssrs_row = ttk.Frame(parent)
             ssrs_row.pack(anchor="w", pady=(0, 4))
-            self.b_ssrs_autofill_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(
-                ssrs_row, text="Auto-fill Asset Details from SSRS Report",
-                variable=self.b_ssrs_autofill_var,
-                command=lambda: self._batch_ssrs_autofill_toggled(active_emp_id),
-            ).pack(side="left")
+            ttk.Label(ssrs_row, text="SSRS Report:", foreground="#666").pack(side="left")
             self.b_ssrs_autofill_hint = ttk.Label(ssrs_row, text="", foreground="#888")
-            self.b_ssrs_autofill_hint.pack(side="left", padx=(8, 0))
+            self.b_ssrs_autofill_hint.pack(side="left", padx=(6, 0))
+            cached_record = None
+            if self._batch_active_index is not None:
+                cached_record = self.batch_queue[self._batch_active_index].get("_ssrs_record")
+            if cached_record:
+                self._apply_ssrs_record_to_batch_asset_fields(cached_record)
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
@@ -5398,31 +5767,6 @@ class WizardApp(tk.Tk):
         row4.pack(anchor="w", pady=4)
         ttk.Label(row4, text="Asset Pending for Submission (if any):").pack(side="left")
         ttk.Entry(row4, textvariable=self.b_asset_pending_var, width=40).pack(side="left", padx=8)
-
-    def _batch_ssrs_autofill_toggled(self, active_emp_id):
-        if not self.b_ssrs_autofill_var.get():
-            self._b_ssrs_match_status = ""
-            self.b_ssrs_autofill_hint.config(text="")
-            return
-        index = self.ssrs_state.get("index", {})
-        record = index.get(active_emp_id) or index.get("".join(c for c in active_emp_id if c.isdigit()))
-        if not record:
-            self._b_ssrs_match_status = "Not Found"
-            self.b_ssrs_autofill_hint.config(
-                text=f"No SSRS row found for Employee ID '{active_emp_id}'.", foreground="#a05a00",
-            )
-            self.b_ssrs_autofill_var.set(False)
-            return
-        self._b_ssrs_match_status = "Matched"
-        if record.get("serial_number"):
-            # Device being ISSUED, not an old/current one - see the
-            # comment in _batch_rebuild_asset_details.
-            self.b_new_serial_var.set(record["serial_number"])
-        summary = self._format_ssrs_record(record)
-        if summary:
-            existing = self.b_assets_other_var.get().strip()
-            self.b_assets_other_var.set(f"{existing}; {summary}" if existing else summary)
-        self.b_ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
     def _batch_build_signature_widget(self, parent, data_key, title, capture_title):
         ttk.Label(parent, text=title, font=("Segoe UI", 11, "bold")).pack(anchor="w")
@@ -5814,6 +6158,7 @@ def _set_windows_dpi_awareness():
 
 if __name__ == "__main__":
     _log_path = _setup_logging()
+    _enable_os_trust_store()
     if len(sys.argv) > 1 and sys.argv[1] == "--webview-helper":
         # Relaunched as the embedded-browser AD lookup helper - see
         # BrowserLookupSession._build_command() above for how/why.
