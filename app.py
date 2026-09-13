@@ -139,6 +139,12 @@ try:
 except ImportError:
     HAS_TRUSTSTORE = False
 
+try:
+    from reportlab.pdfgen import canvas as _rl_canvas
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
+
 
 def _enable_os_trust_store():
     """Make ssl/requests trust the Windows OS certificate store (Trusted Root CAs)
@@ -156,7 +162,7 @@ def _enable_os_trust_store():
     except Exception:
         return False
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 import openpyxl
 
 
@@ -346,9 +352,14 @@ CONFIG = {
         # Enhancement 9) - "Refresh Data" in the app always forces a fresh
         # download regardless of this cache.
         "cache_max_age_hours": 24,
-        # Submission types that show the "Auto-fill Asset Details from
-        # SSRS Report" checkbox.
-        "new_hire_submission_types": ["New Hire"],
+        # Submission types where SSRS is the PRIMARY lookup source (checked
+        # automatically the moment an Employee ID is entered - see
+        # _ssrs_autocheck_now/_batch_try_ssrs_autofill_identity) - AD is
+        # only used as a fallback for these, e.g. when SSRS has no manager
+        # name (SSRS's column map doesn't include one). LWD/Contractor
+        # LWD/Site Transfer are intentionally NOT in this list - for those,
+        # AD + the imported Excel data remain the (only) lookup sources.
+        "new_hire_submission_types": ["New Hire", "Break Fix", "Mixed Build", "Additional Laptop"],
         # SSRS column name -> app field. Edit the right-hand column names
         # here if the real report's headers differ slightly (e.g. a
         # trailing space, or a renamed column) - nothing else needs to
@@ -409,7 +420,7 @@ logger = logging.getLogger("it_asset_app")
 def _setup_logging():
     log_dir = os.path.join(_app_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "app.log")
+    log_path = os.path.join(log_dir, "application.log")
 
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
@@ -3027,6 +3038,51 @@ def _find_signature_field_boxes(pdf_path, target_size_pt=(141.73, 47.24), tolera
         return []
 
 
+def _stamp_signed_on_captions(pdf_path, boxes, when=None):
+    """Enhancement 13/18 - draws a small 'Signed On: <date/time>' caption
+    directly on the page, positioned just below each real signature box
+    _find_signature_field_boxes() already detected. This is independent of
+    the Word template (no template edit needed, and it doesn't touch/
+    resize the actual signature picture the way stamping the caption onto
+    the signature IMAGE itself would - that would have squeezed the visible
+    signature to fit the template's fixed-size picture frame). Must run on
+    the UNSIGNED pdf, same ordering rule as _set_pdf_metadata: editing page
+    content after the cryptographic signature is applied would invalidate
+    it. Never raises - a failure here should never block getting a signed
+    PDF out the door; it just means this run doesn't get the caption."""
+    if not HAS_REPORTLAB or not boxes:
+        return
+    try:
+        from pypdf import PdfReader, PdfWriter
+
+        reader = PdfReader(pdf_path)
+        page = reader.pages[0]
+        page_w = float(page.mediabox.width)
+        page_h = float(page.mediabox.height)
+        caption = f"Signed On: {(when or datetime.now()).strftime('%d-%b-%Y %I:%M %p')}"
+
+        buf = io.BytesIO()
+        c = _rl_canvas.Canvas(buf, pagesize=(page_w, page_h))
+        c.setFont("Helvetica", 8)
+        for (x0, y0, x1, _y1) in boxes:
+            c.drawCentredString((x0 + x1) / 2.0, max(y0 - 11, 2), caption)
+        c.save()
+        buf.seek(0)
+
+        page.merge_page(PdfReader(buf).pages[0])
+
+        writer = PdfWriter()
+        for p in reader.pages:
+            writer.add_page(p)
+        tmp_path = pdf_path + ".captiontmp"
+        with open(tmp_path, "wb") as f:
+            writer.write(f)
+        os.replace(tmp_path, pdf_path)
+        logger.info("Signed-on caption: stamped %d box(es) on %r", len(boxes), pdf_path)
+    except Exception:
+        logger.exception("Signed-on caption: could not stamp %r (non-fatal)", pdf_path)
+
+
 def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config_data):
     """
     Applies one genuine, cryptographic PDF signature FIELD per entry in
@@ -3444,7 +3500,7 @@ def _apply_admin_settings_overrides(config, admin_data=None):
 
 AUDIT_LOG_COLUMNS = [
     "timestamp", "operator", "employee_id", "submission_type",
-    "ssrs_match_status", "pdf_generated", "pdf_location", "email_draft_created",
+    "ssrs_match_status", "lookup_source", "pdf_generated", "pdf_location", "email_draft_created",
 ]
 
 
@@ -3455,7 +3511,7 @@ def _audit_log_path():
 
 
 def _write_audit_log_entry(operator="", employee_id="", submission_type="",
-                            ssrs_match_status="", pdf_generated=False,
+                            ssrs_match_status="", lookup_source="", pdf_generated=False,
                             pdf_location="", email_draft_created=False):
     path = _audit_log_path()
     is_new = not os.path.exists(path)
@@ -3466,7 +3522,7 @@ def _write_audit_log_entry(operator="", employee_id="", submission_type="",
                 writer.writerow(AUDIT_LOG_COLUMNS)
             writer.writerow([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                operator, employee_id, submission_type, ssrs_match_status,
+                operator, employee_id, submission_type, ssrs_match_status, lookup_source,
                 "Yes" if pdf_generated else "No", pdf_location,
                 "Yes" if email_draft_created else "No",
             ])
@@ -3918,6 +3974,51 @@ class WizardApp(tk.Tk):
         # than looking like an editable field.
         style.configure("Status.TLabel", background="#EDEDEA", foreground=MUTED, padding=(6, 3))
 
+    # ------------------------------------------------------------ tooltips
+    def _add_info_tooltip(self, parent, text, side="left", padx=(4, 0)):
+        """A small 'ⓘ' label that shows `text` in a borderless popup on
+        hover - lets a section header stay a couple of words (e.g.
+        'Business Unit') while the longer explanation most people only
+        need once is still one hover away instead of always taking up
+        vertical space on screen."""
+        icon = ttk.Label(parent, text="ⓘ", foreground="#3277c9", cursor="hand2")
+        icon.pack(side=side, padx=padx)
+        tip = {"win": None}
+
+        def show(_event=None):
+            if tip["win"] is not None:
+                return
+            win = tk.Toplevel(self)
+            win.wm_overrideredirect(True)
+            win.wm_attributes("-topmost", True)
+            x = icon.winfo_rootx() + 4
+            y = icon.winfo_rooty() + icon.winfo_height() + 4
+            win.wm_geometry(f"+{x}+{y}")
+            ttk.Label(
+                win, text=text, wraplength=340, justify="left", padding=8,
+                background="#FFFDE7", relief="solid", borderwidth=1,
+            ).pack()
+            tip["win"] = win
+
+        def hide(_event=None):
+            if tip["win"] is not None:
+                tip["win"].destroy()
+                tip["win"] = None
+
+        icon.bind("<Enter>", show)
+        icon.bind("<Leave>", hide)
+        return icon
+
+    # -------------------------------------------------------- keyboard nav
+    @staticmethod
+    def _bind_enter_advances_focus(widget):
+        """Enhancement 8 - Tab/Shift+Tab already follow the natural widget
+        creation order in Tk with no extra code needed; this adds Enter as
+        an equivalent 'move to the next field' for a plain text Entry that
+        doesn't already have its own Enter behavior (Employee ID submits a
+        lookup on Enter, for example - that's intentionally left alone)."""
+        widget.bind("<Return>", lambda e: (e.widget.tk_focusNext().focus(), "break")[-1])
+
     # ------------------------------------------------------------ shell
     def _build_shell(self):
         self.status_var = tk.StringVar(value="Ready.")
@@ -4251,8 +4352,18 @@ class WizardApp(tk.Tk):
 
     def _make_scrollable(self, container):
         """Wraps `container` in a vertically-scrolling canvas and returns
-        the inner content frame to build widgets into. Mousewheel only
-        scrolls this canvas while the cursor is actually over it."""
+        the inner content frame to build widgets into.
+
+        Mousewheel/touchpad scrolling works anywhere over this area - not
+        just when the cursor is directly over the canvas's own gutter (the
+        old per-canvas <Enter>/<Leave> bind_all approach silently stopped
+        working the moment the cursor was over any child widget, like an
+        Entry or a Frame, since those swallow the Enter/Leave events before
+        the canvas ever sees them). Instead every scrollable canvas
+        registers itself once with the app-wide dispatcher set up in
+        _init_global_mousewheel_scrolling(), which figures out - on every
+        wheel/touchpad event, anywhere in the window - which registered
+        canvas (if any) the cursor is currently over and scrolls that one."""
         outer = ttk.Frame(container)
         outer.pack(fill="both", expand=True)
 
@@ -4268,12 +4379,50 @@ class WizardApp(tk.Tk):
         content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(window, width=e.width))
 
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self._register_scrollable_canvas(canvas)
         return content
+
+    def _register_scrollable_canvas(self, canvas):
+        if not hasattr(self, "_scrollable_canvases"):
+            self._scrollable_canvases = []
+            self._init_global_mousewheel_scrolling()
+        self._scrollable_canvases.append(canvas)
+
+    def _init_global_mousewheel_scrolling(self):
+        """Binds mousewheel/touchpad scrolling ONCE for the whole window -
+        every canvas registered via _register_scrollable_canvas() (Single
+        Person, Bulk Batch, and any future scrollable panel) then scrolls
+        correctly no matter where over that panel the cursor is, with no
+        need to click the scrollbar itself first."""
+
+        def _scroll_amount(event):
+            # Windows/macOS send event.delta (multiples of 120 on Windows);
+            # X11/Linux send Button-4 (up) / Button-5 (down) instead.
+            if getattr(event, "num", None) == 4:
+                return -1
+            if getattr(event, "num", None) == 5:
+                return 1
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return 0
+            return int(-1 * (delta / 120)) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+
+        def _dispatch(event):
+            amount = _scroll_amount(event)
+            if amount == 0:
+                return
+            try:
+                widget = self.winfo_containing(event.x_root, event.y_root)
+            except Exception:
+                widget = None
+            while widget is not None:
+                if widget in self._scrollable_canvases:
+                    widget.yview_scroll(amount, "units")
+                    return
+                widget = widget.master
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(seq, _dispatch)
 
     def _refresh_bu_combos(self):
         self._bu_templates_cache = list_templates(_resolve_path(self.config_data, "bu_templates_folder", "bu_templates"))
@@ -4404,24 +4553,26 @@ class WizardApp(tk.Tk):
     # =====================================================================
     def _build_single_tab_shell(self):
         tab = self.single_tab
-        ttk.Label(tab, text="IT Asset Submission Acknowledgement", font=("Segoe UI", 13, "bold")).pack(
-            anchor="w", padx=16, pady=(14, 2)
-        )
-        ttk.Label(tab, text="Fill in one person's details below, then Generate.", foreground="#666").pack(
-            anchor="w", padx=16, pady=(0, 4)
-        )
 
         bottom = ttk.Frame(tab, padding=(16, 8))
         bottom.pack(fill="x", side="bottom")
 
-        save_row = ttk.Frame(bottom)
-        save_row.pack(fill="x", pady=(0, 8))
-        ttk.Label(save_row, text="Save to:").pack(side="left")
-        self._save_location_var = tk.StringVar(value="")
-        ttk.Entry(save_row, textvariable=self._save_location_var, width=60, state="readonly").pack(
-            side="left", padx=6, fill="x", expand=True
-        )
-        ttk.Button(save_row, text="Choose Location...", command=self._choose_save_location).pack(side="left")
+        # Enhancement: no manual Save-to/path/Choose Location on the main
+        # screen anymore - the PDF always saves automatically to the root
+        # folder configured once in Settings, under the automatic
+        # <SubmissionType>/<Date>/<Operator>/ folder structure and
+        # automatic <EmployeeID>_<Type>_<timestamp>.pdf filename (see
+        # _compute_default_output_path). Where it landed is shown on the
+        # success screen after Generate, with one-click Open PDF/Open Folder.
+        self.output_path_override = None
+
+        # Enhancement 10 - a compact Recent Documents panel (last 3), so
+        # opening something just generated doesn't require a trip to the
+        # separate Generated Documents tab.
+        recent_frame = ttk.LabelFrame(bottom, text="Recent Documents", padding=(8, 4))
+        recent_frame.pack(fill="x", pady=(0, 8))
+        self.recent_docs_list_frame = ttk.Frame(recent_frame)
+        self.recent_docs_list_frame.pack(fill="x")
 
         btn_row = ttk.Frame(bottom)
         btn_row.pack(fill="x")
@@ -4429,10 +4580,10 @@ class WizardApp(tk.Tk):
         ttk.Button(btn_row, text="Start Another Form", command=self._on_start_another).pack(side="left", padx=10)
 
         self.single_content = self._make_scrollable(tab)
+        self._recent_docs_refresh()
 
         self._sig_preview_image = {}
         self._signature_paths = {"employee_signature_path": None, "asset_receiver_signature_path": None}
-        self.output_path_override = None
 
     def _clear_single_content(self):
         for child in self.single_content.winfo_children():
@@ -4443,75 +4594,68 @@ class WizardApp(tk.Tk):
         parent = self.single_content
 
         self._build_bu_section(parent)
-        ttk.Separator(parent).pack(fill="x", pady=14)
+        ttk.Separator(parent).pack(fill="x", pady=8)
         self._build_employee_section(parent)
-        ttk.Separator(parent).pack(fill="x", pady=14)
+        ttk.Separator(parent).pack(fill="x", pady=8)
         self._build_contact_section(parent)
-        ttk.Separator(parent).pack(fill="x", pady=14)
+        ttk.Separator(parent).pack(fill="x", pady=8)
         self._build_submission_type_section(parent)
         self.asset_details_frame = ttk.Frame(parent)
-        self.asset_details_frame.pack(fill="x", anchor="w", pady=(4, 0))
+        self.asset_details_frame.pack(fill="x", anchor="w", pady=(2, 0))
         self._rebuild_asset_details()
-        ttk.Separator(parent).pack(fill="x", pady=14)
+        ttk.Separator(parent).pack(fill="x", pady=8)
 
         sig_row = ttk.Frame(parent)
         sig_row.pack(fill="x", anchor="w")
         emp_sig_frame = ttk.Frame(sig_row)
         emp_sig_frame.pack(side="left", padx=(0, 40), anchor="n")
         self._build_signature_section(
-            emp_sig_frame, "employee_signature_path", "6. Employee Signature", "Employee: sign here"
+            emp_sig_frame, "employee_signature_path", "Employee Signature", "Employee: sign here"
         )
         ar_sig_frame = ttk.Frame(sig_row)
         ar_sig_frame.pack(side="left", anchor="n")
         self._build_signature_section(
-            ar_sig_frame, "asset_receiver_signature_path", "7. Asset Receiver Signature", "Asset Receiver: sign here"
+            ar_sig_frame, "asset_receiver_signature_path", "Asset Receiver Signature", "Asset Receiver: sign here"
         )
-
-        self._save_location_var.set(self.output_path_override or self._compute_default_output_path())
 
     # -------------------------------------------------------- 1: BU
     def _build_bu_section(self, parent):
-        ttk.Label(parent, text="1. Business Unit", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(
-            parent,
-            text="Select the Business Unit for this form (its Word template supplies the letterhead, "
-            "address, and layout).",
-            wraplength=760,
-        ).pack(anchor="w", pady=(2, 10))
+        header = ttk.Frame(parent)
+        header.pack(anchor="w", fill="x")
+        ttk.Label(header, text="Business Unit", font=("Segoe UI", 11, "bold")).pack(side="left")
+        self._add_info_tooltip(
+            header,
+            "Its Word template supplies the letterhead, address, and layout. Upload a BU's base "
+            "Word (.docx) form once via 'Add New BU Template...' - the app automatically makes it "
+            "fillable, no Acrobat or manual setup needed.",
+        )
 
         templates = list_templates(_resolve_path(self.config_data, "bu_templates_folder", "bu_templates"))
         self._bu_templates_cache = templates
 
         row = ttk.Frame(parent)
-        row.pack(anchor="w", fill="x")
-        ttk.Label(row, text="Business Unit:").pack(side="left")
+        row.pack(anchor="w", fill="x", pady=(4, 0))
         self.bu_var = tk.StringVar(value="")
         names = [t["name"] for t in templates]
-        self.bu_combo = ttk.Combobox(row, textvariable=self.bu_var, values=names, state="readonly", width=40)
-        self.bu_combo.pack(side="left", padx=8)
+        self.bu_combo = ttk.Combobox(row, textvariable=self.bu_var, values=names, state="readonly", width=36)
+        self.bu_combo.pack(side="left")
         if not names:
-            self.status_var.set("No Business Unit templates yet - click 'Add New BU Template...' below.")
-
-        ttk.Button(parent, text="Add New BU Template...", command=self._add_bu_template).pack(anchor="w", pady=(10, 0))
-
-        ttk.Label(
-            parent,
-            text="Upload a BU's base Word (.docx) form once - the app automatically makes it fillable, "
-            "no Acrobat or manual setup needed. Processing a list of many people at once? Switch to the "
-            "'Bulk Batch' tab above.",
-            wraplength=760,
-            foreground="#555",
-        ).pack(anchor="w", pady=(10, 0))
+            self.status_var.set("No Business Unit templates yet - click 'Add New BU Template...'.")
+        ttk.Button(row, text="Add New BU Template...", command=self._add_bu_template).pack(side="left", padx=8)
 
     # ----------------------------------------------------- 2: employee id
     def _build_employee_section(self, parent):
-        ttk.Label(parent, text="2. Employee ID", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(parent, text="Scan or type the Employee ID, then press Enter or click Lookup.").pack(
-            anchor="w", pady=(2, 10)
+        header = ttk.Frame(parent)
+        header.pack(anchor="w", fill="x")
+        ttk.Label(header, text="Employee ID", font=("Segoe UI", 11, "bold")).pack(side="left")
+        self._add_info_tooltip(
+            header,
+            "Scan or type the Employee ID, then press Enter to look it up automatically - SSRS is "
+            "checked first (instant, no click needed); if it has no match, AD Lookup runs instead.",
         )
 
         row = ttk.Frame(parent)
-        row.pack(anchor="w")
+        row.pack(anchor="w", pady=(4, 0))
         ttk.Label(row, text="Employee ID:").pack(side="left")
         self.emp_id_var = tk.StringVar(value="")
         digits_only_vcmd = (self.register(self._validate_digits_only), "%P")
@@ -4536,24 +4680,32 @@ class WizardApp(tk.Tk):
         self._ssrs_matched_record = None
         self._ssrs_check_after_id = None
 
-        result_box = ttk.LabelFrame(parent, text="Employee Details", padding=10)
-        result_box.pack(fill="x", pady=16)
+        result_box = ttk.LabelFrame(parent, text="Employee Details", padding=8)
+        result_box.pack(fill="x", pady=8)
 
         self.emp_name_var = tk.StringVar(value="")
         self.manager_name_var = tk.StringVar(value="")
+        self._identity_lookup_source = "Manual"  # tracked for the audit log's Lookup Source column
 
         ttk.Label(result_box, text="Employee Name:").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(result_box, textvariable=self.emp_name_var, width=40).grid(row=0, column=1, sticky="w", pady=4, padx=6)
+        emp_name_entry = ttk.Entry(result_box, textvariable=self.emp_name_var, width=40)
+        emp_name_entry.grid(row=0, column=1, sticky="w", pady=4, padx=6)
+        self._bind_enter_advances_focus(emp_name_entry)
 
         ttk.Label(result_box, text="Manager Name:").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(result_box, textvariable=self.manager_name_var, width=40).grid(row=1, column=1, sticky="w", pady=4, padx=6)
+        manager_name_entry = ttk.Entry(result_box, textvariable=self.manager_name_var, width=40)
+        manager_name_entry.grid(row=1, column=1, sticky="w", pady=4, padx=6)
+        self._bind_enter_advances_focus(manager_name_entry)
 
         self.manual_entry_hint = ttk.Label(result_box, text="", foreground="#a05a00", wraplength=620)
         self.manual_entry_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         def _refresh_save_path(*_a):
-            if not self.output_path_override:
-                self._save_location_var.set(self._compute_default_output_path())
+            # No visible "Save to" field anymore (it always auto-saves to
+            # the Settings root folder + automatic subfolder/filename) -
+            # kept as a callable no-op since other code still calls it
+            # after things like a submission-type change.
+            pass
 
         self._refresh_save_path = _refresh_save_path  # reused when submission type changes too
         self.emp_id_var.trace_add("write", _refresh_save_path)
@@ -4592,6 +4744,7 @@ class WizardApp(tk.Tk):
             return
         self._ssrs_match_status = "Matched"
         self._ssrs_matched_record = record
+        self._identity_lookup_source = "SSRS"
         self.ssrs_check_label.config(
             text=f"SSRS: matched - {record.get('employee_name', '') or emp_id}", foreground="#1a7f37",
         )
@@ -4599,6 +4752,36 @@ class WizardApp(tk.Tk):
             self.emp_name_var.set(record["employee_name"])
             self.manual_entry_hint.config(text="Employee name auto-filled from SSRS Report.")
         self._apply_ssrs_record_to_asset_fields(record)
+        # SSRS's column map has no manager field - if the manager name is
+        # still blank after an SSRS match, quietly fall back to AD in the
+        # background just for that (never overwrites a name SSRS already
+        # supplied, and never pops up the multi-candidate picker for a
+        # silent background fill).
+        self._fetch_manager_via_ad_fallback(emp_id)
+
+    def _fetch_manager_via_ad_fallback(self, emp_id):
+        if self.manager_name_var.get().strip():
+            return
+        uses_webview = _uses_webview_lookup(self.config_data)
+
+        def worker():
+            try:
+                if uses_webview:
+                    candidates = self.browser_session.search(emp_id)
+                else:
+                    candidates = [fetch_employee_details(emp_id, self.config_data)]
+                self.after(0, self._on_manager_fallback_result, candidates)
+            except Exception:
+                logger.debug("Manager AD fallback: lookup failed for %r (non-fatal)", emp_id, exc_info=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_manager_fallback_result(self, candidates):
+        if not candidates or self.manager_name_var.get().strip():
+            return
+        manager = candidates[0].get("manager_name", "")
+        if manager:
+            self.manager_name_var.set(manager)
 
     def _apply_ssrs_record_to_asset_fields(self, record):
         """Fills the asset-detail fields (New Device Serial Number, Others)
@@ -4654,29 +4837,36 @@ class WizardApp(tk.Tk):
                 return
         self.emp_name_var.set(chosen.get("emp_name", ""))
         self.manager_name_var.set(chosen.get("manager_name", ""))
+        self._identity_lookup_source = "AD"
         self.manual_entry_hint.config(text="" if chosen.get("emp_name") else "Found a result, but no name field - enter manually.")
         self.status_var.set(f"Employee {emp_id} found.")
 
     def _on_lookup_failure(self, exc):
+        # Friendly on-screen message - the real exception (connection
+        # errors, missing config, etc.) goes to application.log only, not
+        # in front of the operator.
+        logger.error(
+            "AD lookup failed for the active Employee ID (showing friendly message to operator): %s", exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         self.lookup_button.config(state="normal")
-        self.status_var.set("Lookup failed - enter details manually.")
-        self.manual_entry_hint.config(text=f"Lookup failed ({exc}). Please enter details manually below.")
+        self.status_var.set("Lookup unavailable - enter details manually.")
+        self.manual_entry_hint.config(text="⚠ Employee lookup unavailable. Please enter details manually.")
 
     # ----------------------------------------------------- 3: phone
     def _build_contact_section(self, parent):
-        ttk.Label(parent, text="3. Contact Number", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        ttk.Label(parent, text="Contact Number", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         row = ttk.Frame(parent)
-        row.pack(anchor="w", pady=(8, 0))
+        row.pack(anchor="w", pady=(4, 0))
         ttk.Label(row, text="Contact Number:").pack(side="left")
         self.contact_var = tk.StringVar(value="")
-        ttk.Entry(row, textvariable=self.contact_var, width=24).pack(side="left", padx=8)
+        contact_entry = ttk.Entry(row, textvariable=self.contact_var, width=24)
+        contact_entry.pack(side="left", padx=8)
+        self._bind_enter_advances_focus(contact_entry)
 
     # ------------------------------------------------- 4: submission type
     def _build_submission_type_section(self, parent):
-        ttk.Label(parent, text="4. Submission Type", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(parent, text="Select the submission type (this determines the asset fields below).").pack(
-            anchor="w", pady=(2, 10)
-        )
+        ttk.Label(parent, text="Submission Type", font=("Segoe UI", 11, "bold")).pack(anchor="w")
 
         all_types = self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
         self.submission_type_var = tk.StringVar(value="")
@@ -4706,7 +4896,7 @@ class WizardApp(tk.Tk):
 
         sub_type = self.submission_type_var.get()
 
-        ttk.Label(parent, text="5. Asset Details", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(6, 2))
+        ttk.Label(parent, text="Asset Details", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(6, 2))
 
         self.current_serial_var = tk.StringVar(value="")
         self.new_serial_var = tk.StringVar(value="")
@@ -4787,18 +4977,22 @@ class WizardApp(tk.Tk):
 
     @staticmethod
     def _format_ssrs_record(record):
-        """Turns a parsed SSRS asset row into a readable multi-line block
-        (used to append into the 'Others (specify)' free-text field, since
-        the Word templates don't have dedicated cells for these fields
-        yet)."""
+        """Turns a parsed SSRS asset row into a COMPACT one-line summary
+        (e.g. '✅ Device Model: Latitude 5420 | Ticket: INC0012345 | ...'),
+        appended into the 'Others (specify)' free-text field since the Word
+        templates don't have dedicated cells for these fields yet. Device
+        Model and Ticket Number lead since they're what's most often needed
+        at a glance; the rest follow only if the report actually has them."""
         labels = [
-            ("hostname", "Hostname"), ("device_model", "Device Model"),
-            ("ticket_number", "Ticket Number"), ("monitor", "Monitor"),
+            ("device_model", "Device Model"), ("ticket_number", "Ticket"),
+            ("hostname", "Hostname"), ("monitor", "Monitor"),
             ("dock", "Dock"), ("keyboard_mouse", "Keyboard & Mouse"),
             ("power_adapter", "Power Adapter"), ("battery", "Battery"),
         ]
-        lines = [f"{label}: {record.get(key, '')}" for key, label in labels if record.get(key)]
-        return " | ".join(lines)
+        parts = [f"{label}: {record.get(key, '')}" for key, label in labels if record.get(key)]
+        if not parts:
+            return ""
+        return "✅ " + " | ".join(parts)
 
     # ---------------------------------------------- 6/7: signatures
     def _build_signature_section(self, parent, data_key, title, capture_title):
@@ -4907,19 +5101,6 @@ class WizardApp(tk.Tk):
         logger.info("TracIT: opening %s (employee_id=%r, serial_number=%r)", url, employee_id, serial_number)
         webbrowser.open(url)
 
-    def _choose_save_location(self):
-        default_path = self.output_path_override or self._compute_default_output_path()
-        chosen = filedialog.asksaveasfilename(
-            title="Save PDF As",
-            initialdir=os.path.dirname(default_path),
-            initialfile=os.path.basename(default_path),
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf")],
-        )
-        if chosen:
-            self.output_path_override = chosen
-            self._save_location_var.set(chosen)
-
     # ------------------------------------------------------------ generate
     def _validate_form(self):
         if not self.bu_var.get():
@@ -5024,6 +5205,10 @@ class WizardApp(tk.Tk):
             self.update_idletasks()
             convert_docx_to_pdf_via_word(filled_docx, unsigned_pdf)
 
+            # Enhancement 13/18 - visible "Signed On: <timestamp>" caption
+            # under both signatures. Also must happen BEFORE signing.
+            _stamp_signed_on_captions(unsigned_pdf, _find_signature_field_boxes(unsigned_pdf))
+
             # Enhancement 19 - PDF metadata. Must happen BEFORE signing:
             # editing bytes after the cryptographic signature is applied
             # would invalidate it.
@@ -5039,13 +5224,21 @@ class WizardApp(tk.Tk):
 
             self.status_var.set("Applying cryptographic signatures...")
             self.update_idletasks()
+            # Enhancement 12 - Adobe's own Signature Properties dialog has
+            # no dedicated Employee ID field, so it's folded into the
+            # Reason text (along with the employee name) for both
+            # signatures, alongside the real Location and the automatic
+            # signing timestamp pyHanko already embeds.
+            base_reason = self.config_data.get("signing_reason") or "IT Asset Acknowledgement"
+            emp_reason = f"{base_reason} - {emp_name} (Employee ID: {emp_id})"
             sign_pdf_with_signatures(
                 unsigned_pdf, output_path,
                 [
-                    {"field_name": "EmployeeSignature", "display_name": emp_name, "location": operator_location},
+                    {"field_name": "EmployeeSignature", "display_name": emp_name,
+                     "location": operator_location, "reason": emp_reason},
                     {"field_name": "AssetReceiverSignature",
                      "display_name": self.config_data.get("asset_receiver_display_name", "Asset Receiver"),
-                     "location": operator_location},
+                     "location": operator_location, "reason": emp_reason},
                 ],
                 self.config_data,
             )
@@ -5055,8 +5248,8 @@ class WizardApp(tk.Tk):
             self.status_var.set("Generation failed.")
             _write_audit_log_entry(
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
-                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
-                email_draft_created=False,
+                ssrs_match_status=ssrs_match_status, lookup_source=getattr(self, "_identity_lookup_source", ""),
+                pdf_generated=False, pdf_location="", email_draft_created=False,
             )
             return
         except Exception as exc:
@@ -5065,8 +5258,8 @@ class WizardApp(tk.Tk):
             self.status_var.set("Generation failed.")
             _write_audit_log_entry(
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
-                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
-                email_draft_created=False,
+                ssrs_match_status=ssrs_match_status, lookup_source=getattr(self, "_identity_lookup_source", ""),
+                pdf_generated=False, pdf_location="", email_draft_created=False,
             )
             return
         finally:
@@ -5093,18 +5286,57 @@ class WizardApp(tk.Tk):
 
         _write_audit_log_entry(
             operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
-            ssrs_match_status=ssrs_match_status, pdf_generated=True, pdf_location=output_path,
-            email_draft_created=email_draft_created,
+            ssrs_match_status=ssrs_match_status, lookup_source=getattr(self, "_identity_lookup_source", ""),
+            pdf_generated=True, pdf_location=output_path, email_draft_created=email_draft_created,
         )
         if hasattr(self, "_history_refresh"):
             self._history_refresh()
+        if hasattr(self, "_recent_docs_refresh"):
+            self._recent_docs_refresh()
 
-        finish_note = (
-            "\n\nThis PDF is filled AND cryptographically signed - nothing further to do in Acrobat. "
-            "Opening it will show it as signed; the certificate itself shows as \"not trusted\" until "
-            "your IT team installs it as a Trusted Certificate (see the README)."
+        self._show_generation_success_dialog(output_path)
+
+    def _show_generation_success_dialog(self, output_path):
+        """Enhancement 9 - a compact success screen (instead of a plain
+        OK-only messagebox) with the two things an operator does next
+        already one click away, plus a fast way to move on to the next
+        person without any extra navigation."""
+        dlg = tk.Toplevel(self)
+        dlg.title("PDF Generated")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+
+        frm = ttk.Frame(dlg, padding=18)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="✅ PDF Generated Successfully", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(
+            frm, text=output_path, foreground="#555", wraplength=440,
+        ).pack(anchor="w", pady=(4, 2))
+        ttk.Label(
+            frm,
+            text="Filled and cryptographically signed - nothing further to do in Acrobat.",
+            foreground="#888", wraplength=440,
+        ).pack(anchor="w", pady=(0, 14))
+
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Open PDF", command=lambda: self._open_with_os_default(output_path)).pack(
+            side="left"
         )
-        messagebox.showinfo("PDF Generated", f"Saved to:\n{output_path}{finish_note}")
+        ttk.Button(
+            btn_row, text="Open Folder",
+            command=lambda: self._open_with_os_default(os.path.dirname(output_path)),
+        ).pack(side="left", padx=8)
+
+        def start_next():
+            dlg.destroy()
+            self._on_start_another()
+
+        ttk.Button(btn_row, text="Start Next Employee", command=start_next).pack(side="left", padx=8)
+        ttk.Button(frm, text="Close", command=dlg.destroy).pack(anchor="e", pady=(14, 0))
+
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.grab_set()
 
     def _reset_person_fields(self, keep_bu=True):
         if not keep_bu:
@@ -5119,7 +5351,7 @@ class WizardApp(tk.Tk):
         self._rebuild_asset_details()
         self._reset_signature_previews()
         self.output_path_override = None
-        self._save_location_var.set(self._compute_default_output_path())
+        self._identity_lookup_source = "Manual"
         self.status_var.set("Ready.")
 
     def _on_start_another(self):
@@ -5264,6 +5496,7 @@ class WizardApp(tk.Tk):
         self.history_tree.column("timestamp", width=150, anchor="w")
         self.history_tree.column("pdf_location", width=420, anchor="w")
         self.history_tree.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        self._register_scrollable_canvas(self.history_tree)  # same global mousewheel dispatcher
 
         action_row = ttk.Frame(tab)
         action_row.pack(anchor="w", padx=16, pady=(0, 14))
@@ -5271,6 +5504,46 @@ class WizardApp(tk.Tk):
         ttk.Button(action_row, text="Open Folder", command=self._history_open_folder).pack(side="left", padx=8)
 
         self._history_refresh()
+
+    def _recent_docs_refresh(self):
+        """Enhancement 10 - the compact panel on the Single Person tab
+        (last 3 generated PDFs), separate from the full searchable
+        Generated Documents tab."""
+        if not hasattr(self, "recent_docs_list_frame"):
+            return
+        for child in self.recent_docs_list_frame.winfo_children():
+            child.destroy()
+        entries = [e for e in _read_audit_log_entries() if (e.get("pdf_generated") or "").strip().lower() == "yes"][:3]
+        if not entries:
+            ttk.Label(self.recent_docs_list_frame, text="No documents generated yet.", foreground="#888").pack(
+                anchor="w"
+            )
+            return
+        for entry in entries:
+            path = entry.get("pdf_location", "")
+            row = ttk.Frame(self.recent_docs_list_frame)
+            row.pack(fill="x", pady=1)
+            ttk.Label(
+                row,
+                text=f"{entry.get('employee_id', '')}  •  {entry.get('submission_type', '')}  •  {entry.get('timestamp', '')}",
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True)
+
+            def _open_recent_pdf(p=path):
+                if p and os.path.exists(p):
+                    self._open_with_os_default(p)
+                else:
+                    messagebox.showwarning("File not found", f"This PDF no longer exists at:\n{p}")
+
+            def _open_recent_folder(p=path):
+                folder = os.path.dirname(p)
+                if folder and os.path.isdir(folder):
+                    self._open_with_os_default(folder)
+                else:
+                    messagebox.showwarning("Folder not found", f"This folder no longer exists:\n{folder}")
+
+            ttk.Button(row, text="Open", width=6, command=_open_recent_pdf).pack(side="left", padx=(4, 2))
+            ttk.Button(row, text="Folder", width=7, command=_open_recent_folder).pack(side="left")
 
     def _history_refresh(self):
         if not hasattr(self, "history_tree"):
@@ -5499,6 +5772,11 @@ class WizardApp(tk.Tk):
     def _batch_load_row(self, index):
         self._batch_active_index = index
         item = self.batch_queue[index]
+        if "_lookup_source" not in item:
+            # Excel already supplied a name at import time -> "Import" is
+            # the accurate lookup source unless/until SSRS or AD overrides
+            # it below.
+            item["_lookup_source"] = "Import" if item.get("employee_name") else ""
 
         self.batch_placeholder.pack_forget()
         for child in self.batch_person_frame.winfo_children():
@@ -5593,20 +5871,14 @@ class WizardApp(tk.Tk):
 
         ttk.Separator(parent).pack(fill="x", pady=14)
 
-        save_row = ttk.Frame(parent)
-        save_row.pack(fill="x", pady=(0, 10))
-        ttk.Label(save_row, text="Save to:").pack(side="left")
-        self.b_save_location_var = tk.StringVar(value=self._batch_compute_default_output_path(item))
-        ttk.Entry(save_row, textvariable=self.b_save_location_var, width=55, state="readonly").pack(
-            side="left", padx=6, fill="x", expand=True
-        )
-        ttk.Button(save_row, text="Choose Location...", command=self._batch_choose_save_location).pack(side="left")
+        # No manual Save-to/path/Choose Location here either - same
+        # automatic root-folder + subfolder + filename as the Single
+        # Person tab (see _batch_compute_default_output_path).
+        self.b_output_path_override = None
 
         def _batch_refresh_save_path(*_args):
-            if not self.b_output_path_override:
-                self.b_save_location_var.set(self._batch_compute_default_output_path(item))
+            pass  # no-op; kept callable since other code still calls it
         self._batch_refresh_save_path = _batch_refresh_save_path
-        self.b_emp_name_var.trace_add("write", _batch_refresh_save_path)
 
         action_row = ttk.Frame(parent)
         action_row.pack(anchor="w", pady=(4, 20))
@@ -5646,6 +5918,7 @@ class WizardApp(tk.Tk):
             return False
         self._b_ssrs_match_status = "Matched"
         item["_ssrs_record"] = record
+        item["_lookup_source"] = "SSRS"
         if record.get("employee_name"):
             self.b_emp_name_var.set(record["employee_name"])
         self.b_ssrs_check_label.config(
@@ -5653,7 +5926,37 @@ class WizardApp(tk.Tk):
         )
         self.status_var.set(f"Batch: {self.b_emp_name_var.get() or emp_id} found via SSRS.")
         self._apply_ssrs_record_to_batch_asset_fields(record)
+        # Same manager-name AD fallback as the Single Person tab - SSRS has
+        # no manager column, so if the imported Excel data didn't supply
+        # one either, quietly fetch it from AD in the background.
+        self._batch_fetch_manager_via_ad_fallback(index, emp_id)
         return True
+
+    def _batch_fetch_manager_via_ad_fallback(self, index, emp_id):
+        if self.b_manager_name_var.get().strip():
+            return
+        uses_webview = _uses_webview_lookup(self.config_data)
+
+        def worker():
+            try:
+                if uses_webview:
+                    candidates = self.browser_session.search(emp_id)
+                else:
+                    candidates = [fetch_employee_details(emp_id, self.config_data)]
+                self.after(0, self._batch_on_manager_fallback_result, index, candidates)
+            except Exception:
+                logger.debug("Batch manager AD fallback: lookup failed for %r (non-fatal)", emp_id, exc_info=True)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _batch_on_manager_fallback_result(self, index, candidates):
+        if index != self._batch_active_index or not candidates:
+            return
+        if self.b_manager_name_var.get().strip():
+            return
+        manager = candidates[0].get("manager_name", "")
+        if manager:
+            self.b_manager_name_var.set(manager)
 
     def _apply_ssrs_record_to_batch_asset_fields(self, record):
         """Bulk-tab equivalent of _apply_ssrs_record_to_asset_fields - only
@@ -5836,18 +6139,24 @@ class WizardApp(tk.Tk):
                 return
         self.b_emp_name_var.set(chosen.get("emp_name", ""))
         self.b_manager_name_var.set(chosen.get("manager_name", ""))
+        self.batch_queue[index]["_lookup_source"] = "AD"
         self.b_identity_hint.config(text="")
         self.status_var.set(f"Batch: {self.b_emp_name_var.get()} found.")
         self._batch_check_identity_resolved()
 
     def _batch_on_lookup_failure(self, index, exc):
+        logger.error(
+            "Batch AD lookup failed (row index=%s, showing friendly message to operator): %s", index, exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         if index != self._batch_active_index:
             return
-        self._batch_mark_needs_attention(f"AD lookup failed ({exc}) - enter details manually.")
+        self._batch_mark_needs_attention("⚠ Employee lookup unavailable. Please enter details manually.")
 
     def _batch_mark_needs_attention(self, message):
         index = self._batch_active_index
         self.batch_queue[index]["status"] = "Needs Attention"
+        self.batch_queue[index]["_lookup_source"] = "Manual"
         self.b_identity_hint.config(text=message)
         self.status_var.set(f"Batch: {message}")
         self._batch_refresh_tree()
@@ -5905,20 +6214,6 @@ class WizardApp(tk.Tk):
         return os.path.join(
             root, _safe_folder_name(sub_type), today_str, _safe_folder_name(operator), filename
         )
-
-    def _batch_choose_save_location(self):
-        item = self.batch_queue[self._batch_active_index]
-        default_path = self.b_output_path_override or self._batch_compute_default_output_path(item)
-        chosen = filedialog.asksaveasfilename(
-            title="Save PDF As",
-            initialdir=os.path.dirname(default_path),
-            initialfile=os.path.basename(default_path),
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf")],
-        )
-        if chosen:
-            self.b_output_path_override = chosen
-            self.b_save_location_var.set(chosen)
 
     def _batch_validate_active(self):
         item = self.batch_queue[self._batch_active_index]
@@ -6017,6 +6312,11 @@ class WizardApp(tk.Tk):
             self.update_idletasks()
             convert_docx_to_pdf_via_word(filled_docx, unsigned_pdf)
 
+            # Enhancement 13/18 - visible "Signed On: <timestamp>" caption
+            # under both signatures, before signing (see the single-tab
+            # _on_generate for why the ordering matters).
+            _stamp_signed_on_captions(unsigned_pdf, _find_signature_field_boxes(unsigned_pdf))
+
             # Enhancement 19 - PDF metadata, before signing (see the
             # single-tab _on_generate for why the ordering matters).
             _set_pdf_metadata(unsigned_pdf, {
@@ -6031,13 +6331,21 @@ class WizardApp(tk.Tk):
 
             self.status_var.set("Applying cryptographic signatures...")
             self.update_idletasks()
+            # Enhancement 12 - Adobe's own Signature Properties dialog has
+            # no dedicated Employee ID field, so it's folded into the
+            # Reason text (along with the employee name) for both
+            # signatures, alongside the real Location and the automatic
+            # signing timestamp pyHanko already embeds.
+            base_reason = self.config_data.get("signing_reason") or "IT Asset Acknowledgement"
+            emp_reason = f"{base_reason} - {emp_name} (Employee ID: {emp_id})"
             sign_pdf_with_signatures(
                 unsigned_pdf, output_path,
                 [
-                    {"field_name": "EmployeeSignature", "display_name": emp_name, "location": operator_location},
+                    {"field_name": "EmployeeSignature", "display_name": emp_name,
+                     "location": operator_location, "reason": emp_reason},
                     {"field_name": "AssetReceiverSignature",
                      "display_name": self.config_data.get("asset_receiver_display_name", "Asset Receiver"),
-                     "location": operator_location},
+                     "location": operator_location, "reason": emp_reason},
                 ],
                 self.config_data,
             )
@@ -6047,8 +6355,8 @@ class WizardApp(tk.Tk):
             self.status_var.set("Generation failed.")
             _write_audit_log_entry(
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
-                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
-                email_draft_created=False,
+                ssrs_match_status=ssrs_match_status, lookup_source=item.get("_lookup_source", ""),
+                pdf_generated=False, pdf_location="", email_draft_created=False,
             )
             return
         except Exception as exc:
@@ -6057,8 +6365,8 @@ class WizardApp(tk.Tk):
             self.status_var.set("Generation failed.")
             _write_audit_log_entry(
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
-                ssrs_match_status=ssrs_match_status, pdf_generated=False, pdf_location="",
-                email_draft_created=False,
+                ssrs_match_status=ssrs_match_status, lookup_source=item.get("_lookup_source", ""),
+                pdf_generated=False, pdf_location="", email_draft_created=False,
             )
             return
         finally:
@@ -6088,11 +6396,13 @@ class WizardApp(tk.Tk):
 
         _write_audit_log_entry(
             operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
-            ssrs_match_status=ssrs_match_status, pdf_generated=True, pdf_location=output_path,
-            email_draft_created=email_draft_created,
+            ssrs_match_status=ssrs_match_status, lookup_source=item.get("_lookup_source", ""),
+            pdf_generated=True, pdf_location=output_path, email_draft_created=email_draft_created,
         )
         if hasattr(self, "_history_refresh"):
             self._history_refresh()
+        if hasattr(self, "_recent_docs_refresh"):
+            self._recent_docs_refresh()
 
         self.status_var.set(f"Completed: {emp_name} -> {output_path}")
         self._batch_clear_panel()
