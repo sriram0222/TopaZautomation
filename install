@@ -1,0 +1,11 @@
+requests
+requests-negotiate-sspi ; sys_platform == "win32"
+pywin32 ; sys_platform == "win32"
+pywebview
+Pillow
+openpyxl
+pyhanko
+cryptography
+pypdf
+reportlab
+truststore
