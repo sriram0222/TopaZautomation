@@ -380,9 +380,54 @@ CONFIG = {
         },
     },
 
-    "servicenow": {"enabled": False},
-    # Placeholder for a future ServiceNow integration - not implemented
-    # yet, kept here so the shape of that config already exists.
+    "servicenow": {
+        # ServiceNow is checked AUTOMATICALLY the instant an Employee ID is
+        # entered, same trigger point as SSRS (see _servicenow_autocheck_now
+        # /_batch_try_servicenow_autofill) - SSRS is NOT removed or
+        # replaced, both run; ServiceNow's data wins when both have a
+        # record for the same person, since ServiceNow is the LIVE system
+        # and SSRS is a once-a-day snapshot (see _apply_servicenow_record_*
+        # for exactly how the two are merged).
+        #
+        # REPLACE_ME: base_url, table, query_field and field_map below are
+        # placeholders - set to real values once you've confirmed the
+        # exact ServiceNow table/fields (see the chat reply). Until then
+        # this stays harmless: enabled defaults to False, and the app logs
+        # one message and skips the ServiceNow check entirely instead of
+        # erroring.
+        "enabled": False,
+        "base_url": "https://REPLACE_ME.service-now.com",
+        # ServiceNow Table API name for the New Hire onboarding records,
+        # e.g. "u_new_hire_onboarding" or "sc_req_item" - whatever table
+        # actually holds the live New Hire data.
+        "table": "REPLACE_ME_table_name",
+        # The ServiceNow field name to query BY (must hold the Employee ID).
+        "query_field": "REPLACE_ME_employee_id_field",
+        "timeout_seconds": 10,
+        # Submission types ServiceNow is checked for - New Hire only by
+        # default, since that's the live data SSRS is missing; add more
+        # here later if other types get a ServiceNow source too.
+        "new_hire_submission_types": ["New Hire"],
+        # ServiceNow field name -> app field, same idea as SSRS's
+        # column_map. Add/remove rows to match whatever the real table
+        # actually has - a field left as "REPLACE_ME..." is simply
+        # skipped (never sent as part of the query, never mapped).
+        "field_map": {
+            "employee_id": "REPLACE_ME_employee_id_field",
+            "employee_name": "REPLACE_ME_name_field",
+            "manager_name": "REPLACE_ME_manager_field",
+            "email": "REPLACE_ME_email_field",
+            "serial_number": "REPLACE_ME_serial_field",
+            "hostname": "REPLACE_ME_hostname_field",
+            "device_model": "REPLACE_ME_model_field",
+            "ticket_number": "REPLACE_ME_ticket_field",
+            "monitor": "REPLACE_ME_monitor_field",
+            "dock": "REPLACE_ME_dock_field",
+            "keyboard_mouse": "REPLACE_ME_keyboard_mouse_field",
+            "power_adapter": "REPLACE_ME_power_adapter_field",
+            "battery": "REPLACE_ME_battery_field",
+        },
+    },
 }
 
 
@@ -3755,6 +3800,85 @@ def parse_ssrs_asset_workbook(xlsx_path, column_map):
 
 
 # ============================================================================
+# SERVICENOW LIVE NEW HIRE LOOKUP
+#
+# SSRS's asset report is only refreshed once a day (see
+# ssrs_asset_report.cache_max_age_hours above) - a New Hire whose ticket
+# was updated (or created) LATER that same day won't show up in SSRS until
+# the next day's download. ServiceNow is checked as a SEPARATE, ADDITIONAL
+# live lookup for exactly that gap - SSRS is NOT removed and keeps running
+# exactly as before; this just also queries ServiceNow in real time, every
+# time, and ServiceNow's data wins when both have something for the same
+# person (see _apply_servicenow_record_to_asset_fields / the single-tab
+# and bulk-tab autocheck methods for how the two get merged).
+# ============================================================================
+
+def fetch_servicenow_new_hire(emp_id, config):
+    """Queries the ServiceNow Table API for a live New Hire record by
+    Employee ID, using the current Windows login session (SSPI) - same
+    no-stored-password approach as SSRS/AD. Returns a dict of app-field ->
+    value (using servicenow.field_map) on a match, or None if there's no
+    match, ServiceNow isn't configured yet, or the request fails for any
+    reason. Deliberately NEVER RAISES: this runs automatically in the
+    background on every Employee ID entry, so a ServiceNow hiccup must
+    never interrupt the operator - it just quietly falls back to
+    SSRS/AD/manual, with the real error going to application.log only."""
+    sn_cfg = (config or {}).get("servicenow", {})
+    if not sn_cfg.get("enabled"):
+        return None
+    base_url = (sn_cfg.get("base_url") or "").strip()
+    table = (sn_cfg.get("table") or "").strip()
+    query_field = (sn_cfg.get("query_field") or "").strip()
+    if not base_url or "REPLACE_ME" in base_url or not table or "REPLACE_ME" in table \
+            or not query_field or "REPLACE_ME" in query_field:
+        logger.debug("ServiceNow lookup: skipped - not configured yet (base_url/table/query_field still REPLACE_ME)")
+        return None
+    if requests is None:
+        logger.warning("ServiceNow lookup: skipped - the 'requests' library is not installed")
+        return None
+    if not HAS_SSPI:
+        logger.warning("ServiceNow lookup: skipped - requests_negotiate_sspi is not installed")
+        return None
+
+    field_map = {k: v for k, v in sn_cfg.get("field_map", {}).items() if v and "REPLACE_ME" not in v}
+    url = f"{base_url.rstrip('/')}/api/now/table/{table}"
+    params = {
+        "sysparm_query": f"{query_field}={emp_id}",
+        "sysparm_limit": "1",
+    }
+    if field_map:
+        params["sysparm_fields"] = ",".join(sorted(set(field_map.values())))
+
+    try:
+        resp = requests.get(
+            url, params=params, auth=HttpNegotiateAuth(),
+            timeout=sn_cfg.get("timeout_seconds", 10),
+            headers={"Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        rows = (resp.json() or {}).get("result", [])
+    except Exception:
+        logger.exception("ServiceNow lookup: request failed for emp_id=%r (falling back to SSRS/AD/manual)", emp_id)
+        return None
+
+    if not rows:
+        logger.info("ServiceNow lookup: no record found for emp_id=%r", emp_id)
+        return None
+
+    row = rows[0]
+    record = {}
+    for app_field, sn_field in field_map.items():
+        val = row.get(sn_field, "")
+        # ServiceNow reference/choice fields often come back as
+        # {"display_value": ..., "value": ...} rather than a plain string.
+        if isinstance(val, dict):
+            val = val.get("display_value") or val.get("value") or ""
+        record[app_field] = "" if val is None else str(val).strip()
+    logger.info("ServiceNow lookup: matched emp_id=%r (%d field(s))", emp_id, len(record))
+    return record
+
+
+# ============================================================================
 # STARTUP HEALTH CHECK (Enhancement 13)
 # ============================================================================
 
@@ -4009,6 +4133,37 @@ class WizardApp(tk.Tk):
         icon.bind("<Leave>", hide)
         return icon
 
+    def _attach_hover_tooltip(self, widget, text):
+        """Same borderless hover popup as _add_info_tooltip, but attached
+        directly to an existing widget (e.g. an icon-only button) instead
+        of adding a separate 'ⓘ' label next to it - used where a button's
+        text label was replaced with a compact icon to save header space,
+        so the label text is still discoverable on hover."""
+        tip = {"win": None}
+
+        def show(_event=None):
+            if tip["win"] is not None:
+                return
+            win = tk.Toplevel(self)
+            win.wm_overrideredirect(True)
+            win.wm_attributes("-topmost", True)
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            win.wm_geometry(f"+{x}+{y}")
+            ttk.Label(
+                win, text=text, wraplength=340, justify="left", padding=6,
+                background="#FFFDE7", relief="solid", borderwidth=1,
+            ).pack()
+            tip["win"] = win
+
+        def hide(_event=None):
+            if tip["win"] is not None:
+                tip["win"].destroy()
+                tip["win"] = None
+
+        widget.bind("<Enter>", show)
+        widget.bind("<Leave>", hide)
+
     # -------------------------------------------------------- keyboard nav
     @staticmethod
     def _bind_enter_advances_focus(widget):
@@ -4083,13 +4238,22 @@ class WizardApp(tk.Tk):
         ttk.Label(ssrs_box, textvariable=self.ssrs_status_var).pack(anchor="w")
         ttk.Label(ssrs_box, textvariable=self.ssrs_records_var).pack(anchor="w")
         ttk.Label(ssrs_box, textvariable=self.ssrs_updated_var).pack(anchor="w")
-        ttk.Button(ssrs_box, text="Refresh Data", command=lambda: self._ssrs_refresh(force=True)).pack(
-            anchor="w", pady=(4, 0)
+        # Icon-only (⟳) instead of "Refresh Data" to save space, same as
+        # the Settings gear above - a hover tooltip still spells it out.
+        self.ssrs_refresh_button = ttk.Button(
+            ssrs_box, text="⟳", width=3, command=lambda: self._ssrs_refresh(force=True)
         )
+        self.ssrs_refresh_button.pack(anchor="w", pady=(4, 0))
+        self._attach_hover_tooltip(self.ssrs_refresh_button, "Refresh Data")
 
-        ttk.Button(right, text="Settings...", command=lambda: self._show_settings_dialog(first_run=False)).pack(
-            side="left"
+        # Icon-only instead of "Settings..." to save header space - the
+        # gear (⚙) is a widely-recognized settings symbol, and a hover
+        # tooltip still spells out "Settings" for discoverability.
+        settings_button = ttk.Button(
+            right, text="⚙", width=3, command=lambda: self._show_settings_dialog(first_run=False)
         )
+        settings_button.pack(side="left")
+        self._attach_hover_tooltip(settings_button, "Settings")
 
         ttk.Separator(self, orient="horizontal").pack(fill="x", side="top")
 
@@ -4124,7 +4288,16 @@ class WizardApp(tk.Tk):
         thread (Enhancements 9/11) so the UI never blocks on the network
         call, then hops back to the main thread (self.after) to update
         state and the status labels - Tkinter widgets must only be
-        touched from the main thread."""
+        touched from the main thread.
+
+        While the download/parse is in flight, the "Refresh Data" button
+        is greyed out (disabled) and the status line shows "Downloading..."
+        so the operator can see it's actually working, instead of the
+        button looking clickable again immediately with no feedback."""
+        if hasattr(self, "ssrs_refresh_button"):
+            self.ssrs_refresh_button.config(state="disabled")
+        if hasattr(self, "ssrs_status_var"):
+            self.ssrs_status_var.set("Status: Downloading...")
 
         def worker():
             cfg = self.config_data.get("ssrs_asset_report", {})
@@ -4164,6 +4337,8 @@ class WizardApp(tk.Tk):
                     "last_updated": last_updated, "index": index, "error": error_detail,
                 }
                 self._refresh_ssrs_status_labels()
+                if hasattr(self, "ssrs_refresh_button"):
+                    self.ssrs_refresh_button.config(state="normal")
                 logger.info(
                     "SSRS asset report: status=%r records=%d error=%r",
                     status, records, error_detail,
@@ -4566,21 +4741,16 @@ class WizardApp(tk.Tk):
         # success screen after Generate, with one-click Open PDF/Open Folder.
         self.output_path_override = None
 
-        # Enhancement 10 - a compact Recent Documents panel (last 3), so
-        # opening something just generated doesn't require a trip to the
-        # separate Generated Documents tab.
-        recent_frame = ttk.LabelFrame(bottom, text="Recent Documents", padding=(8, 4))
-        recent_frame.pack(fill="x", pady=(0, 8))
-        self.recent_docs_list_frame = ttk.Frame(recent_frame)
-        self.recent_docs_list_frame.pack(fill="x")
-
+        # The compact "Recent Documents" panel that used to live here was
+        # removed - it duplicated the dedicated Generated Documents tab,
+        # which already covers the same (and more) with a full searchable
+        # history, Open PDF and Open Folder.
         btn_row = ttk.Frame(bottom)
         btn_row.pack(fill="x")
         ttk.Button(btn_row, text="Generate Signed PDF", command=self._on_generate).pack(side="left")
         ttk.Button(btn_row, text="Start Another Form", command=self._on_start_another).pack(side="left", padx=10)
 
         self.single_content = self._make_scrollable(tab)
-        self._recent_docs_refresh()
 
         self._sig_preview_image = {}
         self._signature_paths = {"employee_signature_path": None, "asset_receiver_signature_path": None}
@@ -4721,7 +4891,31 @@ class WizardApp(tk.Tk):
                 self.after_cancel(self._ssrs_check_after_id)
             except Exception:
                 pass
+        # The Employee ID itself just changed - clear whatever name/manager
+        # is currently on screen right away (not after the 600ms debounce),
+        # so a previous employee's details never linger while a new ID is
+        # typed or a wrong one is entered. Bug fix: previously these fields
+        # were only ever *filled*, never cleared, so typing a new/wrong
+        # Employee ID kept showing the last match until something else
+        # (like "Start Next Employee") happened to reset the whole form.
+        self._clear_identity_fields_for_new_id()
         self._ssrs_check_after_id = self.after(600, self._ssrs_autocheck_now)
+
+    def _clear_identity_fields_for_new_id(self):
+        """Wipes the Employee Name / Manager Name fields and the SSRS
+        match state whenever the Employee ID changes, so stale data from
+        whichever employee was previously matched can't keep showing on
+        screen for a different (or wrong) Employee ID. Does not touch the
+        Asset Details fields - those are left as-is, same as before."""
+        self._ssrs_matched_record = None
+        self._ssrs_match_status = ""
+        self._identity_lookup_source = "Manual"
+        self.emp_name_var.set("")
+        self.manager_name_var.set("")
+        if hasattr(self, "ssrs_check_label"):
+            self.ssrs_check_label.config(text="")
+        if hasattr(self, "manual_entry_hint"):
+            self.manual_entry_hint.config(text="")
 
     def _ssrs_autocheck_now(self):
         self._ssrs_check_after_id = None
@@ -4770,13 +4964,19 @@ class WizardApp(tk.Tk):
                     candidates = self.browser_session.search(emp_id)
                 else:
                     candidates = [fetch_employee_details(emp_id, self.config_data)]
-                self.after(0, self._on_manager_fallback_result, candidates)
+                self.after(0, self._on_manager_fallback_result, emp_id, candidates)
             except Exception:
                 logger.debug("Manager AD fallback: lookup failed for %r (non-fatal)", emp_id, exc_info=True)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_manager_fallback_result(self, candidates):
+    def _on_manager_fallback_result(self, emp_id, candidates):
+        # The Employee ID field may have moved on to someone else while
+        # this background lookup was in flight - if so, these results
+        # belong to the old ID, not whoever is on screen now, so drop
+        # them rather than let them land on the wrong person's form.
+        if emp_id != self.emp_id_var.get().strip():
+            return
         if not candidates or self.manager_name_var.get().strip():
             return
         manager = candidates[0].get("manager_name", "")
@@ -4824,6 +5024,10 @@ class WizardApp(tk.Tk):
 
     def _on_lookup_success(self, emp_id, candidates):
         self.lookup_button.config(state="normal")
+        if emp_id != self.emp_id_var.get().strip():
+            # Employee ID changed again while this lookup was running -
+            # these results are for the old ID, not the one on screen now.
+            return
         if not candidates:
             self.status_var.set(f"No results for {emp_id} - enter details manually.")
             self.manual_entry_hint.config(text="No match found. Please enter the employee's name and manager manually below.")
@@ -5291,8 +5495,6 @@ class WizardApp(tk.Tk):
         )
         if hasattr(self, "_history_refresh"):
             self._history_refresh()
-        if hasattr(self, "_recent_docs_refresh"):
-            self._recent_docs_refresh()
 
         self._show_generation_success_dialog(output_path)
 
@@ -5504,46 +5706,6 @@ class WizardApp(tk.Tk):
         ttk.Button(action_row, text="Open Folder", command=self._history_open_folder).pack(side="left", padx=8)
 
         self._history_refresh()
-
-    def _recent_docs_refresh(self):
-        """Enhancement 10 - the compact panel on the Single Person tab
-        (last 3 generated PDFs), separate from the full searchable
-        Generated Documents tab."""
-        if not hasattr(self, "recent_docs_list_frame"):
-            return
-        for child in self.recent_docs_list_frame.winfo_children():
-            child.destroy()
-        entries = [e for e in _read_audit_log_entries() if (e.get("pdf_generated") or "").strip().lower() == "yes"][:3]
-        if not entries:
-            ttk.Label(self.recent_docs_list_frame, text="No documents generated yet.", foreground="#888").pack(
-                anchor="w"
-            )
-            return
-        for entry in entries:
-            path = entry.get("pdf_location", "")
-            row = ttk.Frame(self.recent_docs_list_frame)
-            row.pack(fill="x", pady=1)
-            ttk.Label(
-                row,
-                text=f"{entry.get('employee_id', '')}  •  {entry.get('submission_type', '')}  •  {entry.get('timestamp', '')}",
-                anchor="w",
-            ).pack(side="left", fill="x", expand=True)
-
-            def _open_recent_pdf(p=path):
-                if p and os.path.exists(p):
-                    self._open_with_os_default(p)
-                else:
-                    messagebox.showwarning("File not found", f"This PDF no longer exists at:\n{p}")
-
-            def _open_recent_folder(p=path):
-                folder = os.path.dirname(p)
-                if folder and os.path.isdir(folder):
-                    self._open_with_os_default(folder)
-                else:
-                    messagebox.showwarning("Folder not found", f"This folder no longer exists:\n{folder}")
-
-            ttk.Button(row, text="Open", width=6, command=_open_recent_pdf).pack(side="left", padx=(4, 2))
-            ttk.Button(row, text="Folder", width=7, command=_open_recent_folder).pack(side="left")
 
     def _history_refresh(self):
         if not hasattr(self, "history_tree"):
@@ -6401,8 +6563,6 @@ class WizardApp(tk.Tk):
         )
         if hasattr(self, "_history_refresh"):
             self._history_refresh()
-        if hasattr(self, "_recent_docs_refresh"):
-            self._recent_docs_refresh()
 
         self.status_var.set(f"Completed: {emp_name} -> {output_path}")
         self._batch_clear_panel()
