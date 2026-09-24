@@ -323,6 +323,19 @@ CONFIG = {
         # text, not a fixed column position - so it keeps working even if
         # TracIT reorders/adds columns later.
         "results_ready_timeout_seconds": 20,
+        # Keep the TracIT browser window completely off-screen at all
+        # times, instead of popping it up on every "Fetch from TracIT"
+        # click. There's nothing the operator needs to see or click in it
+        # (login is Windows SSO, same as the AD lookup window) - showing
+        # it just interrupts them. Set to False to bring back the old
+        # visible popup for troubleshooting.
+        "keep_window_hidden": True,
+        # Reload the TracIT page in the background this often (seconds)
+        # even when nobody is searching, so the page/session stays warm
+        # and the very next lookup doesn't pay for a cold page load. Set
+        # to 0/None to disable the background refresh entirely. Skipped
+        # automatically if a lookup happens to be in progress right then.
+        "auto_refresh_seconds": 300,
     },
     # Drives the same embedded-browser approach used for AD Lookup to
     # pull the Current Device Serial Number straight from TracIT for LWD/
@@ -1784,9 +1797,15 @@ def _perform_tracit_search(window, emp_id, cfg):
             return "NOT_FOUND";
         }})();
         """
-        window.evaluate_js(toggle_js)
-        deadline = time.time() + 5
+        # A freshly-opened TracIT window may fire "loaded" before React has
+        # finished its first render/hydration pass, so the toggle button
+        # (and then the field) can be missing on the very first click. Keep
+        # re-clicking the toggle on every poll (harmless if already open)
+        # instead of clicking once and hoping, so a slow first render
+        # doesn't cause a false "field not found" failure.
+        deadline = time.time() + 8
         while time.time() < deadline and not window.evaluate_js(find_input_js):
+            window.evaluate_js(toggle_js)
             time.sleep(0.3)
         if not window.evaluate_js(find_input_js):
             logger.error("TracIT lookup: could not open the filter panel / find the Employee ID field")
@@ -1854,6 +1873,25 @@ def _perform_tracit_search(window, emp_id, cfg):
         )
     logger.debug("TracIT lookup: filled Employee ID field OK")
 
+    # Snapshot the results table BEFORE applying the new filter, so the
+    # "ready" check below can require the table to actually have changed -
+    # not just the filter chip to have appeared. The chip is added to the
+    # DOM as soon as the filter *state* changes (synchronous, client-side),
+    # but the table itself only updates once TracIT's async fetch for the
+    # newly-filtered rows returns and React re-renders - those two events
+    # are NOT simultaneous. Relying on the chip alone let this function
+    # read the still-stale (pre-filter) table and grab an unrelated row's
+    # empty Serial Number cell, which is what production logs showed
+    # ("results filtered after 0.0s" followed by an empty Serial Number).
+    snapshot_js = """
+    (function() {
+        var table = document.querySelector('table');
+        var tbody = table ? table.querySelector('tbody') : null;
+        return tbody ? (tbody.textContent || '') : '';
+    })();
+    """
+    table_snapshot_before = window.evaluate_js(snapshot_js) or ""
+
     apply_js = f"""
     (function(text) {{
         var btns = document.querySelectorAll('button');
@@ -1891,13 +1929,19 @@ def _perform_tracit_search(window, emp_id, cfg):
     """
     wait_start = time.time()
     deadline = wait_start + ready_timeout
-    found = False
+    chip_found = False
+    table_changed = False
     while time.time() < deadline:
-        if window.evaluate_js(chip_ready_js):
-            found = True
-            break
-        time.sleep(0.4)
-    if not found:
+        if not chip_found and window.evaluate_js(chip_ready_js):
+            chip_found = True
+            logger.debug("TracIT lookup: filter chip appeared after %.1fs", time.time() - wait_start)
+        if chip_found:
+            current_table = window.evaluate_js(snapshot_js) or ""
+            if current_table != table_snapshot_before:
+                table_changed = True
+                break
+        time.sleep(0.3)
+    if not chip_found:
         logger.error(
             "TracIT lookup: TIMED OUT after %.1fs waiting for the Employee ID "
             "filter chip for emp_id=%r", time.time() - wait_start, emp_id,
@@ -1908,7 +1952,22 @@ def _perform_tracit_search(window, emp_id, cfg):
             "there - try increasing tracit_lookup.results_ready_timeout_"
             "seconds in CONFIG."
         )
-    logger.debug("TracIT lookup: results filtered after %.1fs", time.time() - wait_start)
+    if not table_changed:
+        # The chip appeared but the table's content never visibly changed
+        # within the timeout. This can legitimately happen (e.g. the
+        # previous search happened to already show this same row), so
+        # don't hard-fail - just note it and fall through to extraction
+        # with whatever the table currently shows.
+        logger.warning(
+            "TracIT lookup: filter chip appeared for emp_id=%r but the "
+            "results table content never changed within %.1fs - proceeding "
+            "with extraction anyway", emp_id, ready_timeout,
+        )
+    else:
+        logger.debug("TracIT lookup: results table updated after %.1fs", time.time() - wait_start)
+    # Give React a brief moment to finish committing the new rows after the
+    # table content first differs, before reading cell values out of it.
+    time.sleep(0.3)
 
     extract_js = f"""
     (function(wantHeader) {{
@@ -1942,6 +2001,16 @@ def _perform_tracit_search(window, emp_id, cfg):
         )
     serial = (scan.get("serial") or "").strip()
     if not serial:
+        # The row we just read may still be mid-render (React can commit a
+        # row's shell slightly before its cell text settles). Give it a
+        # short grace window and re-read before treating this as a real
+        # empty-Serial-Number record.
+        retry_deadline = time.time() + 3
+        while not serial and time.time() < retry_deadline:
+            time.sleep(0.3)
+            scan = window.evaluate_js(extract_js) or {}
+            serial = (scan.get("serial") or "").strip()
+    if not serial:
         raise RuntimeError(
             f"TracIT found a record for Employee ID '{emp_id}', but its "
             "Serial Number cell was empty."
@@ -1971,15 +2040,51 @@ def _run_tracit_webview_helper():
         })
         return
 
+    keep_hidden = cfg.get("keep_window_hidden", True)
     window = webview.create_window(
-        "TracIT Lookup - log in here if prompted, then leave this window open",
+        "TracIT Lookup (background - stays hidden, no action needed here)",
         search_url,
         width=1200,
         height=800,
+        hidden=bool(keep_hidden),
     )
 
     page_ready = threading.Event()
     window.events.loaded += lambda: page_ready.set()
+
+    # Serializes access to the window between an in-progress lookup and the
+    # background refresh loop below, so a scheduled reload can never land
+    # in the middle of a search (and vice versa).
+    window_lock = threading.Lock()
+
+    def refresh_loop():
+        try:
+            interval = int(cfg.get("auto_refresh_seconds") or 0)
+        except (TypeError, ValueError):
+            interval = 0
+        if interval <= 0:
+            return
+        interval = max(60, interval)
+        logger.info("TracIT helper: background refresh enabled every %ss", interval)
+        while True:
+            time.sleep(interval)
+            if not window_lock.acquire(blocking=False):
+                logger.debug("TracIT helper: skipping scheduled refresh - a lookup is in progress")
+                continue
+            try:
+                logger.info("TracIT helper: refreshing the TracIT page in the background to keep it warm")
+                page_ready.clear()
+                window.load_url(search_url)
+                if not page_ready.wait(timeout=60):
+                    logger.warning("TracIT helper: background refresh did not finish loading within 60s")
+                else:
+                    logger.info("TracIT helper: background refresh completed")
+            except Exception:
+                logger.exception("TracIT helper: background refresh failed (non-fatal, will retry next interval)")
+            finally:
+                window_lock.release()
+
+    threading.Thread(target=refresh_loop, daemon=True).start()
 
     def stdin_reader():
         for line in sys.stdin:
@@ -2002,11 +2107,6 @@ def _run_tracit_webview_helper():
             emp_id = (req.get("emp_id") or "").strip()
             logger.info("TracIT helper: received lookup request_id=%r emp_id=%r", request_id, emp_id)
 
-            try:
-                window.show()
-            except Exception:
-                logger.exception("TracIT helper: window.show() failed (request_id=%r)", request_id)
-
             if not emp_id:
                 logger.warning("TracIT helper: empty employee ID in request_id=%r", request_id)
                 _send({"request_id": request_id, "error": "Empty employee ID."})
@@ -2020,18 +2120,17 @@ def _run_tracit_webview_helper():
                 })
                 continue
 
-            try:
-                serial = _perform_tracit_search(window, emp_id, cfg)
-                logger.info("TracIT helper: sending serial_number back for request_id=%r", request_id)
-                _send({"request_id": request_id, "serial_number": serial})
+            # The window is never shown (see keep_window_hidden in CONFIG) -
+            # the lock just keeps this search from overlapping a scheduled
+            # background refresh, not from anything visual.
+            with window_lock:
                 try:
-                    window.hide()
-                    logger.info("TracIT helper: auto-hid lookup window after successful result (request_id=%r)", request_id)
-                except Exception:
-                    logger.exception("TracIT helper: window.hide() failed (request_id=%r)", request_id)
-            except Exception as exc:
-                logger.exception("TracIT helper: lookup failed for request_id=%r emp_id=%r", request_id, emp_id)
-                _send({"request_id": request_id, "error": str(exc)})
+                    serial = _perform_tracit_search(window, emp_id, cfg)
+                    logger.info("TracIT helper: sending serial_number back for request_id=%r", request_id)
+                    _send({"request_id": request_id, "serial_number": serial})
+                except Exception as exc:
+                    logger.exception("TracIT helper: lookup failed for request_id=%r emp_id=%r", request_id, emp_id)
+                    _send({"request_id": request_id, "error": str(exc)})
 
     threading.Thread(target=stdin_reader, daemon=True).start()
 
