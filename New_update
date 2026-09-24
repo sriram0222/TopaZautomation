@@ -1,0 +1,39 @@
+How the IT Asset Submission App Works
+Sep 17, 2026
+Prepared by Sriram for manager and office review.
+This note answers the six questions that came up from the manager and the office about the IT Asset Submission app — in plain terms, not code. It covers where each piece of data comes from, how the signature and lookups actually connect, and why the tool feels as polished as a commercial one.
+1. How the SSRS Excel report is collected and auto-populated
+The app downloads the same asset report that used to be pulled manually from the SSRS reporting portal — it just does it itself, on a schedule, instead of someone opening a browser and exporting it. It signs in using the person's own Windows login (no separate password stored anywhere), fetches the report, and saves it as an Excel file, refreshing it periodically so the data doesn't go stale.
+Once the file is on disk, the app reads it directly (no copy-pasting): it scans the header row to line up each expected column (Employee ID, name, manager, serial number, model, and so on), then builds an internal lookup table keyed by Employee ID. Every employee ID is stored two ways — exactly as SSRS wrote it, and as a digits-only version — so a lookup still matches even if someone types the ID slightly differently (with or without leading zeros, for example).
+From then on, the moment a technician types an Employee ID into the form, the app checks this table instantly and, on a match, fills in the person's details and asset fields automatically — no manual retyping, and far fewer transcription errors.
+2. How the Topaz pad handshake works
+When a real Topaz signature pad is plugged in, the app talks to it through Topaz's own official driver (the SigPlus SDK) — the same software vendor-supplied driver any Windows program uses to talk to the pad, not a workaround. On startup the app connects to that driver, "arms" the pad (turns on its writing surface and clears any old strokes), and waits for the person to sign.
+Once they lift the pen, the app reads the captured signature back from the driver and saves it as an image, then immediately turns the pad off again so it's not still capturing input from whatever happens next. If no pad is connected, or a pad is deliberately disabled in settings, the app automatically falls back to an on-screen signature pad drawn with the mouse or touchscreen — so the workflow never breaks even without the physical hardware. Either way, the resulting signature image ends up embedded in the final signed PDF the same way.
+3. How the AD lookup is connected
+The AD lookup reuses the same internal company lookup page people already use in a browser — the app just drives it automatically instead of someone doing it by hand. It opens that page using an embedded browser session, signed in with the person's own Windows credentials (the same single sign-on the corporate network already trusts, so nothing is typed or stored by the app), searches for the Employee ID, and reads the results straight off the page — name, manager, department, contact number, and so on.
+Those values are then dropped straight into the form. If SSRS already matched the same employee, AD lookup fills in anything SSRS's report doesn't carry (like manager or department), so the two sources complement rather than conflict with each other.
+4. How the BU profile works
+Each Business Unit has its own pre-built Word template stored in a shared "BU templates" folder — these are the same acknowledgement form layouts each BU already uses, just saved in one place the app can read from. When the operator picks a Business Unit from a dropdown, the app simply points at that BU's template instead of a generic one, so the wording, branding, and layout match what that BU expects, without anyone having to remember which template goes with which BU.
+Adding a new BU (or updating an existing one's wording) doesn't need a code change — it's just a new Word file dropped into that shared folder, and it shows up in the dropdown automatically the next time the app starts.
+5. How bulk processing is managed
+The Bulk Batch tab takes a single Excel file listing many employees at once and turns it into a queue — each row becomes one entry with its own status: Pending, Completed, or Skipped. The operator can step through them one at a time (loading a row auto-runs the same SSRS/AD lookups the Single Person tab uses, so each person's details still get filled in automatically), or hit "Process All" to auto-advance through the whole queue, generating and signing each PDF in turn without re-opening the form each time.
+Every row keeps its own state, so if something needs a second look, the operator can re-queue just that one person, skip it, or reprocess an already-completed one — nothing else in the batch is disturbed. This is what lets one person process dozens of new-hire or asset submissions in one sitting instead of repeating the whole manual process for each.
+6. How the UI was built to look this polished
+The app is a native Windows desktop application, built on Python's standard Tkinter toolkit but styled deliberately — consistent fonts, spacing, colors, and button states across every tab, tooltips on the less obvious fields, status messages that explain what's happening instead of leaving blank space, and a clean layout that groups related fields together (identity, asset details, signatures) rather than dumping everything on one screen.
+A lot of the "feels professional" quality also comes from what it doesn't make the user think about: fields auto-fill instead of needing to be typed, lookups happen quietly in the background with a status label rather than a frozen screen, errors are shown as plain-English messages instead of technical stack traces, and the whole thing packages into a single .exe file so nobody has to install Python or any libraries to run it — they just double-click it, the same as any commercial desktop tool.
+What's been built so far
+• Signature capture from a real Topaz pad, with automatic fallback to an on-screen signature pad when no pad is connected
+• Word template auto-fill, converted to PDF automatically (no manual "Print to PDF" step)
+• Cryptographic digital signing of the final PDF, plus a visible "Signed On" timestamp on the document itself
+• Automatic SSRS asset report download and auto-populate by Employee ID
+• Automatic AD lookup (Windows single sign-on, no password ever typed or stored) as a second identity source
+• Per-Business-Unit Word templates, selected automatically from a shared template folder
+• A Bulk Batch tab for processing many employees from one Excel file, with per-row status tracking and an auto-advance "Process All" mode
+• A Generated Documents tab with recent-document history for quick reopening
+• An audit log recording who was looked up, from which source (SSRS/AD/manual), and when each document was signed
+• Friendly, plain-English error messages instead of technical crash screens
+• Packaged as a single .exe — no Python or libraries required on any teammate's machine to run it
+What's planned next
+• A live ServiceNow New Hire lookup, running alongside SSRS (not replacing it) so same-day new hires show up immediately instead of waiting for the next day's SSRS refresh — currently in progress, waiting on the exact ServiceNow table/field names from a discovery script already sent over
+• Beyond that, open to whatever the manager and the office raise next — any workflow gap, extra field, or report they'd find useful can be scoped and added
+Further questions or enhancement requests from the manager or the office are welcome any time — send them over and they'll be reviewed and built in.
