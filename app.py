@@ -1783,29 +1783,64 @@ def _perform_tracit_search(window, emp_id, cfg):
     # visible - TracIT hides the filter row behind a funnel icon until
     # it's clicked.
     if not window.evaluate_js(find_input_js):
+        # IMPORTANT: the filter button is a real open/close TOGGLE (its
+        # aria-label flips between e.g. "Show Filters" and "Hide Filters"
+        # once the panel is open), not an idempotent "make sure it's open"
+        # action. Clicking it again while the panel is already open (or
+        # mid-way through its open animation) closes it right back up. The
+        # previous version of this helper re-clicked it on every single
+        # poll (treating repeated clicks as always safe), which was wrong:
+        # if the panel's
+        # open animation hadn't finished rendering the input yet, the next
+        # poll would click the now-"Hide Filters" button and slam the panel
+        # shut again, and the loop could spend its whole 8s deadline
+        # flip-flopping the panel open/closed instead of just waiting for
+        # it to finish opening. This produced the intermittent "Could not
+        # find the Employee ID field ... even after trying to open the
+        # filter panel" failures seen in production, clustered on certain
+        # lookups rather than every lookup, exactly as a race like this
+        # would present.
+        #
+        # Fix: only click the button when its own state says it's actually
+        # closed. If its aria-label doesn't distinguish show/hide (some
+        # TracIT builds may not), fall back to clicking at most ONCE and
+        # then just wait out the animation instead of clicking repeatedly.
         toggle_js = f"""
-        (function() {{
+        (function(skipAmbiguousClick) {{
             var wantAria = {json.dumps(toggle_aria.strip().lower())};
             var btns = document.querySelectorAll('button');
             for (var i = 0; i < btns.length; i++) {{
                 var aria = (btns[i].getAttribute('aria-label') || '').trim().toLowerCase();
-                if (aria === wantAria || aria.indexOf('filter') !== -1) {{
+                if (aria === wantAria) {{
                     btns[i].click();
-                    return "OK";
+                    return "CLICKED";
+                }}
+                if (aria.indexOf('hide') !== -1 && aria.indexOf('filter') !== -1) {{
+                    return "ALREADY_OPEN";
+                }}
+            }}
+            if (skipAmbiguousClick) return "WAITING";
+            for (var i = 0; i < btns.length; i++) {{
+                var aria2 = (btns[i].getAttribute('aria-label') || '').trim().toLowerCase();
+                if (aria2.indexOf('filter') !== -1) {{
+                    btns[i].click();
+                    return "CLICKED_FALLBACK";
                 }}
             }}
             return "NOT_FOUND";
-        }})();
+        }})(%s);
         """
         # A freshly-opened TracIT window may fire "loaded" before React has
         # finished its first render/hydration pass, so the toggle button
         # (and then the field) can be missing on the very first click. Keep
-        # re-clicking the toggle on every poll (harmless if already open)
-        # instead of clicking once and hoping, so a slow first render
-        # doesn't cause a false "field not found" failure.
+        # polling for up to 8s, but only click the toggle when it's safe to
+        # (see comment above) so the panel doesn't get toggled shut again.
         deadline = time.time() + 8
+        ambiguous_clicked = False
         while time.time() < deadline and not window.evaluate_js(find_input_js):
-            window.evaluate_js(toggle_js)
+            result = window.evaluate_js(toggle_js % ("true" if ambiguous_clicked else "false"))
+            if result == "CLICKED_FALLBACK":
+                ambiguous_clicked = True
             time.sleep(0.3)
         if not window.evaluate_js(find_input_js):
             logger.error("TracIT lookup: could not open the filter panel / find the Employee ID field")
@@ -1969,6 +2004,13 @@ def _perform_tracit_search(window, emp_id, cfg):
     # table content first differs, before reading cell values out of it.
     time.sleep(0.3)
 
+    # Scan every row for the Serial Number, not just the first one. An
+    # employee can have more than one asset record (e.g. a phone plan or
+    # accessory row with no serial alongside their actual laptop/monitor
+    # rows), and TracIT doesn't guarantee the row with a populated Serial
+    # Number sorts first. Production logs showed "Serial Number cell was
+    # empty" recurring even after the stale-table-read fix, which points to
+    # this - reading only row 0 - rather than a timing bug.
     extract_js = f"""
     (function(wantHeader) {{
         var table = document.querySelector('table');
@@ -1982,9 +2024,16 @@ def _perform_tracit_search(window, emp_id, cfg):
         if (colIndex === -1) return {{error: "NO_SERIAL_COLUMN"}};
         var bodyRows = table.querySelectorAll('tbody tr');
         if (!bodyRows.length) return {{error: "NO_ROWS"}};
-        var cells = bodyRows[0].querySelectorAll('td');
-        if (colIndex >= cells.length) return {{error: "COLUMN_OUT_OF_RANGE"}};
-        return {{serial: (cells[colIndex].textContent || '').trim(), rowCount: bodyRows.length}};
+        var serials = [];
+        for (var r = 0; r < bodyRows.length; r++) {{
+            var cells = bodyRows[r].querySelectorAll('td');
+            serials.push(colIndex < cells.length ? (cells[colIndex].textContent || '').trim() : '');
+        }}
+        var firstNonEmpty = '';
+        for (var s = 0; s < serials.length; s++) {{
+            if (serials[s]) {{ firstNonEmpty = serials[s]; break; }}
+        }}
+        return {{serial: serials[0], firstNonEmptySerial: firstNonEmpty, rowCount: bodyRows.length}};
     }})({json.dumps(serial_header.strip().lower())});
     """
     scan = window.evaluate_js(extract_js) or {}
@@ -1999,21 +2048,26 @@ def _perform_tracit_search(window, emp_id, cfg):
             f"TracIT returned no asset records for Employee ID '{emp_id}'. "
             "Double-check the ID, or look it up on TracIT directly."
         )
-    serial = (scan.get("serial") or "").strip()
+    serial = (scan.get("firstNonEmptySerial") or "").strip()
     if not serial:
-        # The row we just read may still be mid-render (React can commit a
-        # row's shell slightly before its cell text settles). Give it a
-        # short grace window and re-read before treating this as a real
-        # empty-Serial-Number record.
+        # Every row's Serial Number cell was empty. The row(s) may still be
+        # mid-render (React can commit a row's shell slightly before its
+        # cell text settles) - give it a short grace window and re-read
+        # before treating this as a real empty-Serial-Number record.
         retry_deadline = time.time() + 3
         while not serial and time.time() < retry_deadline:
             time.sleep(0.3)
             scan = window.evaluate_js(extract_js) or {}
-            serial = (scan.get("serial") or "").strip()
+            serial = (scan.get("firstNonEmptySerial") or "").strip()
     if not serial:
         raise RuntimeError(
-            f"TracIT found a record for Employee ID '{emp_id}', but its "
-            "Serial Number cell was empty."
+            f"TracIT found {scan.get('rowCount')} record(s) for Employee ID "
+            f"'{emp_id}', but none had a Serial Number filled in."
+        )
+    if scan.get("serial") and scan.get("serial") != serial:
+        logger.info(
+            "TracIT lookup: emp_id=%r - first row's Serial Number was blank, "
+            "used the first non-empty one from another row instead", emp_id,
         )
     logger.info(
         "TracIT lookup: SUCCESS for emp_id=%r - serial_number=%r (rowCount=%s)",
