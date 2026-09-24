@@ -296,6 +296,42 @@ CONFIG = {
     # {serial_number} placeholders will be filled in automatically from
     # the form.
 
+    "tracit_lookup": {
+        "enabled": True,
+        # TracIT's "View Assets" page has one fixed URL (no query-string
+        # deep-link into a filtered result) - it always reopens showing
+        # whatever filter was last applied there, so every automated
+        # lookup below starts by clearing that stale filter before
+        # applying a fresh one for the Employee ID being looked up.
+        "search_page_url": "https://tracit.optum.com/ham/view-assets",
+        # These are matched by their VISIBLE TEXT (label / aria-label /
+        # button caption), not by CSS class - TracIT is a React/MUI app
+        # whose class names (e.g. "css-xeauuy") are build-specific and
+        # change on every TracIT deploy, so matching by class would break
+        # the moment TracIT ships an update. Matching by the words a
+        # person actually reads on screen is far more stable.
+        "filter_toggle_aria_label": "Show Filters",
+        # aria-label of the funnel icon that opens the filter panel, if
+        # it isn't already open.
+        "employee_id_field_label": "User Employee Id",
+        # The floating label text above the Employee ID box inside the
+        # filter panel.
+        "clear_button_text": "Clear Filters",
+        "apply_button_text": "Apply Filters",
+        "serial_number_column_header": "Serial Number",
+        # The results table's column is found by matching this header
+        # text, not a fixed column position - so it keeps working even if
+        # TracIT reorders/adds columns later.
+        "results_ready_timeout_seconds": 20,
+    },
+    # Drives the same embedded-browser approach used for AD Lookup to
+    # pull the Current Device Serial Number straight from TracIT for LWD/
+    # Contractor LWD/Break Fix submissions, instead of the operator typing
+    # it in by hand. See TracitLookupSession / _run_tracit_webview_helper
+    # further down in this file. If TracIT's real page ever stops
+    # matching the text above (e.g. the field gets relabeled), update the
+    # strings here - no code changes needed.
+
     "signing_identity_folder": "signing_identity",
     # Where this app's own self-signed signing certificate + private key
     # are stored, once generated on first use (see ensure_signing_identity
@@ -377,7 +413,17 @@ CONFIG = {
             "keyboard_mouse": "Peripherals Keyb Mouse",
             "power_adapter": "Peripherals Power Chords",
             "battery": "Peripherals Battery",
+            # The report's own request-type column (e.g. "New Hire",
+            # "UHC MVS", "M & A") - used to auto-select the "New Hire"
+            # submission type the moment SSRS matches a New Hire row (see
+            # _ssrs_autocheck_now/_batch_try_ssrs_autofill_identity). Never
+            # overwrites a submission type the operator already picked.
+            "request_type": "Request Type",
         },
+        # The exact value(s) in the request_type column that mean "New
+        # Hire" - compared case-insensitively, trimmed. Add more strings
+        # here if the report ever spells it differently.
+        "new_hire_request_type_values": ["New Hire"],
     },
 
     "servicenow": {
@@ -809,6 +855,146 @@ class BrowserLookupSession:
         if "error" in result:
             raise RuntimeError(result["error"])
         return result.get("candidates", [])
+
+    def shutdown(self):
+        """Call when the main app is closing, to cleanly close the
+        embedded browser window and end the helper process."""
+        with self._lock:
+            if self._proc is None:
+                return
+            try:
+                self._proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                self._proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+            self._proc = None
+
+
+class TracitLookupSession:
+    """Bulk-serial-number-pulling sibling of BrowserLookupSession, above -
+    same overall design (a background subprocess drives a real embedded
+    browser window so TracIT's own SSO session gets reused, request/
+    response pairs travel over stdin/stdout keyed by request_id), just
+    talking to TracIT's "View Assets" page instead of the AD report."""
+
+    SEARCH_TIMEOUT_SECONDS = 60
+
+    def __init__(self):
+        self._proc = None
+        self._lock = threading.Lock()
+        self._pending = {}  # request_id -> {"event": Event, "result": dict}
+        self._fatal_error = None
+
+    def _build_command(self):
+        if getattr(sys, "frozen", False):
+            return [sys.executable, "--tracit-helper"]
+        return [sys.executable, os.path.abspath(__file__), "--tracit-helper"]
+
+    def start(self):
+        """Launches the helper process and its background window. Safe to
+        call more than once - a no-op if already running."""
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return
+            self._fatal_error = None
+            command = self._build_command()
+            try:
+                self._proc = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                logger.info("TracIT helper: launched new subprocess (pid=%s): %r", self._proc.pid, command)
+            except FileNotFoundError:
+                logger.exception("TracIT helper: failed to launch subprocess: %r", command)
+                self._fatal_error = (
+                    f"Could not launch the TracIT lookup helper process ({command[0]}). "
+                    "This usually means Python itself couldn't be found - "
+                    "if you're running the packaged .exe, try reinstalling it."
+                )
+                self._proc = None
+                return
+
+            threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self):
+        proc = self._proc
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+
+            if data.get("cmd") == "fatal_error":
+                self._fatal_error = data.get("error", "Unknown fatal error in TracIT lookup helper.")
+                for entry in self._pending.values():
+                    entry["result"] = {"error": self._fatal_error}
+                    entry["event"].set()
+                continue
+
+            request_id = data.get("request_id")
+            entry = self._pending.get(request_id)
+            if entry is not None:
+                entry["result"] = data
+                entry["event"].set()
+        with self._lock:
+            if self._proc is proc:
+                self._proc = None
+
+    def is_running(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def search(self, emp_id):
+        """Blocks until a serial number is returned or raises RuntimeError.
+        Returns the serial number string (never None on success - a
+        genuinely empty Serial Number cell on TracIT's side surfaces as a
+        RuntimeError, same as a not-found search, so the caller never
+        silently overwrites a real value with blank text)."""
+        if not self.is_running():
+            self.start()
+        if self._fatal_error:
+            raise RuntimeError(self._fatal_error)
+        if self._proc is None:
+            raise RuntimeError("TracIT lookup helper failed to start.")
+
+        request_id = uuid.uuid4().hex
+        event = threading.Event()
+        self._pending[request_id] = {"event": event, "result": None}
+
+        try:
+            self._proc.stdin.write(json.dumps({"request_id": request_id, "emp_id": emp_id}) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            self._pending.pop(request_id, None)
+            raise RuntimeError(
+                f"TracIT lookup helper is not responding ({exc}). It may have "
+                "been closed - click Fetch from TracIT again to restart it."
+            )
+
+        if not event.wait(timeout=self.SEARCH_TIMEOUT_SECONDS):
+            self._pending.pop(request_id, None)
+            raise RuntimeError(
+                "Timed out waiting for the TracIT search result. If a login "
+                "page appeared, please complete it and try again."
+            )
+
+        result = self._pending.pop(request_id)["result"]
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result.get("serial_number")
 
     def shutdown(self):
         """Call when the main app is closing, to cleanly close the
@@ -1537,6 +1723,322 @@ def _run_webview_helper():
 
 
 # ============================================================================
+# TRACIT LOOKUP - embedded-browser helper (runs in a SEPARATE process - this
+# same file, relaunched with --tracit-helper; see TracitLookupSession above
+# and the bottom of this file for the dispatcher)
+# ============================================================================
+
+def _perform_tracit_search(window, emp_id, cfg):
+    """Runs one search against TracIT's "View Assets" page: makes sure the
+    filter panel is open, clears whatever filter TracIT kept from the last
+    search, types the Employee ID into the field, applies it, waits for
+    the results table to actually reflect that Employee ID, then reads
+    the Serial Number cell out of the first row.
+
+    Every element is found by its VISIBLE TEXT (label/aria-label/button
+    caption) rather than a CSS selector - see the tracit_lookup CONFIG
+    comment for why (TracIT's MUI class names are build-specific and
+    change on every TracIT deploy)."""
+    employee_id_label = cfg.get("employee_id_field_label", "User Employee Id")
+    clear_text = cfg.get("clear_button_text", "Clear Filters")
+    apply_text = cfg.get("apply_button_text", "Apply Filters")
+    toggle_aria = cfg.get("filter_toggle_aria_label", "Show Filters")
+    serial_header = cfg.get("serial_number_column_header", "Serial Number")
+    ready_timeout = cfg.get("results_ready_timeout_seconds", 20)
+
+    logger.info("TracIT lookup: starting search for emp_id=%r", emp_id)
+
+    find_input_js = f"""
+    (function() {{
+        var wantLabel = {json.dumps(employee_id_label.strip().lower())};
+        var nodes = document.querySelectorAll('label, span, p, div, legend');
+        for (var i = 0; i < nodes.length; i++) {{
+            var t = (nodes[i].textContent || '').trim().toLowerCase();
+            if (t !== wantLabel) continue;
+            var container = nodes[i].closest('div');
+            for (var d = 0; d < 4 && container; d++) {{
+                var inp = container.querySelector('input');
+                if (inp) return true;
+                container = container.parentElement;
+            }}
+        }}
+        return false;
+    }})();
+    """
+
+    # Open the filter panel first, if the Employee ID field isn't already
+    # visible - TracIT hides the filter row behind a funnel icon until
+    # it's clicked.
+    if not window.evaluate_js(find_input_js):
+        toggle_js = f"""
+        (function() {{
+            var wantAria = {json.dumps(toggle_aria.strip().lower())};
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {{
+                var aria = (btns[i].getAttribute('aria-label') || '').trim().toLowerCase();
+                if (aria === wantAria || aria.indexOf('filter') !== -1) {{
+                    btns[i].click();
+                    return "OK";
+                }}
+            }}
+            return "NOT_FOUND";
+        }})();
+        """
+        window.evaluate_js(toggle_js)
+        deadline = time.time() + 5
+        while time.time() < deadline and not window.evaluate_js(find_input_js):
+            time.sleep(0.3)
+        if not window.evaluate_js(find_input_js):
+            logger.error("TracIT lookup: could not open the filter panel / find the Employee ID field")
+            raise RuntimeError(
+                f"Could not find the '{employee_id_label}' field on the TracIT "
+                "View Assets page (even after trying to open the filter panel). "
+                "TracIT may have changed its layout - update tracit_lookup in "
+                "CONFIG to match the current field/button wording."
+            )
+
+    # Clear whatever filter TracIT kept from the previous search (it does
+    # not reset itself when the page reopens) before applying a new one.
+    clear_js = f"""
+    (function(text) {{
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {{
+            if ((btns[i].textContent || '').trim().toLowerCase() === text) {{
+                btns[i].click();
+                return "OK";
+            }}
+        }}
+        return "NOT_FOUND";
+    }})({json.dumps(clear_text.strip().lower())});
+    """
+    if window.evaluate_js(clear_js) == "OK":
+        logger.debug("TracIT lookup: cleared the previous filter")
+        time.sleep(0.5)
+
+    # Fill the Employee ID field. TracIT is a React app, so a plain
+    # `.value = ...` assignment doesn't register with React's own state -
+    # the native property setter has to be used instead, same trick the
+    # rest of this function relies on for every other field it fills.
+    fill_js = f"""
+    (function(wantLabel, empId) {{
+        var nodes = document.querySelectorAll('label, span, p, div, legend');
+        var input = null;
+        for (var i = 0; i < nodes.length; i++) {{
+            var t = (nodes[i].textContent || '').trim().toLowerCase();
+            if (t !== wantLabel) continue;
+            var container = nodes[i].closest('div');
+            for (var d = 0; d < 4 && container && !input; d++) {{
+                input = container.querySelector('input');
+                container = container.parentElement;
+            }}
+            if (input) break;
+        }}
+        if (!input) return "NO_INPUT";
+        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        input.focus();
+        setter.call(input, '');
+        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        setter.call(input, empId);
+        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        input.blur();
+        return "OK";
+    }})({json.dumps(employee_id_label.strip().lower())}, {json.dumps(emp_id)});
+    """
+    if window.evaluate_js(fill_js) != "OK":
+        logger.error("TracIT lookup: could not find/fill the '%s' field for emp_id=%r", employee_id_label, emp_id)
+        raise RuntimeError(
+            f"Could not fill the '{employee_id_label}' field on the TracIT "
+            "View Assets page. Update tracit_lookup.employee_id_field_label "
+            "in CONFIG if TracIT has changed that label's wording."
+        )
+    logger.debug("TracIT lookup: filled Employee ID field OK")
+
+    apply_js = f"""
+    (function(text) {{
+        var btns = document.querySelectorAll('button');
+        for (var i = 0; i < btns.length; i++) {{
+            if ((btns[i].textContent || '').trim().toLowerCase() === text) {{
+                btns[i].click();
+                return "OK";
+            }}
+        }}
+        return "NOT_FOUND";
+    }})({json.dumps(apply_text.strip().lower())});
+    """
+    if window.evaluate_js(apply_js) != "OK":
+        logger.error("TracIT lookup: could not find the '%s' button", apply_text)
+        raise RuntimeError(
+            f"Could not find the '{apply_text}' button on the TracIT View "
+            "Assets page. Update tracit_lookup.apply_button_text in CONFIG "
+            "if TracIT has changed that button's wording."
+        )
+    logger.debug("TracIT lookup: clicked '%s'", apply_text)
+
+    # Wait for the results to actually reflect THIS Employee ID - TracIT
+    # shows the applied filter as a chip reading "Employee ID: <value>",
+    # which only appears once the new filter has taken effect.
+    chip_ready_js = f"""
+    (function(empId) {{
+        var wantText = ('employee id: ' + empId).toLowerCase();
+        var nodes = document.querySelectorAll('span, div');
+        for (var i = 0; i < nodes.length; i++) {{
+            var t = (nodes[i].textContent || '').trim().toLowerCase();
+            if (t === wantText) return true;
+        }}
+        return false;
+    }})({json.dumps(emp_id)});
+    """
+    wait_start = time.time()
+    deadline = wait_start + ready_timeout
+    found = False
+    while time.time() < deadline:
+        if window.evaluate_js(chip_ready_js):
+            found = True
+            break
+        time.sleep(0.4)
+    if not found:
+        logger.error(
+            "TracIT lookup: TIMED OUT after %.1fs waiting for the Employee ID "
+            "filter chip for emp_id=%r", time.time() - wait_start, emp_id,
+        )
+        raise RuntimeError(
+            f"Timed out waiting for TracIT to apply the Employee ID filter "
+            f"for '{emp_id}'. TracIT may be slow, or the ID may not exist "
+            "there - try increasing tracit_lookup.results_ready_timeout_"
+            "seconds in CONFIG."
+        )
+    logger.debug("TracIT lookup: results filtered after %.1fs", time.time() - wait_start)
+
+    extract_js = f"""
+    (function(wantHeader) {{
+        var table = document.querySelector('table');
+        if (!table) return {{error: "NO_TABLE"}};
+        var headerCells = table.querySelectorAll('thead th');
+        var colIndex = -1;
+        for (var i = 0; i < headerCells.length; i++) {{
+            var t = (headerCells[i].textContent || '').trim().toLowerCase();
+            if (t === wantHeader) {{ colIndex = i; break; }}
+        }}
+        if (colIndex === -1) return {{error: "NO_SERIAL_COLUMN"}};
+        var bodyRows = table.querySelectorAll('tbody tr');
+        if (!bodyRows.length) return {{error: "NO_ROWS"}};
+        var cells = bodyRows[0].querySelectorAll('td');
+        if (colIndex >= cells.length) return {{error: "COLUMN_OUT_OF_RANGE"}};
+        return {{serial: (cells[colIndex].textContent || '').trim(), rowCount: bodyRows.length}};
+    }})({json.dumps(serial_header.strip().lower())});
+    """
+    scan = window.evaluate_js(extract_js) or {}
+    if scan.get("error") == "NO_SERIAL_COLUMN":
+        raise RuntimeError(
+            f"TracIT's results table doesn't have a '{serial_header}' column "
+            "(or its wording has changed). Update tracit_lookup."
+            "serial_number_column_header in CONFIG."
+        )
+    if scan.get("error") in ("NO_TABLE", "NO_ROWS"):
+        raise RuntimeError(
+            f"TracIT returned no asset records for Employee ID '{emp_id}'. "
+            "Double-check the ID, or look it up on TracIT directly."
+        )
+    serial = (scan.get("serial") or "").strip()
+    if not serial:
+        raise RuntimeError(
+            f"TracIT found a record for Employee ID '{emp_id}', but its "
+            "Serial Number cell was empty."
+        )
+    logger.info(
+        "TracIT lookup: SUCCESS for emp_id=%r - serial_number=%r (rowCount=%s)",
+        emp_id, serial, scan.get("rowCount"),
+    )
+    return serial
+
+
+def _run_tracit_webview_helper():
+    import webview
+
+    logger.info("TracIT helper: subprocess started (pid=%s)", os.getpid())
+
+    config = CONFIG
+    _apply_admin_settings_overrides(config)
+    cfg = config.get("tracit_lookup", {})
+    search_url = cfg.get("search_page_url") or config.get("tracit_url_template", "")
+    profile_dir = os.path.join(os.path.expanduser("~"), ".it_asset_form_tracit_webview_profile")
+
+    if not search_url:
+        _send({
+            "cmd": "fatal_error",
+            "error": "CONFIG -> tracit_lookup.search_page_url isn't set. See README.md.",
+        })
+        return
+
+    window = webview.create_window(
+        "TracIT Lookup - log in here if prompted, then leave this window open",
+        search_url,
+        width=1200,
+        height=800,
+    )
+
+    page_ready = threading.Event()
+    window.events.loaded += lambda: page_ready.set()
+
+    def stdin_reader():
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except Exception:
+                continue
+
+            if req.get("cmd") == "shutdown":
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
+                return
+
+            request_id = req.get("request_id")
+            emp_id = (req.get("emp_id") or "").strip()
+            logger.info("TracIT helper: received lookup request_id=%r emp_id=%r", request_id, emp_id)
+
+            try:
+                window.show()
+            except Exception:
+                logger.exception("TracIT helper: window.show() failed (request_id=%r)", request_id)
+
+            if not emp_id:
+                logger.warning("TracIT helper: empty employee ID in request_id=%r", request_id)
+                _send({"request_id": request_id, "error": "Empty employee ID."})
+                continue
+
+            if not page_ready.wait(timeout=180):
+                logger.error("TracIT helper: browser window never finished loading (request_id=%r)", request_id)
+                _send({
+                    "request_id": request_id,
+                    "error": "Browser window never finished loading (login taking too long?).",
+                })
+                continue
+
+            try:
+                serial = _perform_tracit_search(window, emp_id, cfg)
+                logger.info("TracIT helper: sending serial_number back for request_id=%r", request_id)
+                _send({"request_id": request_id, "serial_number": serial})
+                try:
+                    window.hide()
+                    logger.info("TracIT helper: auto-hid lookup window after successful result (request_id=%r)", request_id)
+                except Exception:
+                    logger.exception("TracIT helper: window.hide() failed (request_id=%r)", request_id)
+            except Exception as exc:
+                logger.exception("TracIT helper: lookup failed for request_id=%r emp_id=%r", request_id, emp_id)
+                _send({"request_id": request_id, "error": str(exc)})
+
+    threading.Thread(target=stdin_reader, daemon=True).start()
+
+    webview.start(gui="edgechromium", private_mode=False, storage_path=profile_dir)
+
+
+# ============================================================================
 # BULK BATCH QUEUE - reads the Excel import file
 # ============================================================================
 
@@ -2052,6 +2554,26 @@ def _extract_rpr(inner_xml):
     return m.group(0) if m else ""
 
 
+# Some BU templates have their Emp ID / Contact Number / Last Working Date
+# underline blanks at a visibly smaller point size than the Date field's -
+# a template-authoring inconsistency that looked like a layout/alignment
+# glitch on the printed form once real data was filled in. fill_docx()
+# normalizes these three to always render at the Date field's font size.
+_FONT_SIZE_NORMALIZED_TAGS = {"EmpID", "ContactNumber", "LastWorkingDate"}
+
+
+def _rpr_with_date_font_size(rpr_xml, date_size_tags):
+    """Returns rpr_xml with its own <w:sz>/<w:szCs> (font-size) elements
+    replaced by date_size_tags. No-ops (returns rpr_xml unchanged) if
+    either side is empty - e.g. the Date field itself had no explicit
+    size (inherits the document default), or this particular field has
+    no rPr at all to inject a size into."""
+    if not rpr_xml or not date_size_tags:
+        return rpr_xml
+    stripped = re.sub(r"<w:sz(?:Cs)?\s[^/]*/>", "", rpr_xml)
+    return stripped.replace("</w:rPr>", date_size_tags + "</w:rPr>")
+
+
 def _sdt_pattern(tag):
     return re.compile(
         r'<w:sdt><w:sdtPr>.*?<w:tag w:val="' + re.escape(tag) + r'"/>.*?</w:sdtPr>'
@@ -2108,11 +2630,19 @@ def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, 
             xml = f.read()
 
         # ---- text fields ----
+        # Captured up front, from the untouched xml, so later replacements
+        # in this same loop (including Date's own) can't affect it.
+        date_match = _sdt_pattern("Date").search(xml)
+        date_rpr = _extract_rpr(date_match.group(1)) if date_match else ""
+        date_size_tags = "".join(re.findall(r"<w:sz(?:Cs)?\s[^/]*/>", date_rpr))
+
         for tag, value in field_values.items():
             m = _sdt_pattern(tag).search(xml)
             if not m:
                 continue  # this tag isn't on this particular BU form variant - fine to skip
             rpr = _extract_rpr(m.group(1))
+            if tag in _FONT_SIZE_NORMALIZED_TAGS:
+                rpr = _rpr_with_date_font_size(rpr, date_size_tags)
             safe_value = _xml_escape(value) if value else " "
             new_inner = f'<w:r>{rpr}<w:t xml:space="preserve">{safe_value}</w:t></w:r>'
             xml = _replace_sdt_content(xml, tag, new_inner)
@@ -3975,6 +4505,7 @@ class WizardApp(tk.Tk):
             self.user_settings.get("operator_name"),
         )
         self.browser_session = BrowserLookupSession()
+        self.tracit_session = TracitLookupSession()
         self.signature_service = SignatureService(self.config_data)
 
         self.title("IT Asset Submission Acknowledgement")
@@ -4945,6 +5476,11 @@ class WizardApp(tk.Tk):
         if record.get("employee_name") and not self.emp_name_var.get().strip():
             self.emp_name_var.set(record["employee_name"])
             self.manual_entry_hint.config(text="Employee name auto-filled from SSRS Report.")
+        # Auto-select the submission type BEFORE filling asset fields -
+        # selecting a type rebuilds the Asset Details widgets from scratch
+        # (fresh StringVars), which would wipe out a serial number filled
+        # a moment earlier if this ran after _apply_ssrs_record_to_asset_fields.
+        self._auto_select_new_hire_from_ssrs(record)
         self._apply_ssrs_record_to_asset_fields(record)
         # SSRS's column map has no manager field - if the manager name is
         # still blank after an SSRS match, quietly fall back to AD in the
@@ -4952,6 +5488,33 @@ class WizardApp(tk.Tk):
         # supplied, and never pops up the multi-candidate picker for a
         # silent background fill).
         self._fetch_manager_via_ad_fallback(emp_id)
+
+    def _auto_select_new_hire_from_ssrs(self, record):
+        """If SSRS's own Request Type column says this is a New Hire, and
+        the operator hasn't picked a submission type yet, auto-select
+        "New Hire" - saves a click for the most common case, without ever
+        overriding a type the operator already chose (manually or via a
+        previous match)."""
+        if not hasattr(self, "submission_type_var"):
+            return
+        if self.submission_type_var.get():
+            return  # operator already picked one - never override it
+        request_type = (record.get("request_type") or "").strip().lower()
+        if not request_type:
+            return
+        new_hire_values = [
+            v.strip().lower()
+            for v in self.config_data.get("ssrs_asset_report", {}).get("new_hire_request_type_values", ["New Hire"])
+        ]
+        if request_type in new_hire_values and "New Hire" in (
+            self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
+        ):
+            self.submission_type_var.set("New Hire")
+            self._on_submission_type_changed()
+            if hasattr(self, "submission_type_hint"):
+                self.submission_type_hint.config(
+                    text='Auto-selected "New Hire" from the SSRS Request Type column.', foreground="#1a7f37",
+                )
 
     def _fetch_manager_via_ad_fallback(self, emp_id):
         if self.manager_name_var.get().strip():
@@ -4984,20 +5547,22 @@ class WizardApp(tk.Tk):
             self.manager_name_var.set(manager)
 
     def _apply_ssrs_record_to_asset_fields(self, record):
-        """Fills the asset-detail fields (New Device Serial Number, Others)
-        from a matched SSRS row - only meaningful for New Hire-type
-        submissions, since that's the only case SSRS has issued-asset data
-        for. Safe to call even if the asset-details widgets don't exist yet
-        (e.g. no submission type picked yet) - it just no-ops via hasattr."""
+        """Fills the New Device Serial Number field from a matched SSRS
+        row - only meaningful for New Hire-type submissions, since that's
+        the only case SSRS has issued-asset data for. Safe to call even if
+        the asset-details widgets don't exist yet (e.g. no submission type
+        picked yet) - it just no-ops via hasattr.
+
+        Does NOT touch the "Others" field - it used to auto-append a long
+        Device Model/Ticket/Hostname/Dock/Keyboard&Mouse/Power Adapter
+        summary there, which wasn't needed on the printed form and made
+        that table row (and everything below it, including the signature
+        rows) taller than intended."""
         sub_type = self.submission_type_var.get() if hasattr(self, "submission_type_var") else ""
         if sub_type not in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
             return
         if record.get("serial_number") and hasattr(self, "new_serial_var"):
             self.new_serial_var.set(record["serial_number"])
-        summary = self._format_ssrs_record(record)
-        if summary and hasattr(self, "assets_other_var"):
-            existing = self.assets_other_var.get().strip()
-            self.assets_other_var.set(f"{existing}; {summary}" if existing else summary)
         if hasattr(self, "ssrs_autofill_hint"):
             self.ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
@@ -5125,10 +5690,17 @@ class WizardApp(tk.Tk):
             ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
             ttk.Entry(row1, textvariable=self.current_serial_var, width=30).pack(side="left", padx=8)
             if sub_type in self.config_data.get("tracit_submission_types", []):
+                self.tracit_fetch_button = ttk.Button(
+                    row1, text="Fetch from TracIT",
+                    command=lambda: self._fetch_serial_from_tracit(),
+                )
+                self.tracit_fetch_button.pack(side="left", padx=(4, 0))
                 ttk.Button(
                     row1, text="Open TracIT",
                     command=lambda: self._open_tracit(self.emp_id_var.get().strip(), self.current_serial_var.get().strip()),
                 ).pack(side="left", padx=(4, 0))
+                self.tracit_fetch_hint = ttk.Label(row1, text="", foreground="#888")
+                self.tracit_fetch_hint.pack(side="left", padx=(6, 0))
 
         # Enhancement 7 - SSRS-based asset auto-population, for New Hire
         # (configurable via ssrs_asset_report.new_hire_submission_types).
@@ -5305,6 +5877,107 @@ class WizardApp(tk.Tk):
         logger.info("TracIT: opening %s (employee_id=%r, serial_number=%r)", url, employee_id, serial_number)
         webbrowser.open(url)
 
+    def _fetch_serial_from_tracit(self):
+        """Drives an embedded TracIT browser session (same overall idea as
+        the AD Lookup embedded session) to pull the Current Device Serial
+        Number straight from TracIT for this Employee ID, instead of the
+        operator having to open TracIT, filter it by hand, and retype the
+        serial number here."""
+        emp_id = self.emp_id_var.get().strip()
+        if not emp_id:
+            messagebox.showwarning("Missing Employee ID", "Please enter an Employee ID first.")
+            return
+        if not self.config_data.get("tracit_lookup", {}).get("enabled", True):
+            messagebox.showwarning("TracIT lookup disabled", "TracIT lookup is disabled in CONFIG.")
+            return
+        if hasattr(self, "tracit_fetch_button"):
+            self.tracit_fetch_button.config(state="disabled")
+        if hasattr(self, "tracit_fetch_hint"):
+            self.tracit_fetch_hint.config(text="Fetching from TracIT...", foreground="#888")
+
+        def worker():
+            try:
+                serial = self.tracit_session.search(emp_id)
+                self.after(0, self._on_tracit_fetch_success, emp_id, serial)
+            except Exception as exc:
+                self.after(0, self._on_tracit_fetch_failure, emp_id, exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_tracit_fetch_success(self, emp_id, serial):
+        if hasattr(self, "tracit_fetch_button"):
+            self.tracit_fetch_button.config(state="normal")
+        if emp_id != self.emp_id_var.get().strip():
+            # Employee ID changed again while this lookup was running - this
+            # result is for the old ID, not the one on screen now.
+            return
+        self.current_serial_var.set(serial)
+        if hasattr(self, "tracit_fetch_hint"):
+            self.tracit_fetch_hint.config(text="Filled from TracIT.", foreground="#1a7f37")
+
+    def _on_tracit_fetch_failure(self, emp_id, exc):
+        if hasattr(self, "tracit_fetch_button"):
+            self.tracit_fetch_button.config(state="normal")
+        logger.exception("TracIT fetch failed for emp_id=%r", emp_id)
+        if emp_id != self.emp_id_var.get().strip():
+            return
+        if hasattr(self, "tracit_fetch_hint"):
+            self.tracit_fetch_hint.config(text="Could not fetch from TracIT - enter it manually.", foreground="#b00020")
+        messagebox.showwarning("TracIT lookup failed", str(exc))
+
+    def _batch_fetch_serial_from_tracit(self, emp_id):
+        """Bulk-tab equivalent of _fetch_serial_from_tracit."""
+        emp_id = (emp_id or "").strip()
+        if not emp_id:
+            messagebox.showwarning("Missing Employee ID", "This row has no Employee ID yet.")
+            return
+        if not self.config_data.get("tracit_lookup", {}).get("enabled", True):
+            messagebox.showwarning("TracIT lookup disabled", "TracIT lookup is disabled in CONFIG.")
+            return
+        if hasattr(self, "b_tracit_fetch_button"):
+            self.b_tracit_fetch_button.config(state="disabled")
+        if hasattr(self, "b_tracit_fetch_hint"):
+            self.b_tracit_fetch_hint.config(text="Fetching from TracIT...", foreground="#888")
+
+        def worker():
+            try:
+                serial = self.tracit_session.search(emp_id)
+                self.after(0, self._on_batch_tracit_fetch_success, emp_id, serial)
+            except Exception as exc:
+                self.after(0, self._on_batch_tracit_fetch_failure, emp_id, exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _batch_active_row_emp_id(self):
+        """The Employee ID of whichever bulk row is currently on screen, or
+        '' if none is active - used to guard a background TracIT fetch
+        against the operator having moved to a different row (or the row
+        list having changed) before it finished."""
+        if self._batch_active_index is None or self._batch_active_index >= len(self.batch_queue):
+            return ""
+        return self.batch_queue[self._batch_active_index].get("employee_id") or ""
+
+    def _on_batch_tracit_fetch_success(self, emp_id, serial):
+        if hasattr(self, "b_tracit_fetch_button"):
+            self.b_tracit_fetch_button.config(state="normal")
+        if emp_id != self._batch_active_row_emp_id():
+            # The operator moved to a different row while this lookup was
+            # running - this result belongs to the row that's no longer shown.
+            return
+        self.b_current_serial_var.set(serial)
+        if hasattr(self, "b_tracit_fetch_hint"):
+            self.b_tracit_fetch_hint.config(text="Filled from TracIT.", foreground="#1a7f37")
+
+    def _on_batch_tracit_fetch_failure(self, emp_id, exc):
+        if hasattr(self, "b_tracit_fetch_button"):
+            self.b_tracit_fetch_button.config(state="normal")
+        logger.exception("Bulk TracIT fetch failed for emp_id=%r", emp_id)
+        if emp_id != self._batch_active_row_emp_id():
+            return
+        if hasattr(self, "b_tracit_fetch_hint"):
+            self.b_tracit_fetch_hint.config(text="Could not fetch from TracIT - enter it manually.", foreground="#b00020")
+        messagebox.showwarning("TracIT lookup failed", str(exc))
+
     # ------------------------------------------------------------ generate
     def _validate_form(self):
         if not self.bu_var.get():
@@ -5326,9 +5999,8 @@ class WizardApp(tk.Tk):
                 "Please look up the employee, or enter their name manually, before continuing.",
             )
             return False
-        if not self.contact_var.get().strip():
-            messagebox.showwarning("Missing contact number", "Please enter a contact number.")
-            return False
+        # Contact Number is optional - not required to generate the PDF
+        # (it can be left blank; the template's underline just stays empty).
         if not self.submission_type_var.get():
             messagebox.showwarning("Missing selection", "Please select a submission type.")
             return False
@@ -6087,12 +6759,41 @@ class WizardApp(tk.Tk):
             text=f"SSRS: matched - {record.get('employee_name', '') or emp_id}", foreground="#1a7f37",
         )
         self.status_var.set(f"Batch: {self.b_emp_name_var.get() or emp_id} found via SSRS.")
+        # Auto-select the submission type BEFORE filling asset fields, same
+        # ordering reason as the Single Person tab: selecting a type
+        # rebuilds the Asset Details widgets, which would wipe a serial
+        # number filled a moment earlier if done the other way round.
+        self._batch_auto_select_new_hire_from_ssrs(index, record)
         self._apply_ssrs_record_to_batch_asset_fields(record)
         # Same manager-name AD fallback as the Single Person tab - SSRS has
         # no manager column, so if the imported Excel data didn't supply
         # one either, quietly fetch it from AD in the background.
         self._batch_fetch_manager_via_ad_fallback(index, emp_id)
         return True
+
+    def _batch_auto_select_new_hire_from_ssrs(self, index, record):
+        """Bulk-tab equivalent of _auto_select_new_hire_from_ssrs - only
+        acts if this row's type wasn't already recognized from the
+        imported Excel file (item.get("type_recognized")), and never
+        overrides a type the operator has since picked in the dropdown."""
+        item = self.batch_queue[index]
+        if item.get("type_recognized"):
+            return  # the imported file already said what type this is
+        if not hasattr(self, "b_submission_type_var") or self.b_submission_type_var.get():
+            return
+        request_type = (record.get("request_type") or "").strip().lower()
+        if not request_type:
+            return
+        new_hire_values = [
+            v.strip().lower()
+            for v in self.config_data.get("ssrs_asset_report", {}).get("new_hire_request_type_values", ["New Hire"])
+        ]
+        if request_type in new_hire_values and "New Hire" in (
+            self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
+        ):
+            self.b_submission_type_var.set("New Hire")
+            item["type"] = "New Hire"
+            self._batch_on_submission_type_changed()
 
     def _batch_fetch_manager_via_ad_fallback(self, index, emp_id):
         if self.b_manager_name_var.get().strip():
@@ -6124,16 +6825,14 @@ class WizardApp(tk.Tk):
         """Bulk-tab equivalent of _apply_ssrs_record_to_asset_fields - only
         meaningful for New Hire-type submissions, since that's the only
         case SSRS has issued-asset data for. Safe to call before a
-        submission type/asset-details widgets exist yet (hasattr-guarded)."""
+        submission type/asset-details widgets exist yet (hasattr-guarded).
+        Does NOT touch the "Others" field - see the single-tab version's
+        docstring for why."""
         sub_type = self.b_submission_type_var.get() if hasattr(self, "b_submission_type_var") else ""
         if sub_type not in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
             return
         if record.get("serial_number") and hasattr(self, "b_new_serial_var"):
             self.b_new_serial_var.set(record["serial_number"])
-        summary = self._format_ssrs_record(record)
-        if summary and hasattr(self, "b_assets_other_var"):
-            existing = self.b_assets_other_var.get().strip()
-            self.b_assets_other_var.set(f"{existing}; {summary}" if existing else summary)
         if hasattr(self, "b_ssrs_autofill_hint"):
             self.b_ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
@@ -6183,10 +6882,17 @@ class WizardApp(tk.Tk):
             ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
             ttk.Entry(row1, textvariable=self.b_current_serial_var, width=30).pack(side="left", padx=8)
             if sub_type in self.config_data.get("tracit_submission_types", []):
+                self.b_tracit_fetch_button = ttk.Button(
+                    row1, text="Fetch from TracIT",
+                    command=lambda: self._batch_fetch_serial_from_tracit(active_emp_id),
+                )
+                self.b_tracit_fetch_button.pack(side="left", padx=(4, 0))
                 ttk.Button(
                     row1, text="Open TracIT",
                     command=lambda: self._open_tracit(active_emp_id, self.b_current_serial_var.get().strip()),
                 ).pack(side="left", padx=(4, 0))
+                self.b_tracit_fetch_hint = ttk.Label(row1, text="", foreground="#888")
+                self.b_tracit_fetch_hint.pack(side="left", padx=(6, 0))
             if prefill_note:
                 ttk.Label(row1, text=prefill_note, foreground="#888").pack(side="left")
 
@@ -6398,9 +7104,7 @@ class WizardApp(tk.Tk):
         if not self.b_emp_name_var.get().strip():
             messagebox.showwarning("Missing Employee Name", "Enter the employee's name (AD lookup found nothing).")
             return None
-        if not self.b_contact_var.get().strip():
-            messagebox.showwarning("Missing contact number", "Enter a contact number.")
-            return None
+        # Contact Number is optional here too - see the Single Person tab.
         if not self.b_submission_type_var.get():
             messagebox.showwarning("Missing selection", "Select a submission type.")
             return None
@@ -6593,6 +7297,10 @@ class WizardApp(tk.Tk):
             self.browser_session.shutdown()
         except Exception:
             logger.debug("WizardApp: browser_session.shutdown() failed (non-fatal)", exc_info=True)
+        try:
+            self.tracit_session.shutdown()
+        except Exception:
+            logger.debug("WizardApp: tracit_session.shutdown() failed (non-fatal)", exc_info=True)
         self.destroy()
         logger.info("WizardApp: closed")
 
@@ -6633,6 +7341,10 @@ if __name__ == "__main__":
         # Relaunched as the embedded-browser AD lookup helper - see
         # BrowserLookupSession._build_command() above for how/why.
         _run_webview_helper()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--tracit-helper":
+        # Relaunched as the embedded-browser TracIT lookup helper - see
+        # TracitLookupSession._build_command() above for how/why.
+        _run_tracit_webview_helper()
     else:
         _set_windows_dpi_awareness()
         app = WizardApp()
