@@ -2049,8 +2049,29 @@ def _run_tracit_webview_helper():
         hidden=bool(keep_hidden),
     )
 
+    # `page_ready` tracks only the WINDOW'S VERY FIRST LOAD, and is never
+    # cleared again after that. It is set exactly once, by whichever fires
+    # first: the initial navigation, or (see below) a later refresh. This
+    # is deliberate: an earlier version of this helper reused page_ready
+    # for the background refresh too (clearing it before each reload and
+    # waiting for it to be set again), which meant that if a background
+    # refresh's "loaded" event never fired - a slow SSO redirect, a
+    # transient network hiccup, TracIT throwing a native "leave site?"
+    # confirm dialog on navigation-away, anything - page_ready was left
+    # PERMANENTLY cleared, and every real lookup after that point would
+    # sit for the full 180s timeout and fail with "Browser window never
+    # finished loading", even though the window was actually fine. That's
+    # the "worked the first time, then stopped working" failure mode.
+    # `reload_ready` (below) is a separate event used only to time out a
+    # refresh attempt - it never blocks a real lookup.
     page_ready = threading.Event()
-    window.events.loaded += lambda: page_ready.set()
+    reload_ready = threading.Event()
+
+    def _on_loaded():
+        page_ready.set()
+        reload_ready.set()
+
+    window.events.loaded += _on_loaded
 
     # Serializes access to the window between an in-progress lookup and the
     # background refresh loop below, so a scheduled reload can never land
@@ -2073,10 +2094,18 @@ def _run_tracit_webview_helper():
                 continue
             try:
                 logger.info("TracIT helper: refreshing the TracIT page in the background to keep it warm")
-                page_ready.clear()
+                reload_ready.clear()
                 window.load_url(search_url)
-                if not page_ready.wait(timeout=60):
-                    logger.warning("TracIT helper: background refresh did not finish loading within 60s")
+                if not reload_ready.wait(timeout=60):
+                    # Best-effort only. Deliberately do NOT touch page_ready
+                    # here - real lookups must keep working off the window's
+                    # last known-good state even if this particular refresh
+                    # never confirmed completion.
+                    logger.warning(
+                        "TracIT helper: background refresh did not confirm "
+                        "loading within 60s (non-fatal - real lookups are "
+                        "unaffected; will retry next interval)"
+                    )
                 else:
                     logger.info("TracIT helper: background refresh completed")
             except Exception:
