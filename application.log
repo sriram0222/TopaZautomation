@@ -2044,3 +2044,144 @@ Traceback (most recent call last):
     self.tk.mainloop(n)
     ~~~~~~~~~~~~~~~~^^^
 KeyboardInterrupt
+2026-09-24 15:00:28 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-24 15:00:28 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\application.log
+2026-09-24 15:00:28 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-24 15:00:28 INFO    [MainThread] it_asset_app: WizardApp: starting up. ad_lookup_mode='ssrs_report' use_topaz_pad=True bu_templates_folder='bu_templates' root_save_folder='Z:/Topaz_auto' operator_name='Sriram'
+2026-09-24 15:00:28 INFO    [MainThread] it_asset_app: WizardApp: GUI ready
+2026-09-24 15:00:28 INFO    [Thread-2 (worker)] it_asset_app: SSRS asset report: downloading (force=False) -> 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\cache\\ssrs_asset_report.xlsx'
+2026-09-24 15:00:28 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=34328): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-24 15:00:29 INFO    [MainThread] it_asset_app: Startup health check: [('Microsoft Word', True, ''), ('Signing Certificate', True, ''), ('SSRS Asset Report', False, 'Stale'), ('Save Folder', True, 'Z:/Topaz_auto'), ('BU Templates', True, '5 loaded')]
+2026-09-24 15:00:29 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-24 15:00:29 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\application.log
+2026-09-24 15:00:29 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-24 15:00:29 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=34328)
+2026-09-24 15:02:21 INFO    [MainThread] it_asset_app: WizardApp: closing (user closed the window)
+2026-09-24 15:02:22 INFO    [MainThread] it_asset_app: WizardApp: closed
+2026-09-24 15:02:28 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-24 15:02:28 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\application.log
+2026-09-24 15:02:28 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-24 15:02:28 INFO    [MainThread] it_asset_app: WizardApp: starting up. ad_lookup_mode='ssrs_report' use_topaz_pad=True bu_templates_folder='bu_templates' root_save_folder='Z:/Topaz_auto' operator_name='Sriram'
+2026-09-24 15:02:28 INFO    [MainThread] it_asset_app: WizardApp: GUI ready
+2026-09-24 15:02:28 INFO    [Thread-2 (worker)] it_asset_app: SSRS asset report: downloading (force=False) -> 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\cache\\ssrs_asset_report.xlsx'
+2026-09-24 15:02:28 INFO    [Thread-1 (start)] it_asset_app: AD helper: launched new subprocess (pid=43724): ['C:\\Program Files\\Python314\\python.exe', 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\app.py', '--webview-helper']
+2026-09-24 15:02:29 INFO    [MainThread] it_asset_app: Startup health check: [('Microsoft Word', True, ''), ('Signing Certificate', True, ''), ('SSRS Asset Report', False, 'Stale'), ('Save Folder', True, 'Z:/Topaz_auto'), ('BU Templates', True, '5 loaded')]
+2026-09-24 15:02:29 INFO    [MainThread] it_asset_app: ======================================================================
+2026-09-24 15:02:29 INFO    [MainThread] it_asset_app: App starting - log file: C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\logs\application.log
+2026-09-24 15:02:29 INFO    [MainThread] it_asset_app: Python: 3.14.7 | frozen: False
+2026-09-24 15:02:29 INFO    [MainThread] it_asset_app: AD helper: subprocess started (pid=43724)
+2026-09-24 15:02:59 ERROR   [Thread-2 (worker)] it_asset_app: SSRS asset report: download failed (will try existing cache, if any)
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connectionpool.py", line 464, in _make_request
+    self._validate_conn(conn)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connectionpool.py", line 1106, in _validate_conn
+    conn.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connection.py", line 796, in connect
+    sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+        sock=sock,
+    ...<14 lines>...
+        assert_fingerprint=self.assert_fingerprint,
+    )
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connection.py", line 975, in _ssl_wrap_socket_and_match_hostname
+    ssl_sock = ssl_wrap_socket(
+        sock=sock,
+    ...<8 lines>...
+        tls_in_tls=tls_in_tls,
+    )
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\util\ssl_.py", line 433, in ssl_wrap_socket
+    ssl_sock = _ssl_wrap_socket_impl(sock, context, tls_in_tls, server_hostname)
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\util\ssl_.py", line 477, in _ssl_wrap_socket_impl
+    return ssl_context.wrap_socket(sock, server_hostname=server_hostname)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\truststore\_api.py", line 121, in wrap_socket
+    ssl_sock = self._ctx.wrap_socket(
+        sock,
+    ...<4 lines>...
+        session=session,
+    )
+  File "C:\Program Files\Python314\Lib\ssl.py", line 455, in wrap_socket
+    return self.sslsocket_class._create(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        sock=sock,
+        ^^^^^^^^^^
+    ...<5 lines>...
+        session=session
+        ^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Program Files\Python314\Lib\ssl.py", line 1076, in _create
+    self.do_handshake()
+    ~~~~~~~~~~~~~~~~~^^
+  File "C:\Program Files\Python314\Lib\ssl.py", line 1372, in do_handshake
+    self._sslobj.do_handshake()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+ssl.SSLEOFError: [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1082)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connectionpool.py", line 788, in urlopen
+    response = self._make_request(
+        conn,
+    ...<10 lines>...
+        **response_kw,
+    )
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connectionpool.py", line 488, in _make_request
+    raise new_e
+urllib3.exceptions.SSLError: [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1082)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\requests\adapters.py", line 696, in send
+    resp = conn.urlopen(
+        method=request.method,
+    ...<9 lines>...
+        chunked=chunked,
+    )
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\connectionpool.py", line 842, in urlopen
+    retries = retries.increment(
+        method, url, error=new_e, _pool=self, _stacktrace=sys.exc_info()[2]
+    )
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\urllib3\util\retry.py", line 543, in increment
+    raise MaxRetryError(_pool, url, reason) from reason  # type: ignore[arg-type]
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='orbit-ssrs-prod-int.optum.com', port=443): Max retries exceeded with url: /ReportServer?/Optum%20ET/EUTS%20Dev%20Ops/EUTSDReporting/TransferredFromPowerBIReportServer/CheckInTool-ShippingCenterReports/DDT%20Open%20Requests%20by%20Status%20Raw%20Data&rs:Format=EXCELOPENXML (Caused by SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1082)')))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 4337, in download_ssrs_asset_report
+    resp = requests.get(url, auth=auth, timeout=timeout)
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\requests\api.py", line 87, in get
+    return request("get", url, params=params, **kwargs)
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\requests\api.py", line 71, in request
+    return session.request(method=method, url=url, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\requests\sessions.py", line 651, in request
+    resp = self.send(prep, **send_kwargs)
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\requests\sessions.py", line 784, in send
+    r = adapter.send(request, **kwargs)
+  File "C:\Users\srajaamu\AppData\Roaming\Python\Python314\site-packages\requests\adapters.py", line 727, in send
+    raise SSLError(e, request=request)
+requests.exceptions.SSLError: HTTPSConnectionPool(host='orbit-ssrs-prod-int.optum.com', port=443): Max retries exceeded with url: /ReportServer?/Optum%20ET/EUTS%20Dev%20Ops/EUTSDReporting/TransferredFromPowerBIReportServer/CheckInTool-ShippingCenterReports/DDT%20Open%20Requests%20by%20Status%20Raw%20Data&rs:Format=EXCELOPENXML (Caused by SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1082)')))
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 4974, in worker
+    download_ssrs_asset_report(url, cache_path)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\srajaamu\OneDrive - UHG\Topaz_automation\WorkFlow_Topaz\app.py", line 4350, in download_ssrs_asset_report
+    raise RuntimeError(
+    ...<7 lines>...
+    ) from exc
+RuntimeError: SSRS download failed because of a certificate trust problem, not a network/VPN problem:
+
+HTTPSConnectionPool(host='orbit-ssrs-prod-int.optum.com', port=443): Max retries exceeded with url: /ReportServer?/Optum%20ET/EUTS%20Dev%20Ops/EUTSDReporting/TransferredFromPowerBIReportServer/CheckInTool-ShippingCenterReports/DDT%20Open%20Requests%20by%20Status%20Raw%20Data&rs:Format=EXCELOPENXML (Caused by SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1082)')))
+
+This usually means your company's internal root certificate is trusted by Windows/your browser (which is why the report downloads fine in Chrome) but is not in Python's separate list of trusted certificates.
+2026-09-24 15:03:02 INFO    [MainThread] it_asset_app: SSRS asset report: status='Stale' records=1780 error="SSRS download failed because of a certificate trust problem, not a network/VPN problem:\n\nHTTPSConnectionPool(host='orbit-ssrs-prod-int.optum.com', port=443): Max retries exceeded with url: /ReportServer?/Optum%20ET/EUTS%20Dev%20Ops/EUTSDReporting/TransferredFromPowerBIReportServer/CheckInTool-ShippingCenterReports/DDT%20Open%20Requests%20by%20Status%20Raw%20Data&rs:Format=EXCELOPENXML (Caused by SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1082)')))\n\nThis usually means your company's internal root certificate is trusted by Windows/your browser (which is why the report downloads fine in Chrome) but is not in Python's separate list of trusted certificates."
+2026-09-24 15:03:45 INFO    [Thread-4 (worker)] it_asset_app: SSRS asset report: downloading (force=True) -> 'C:\\Users\\srajaamu\\OneDrive - UHG\\Topaz_automation\\WorkFlow_Topaz\\cache\\ssrs_asset_report.xlsx'
