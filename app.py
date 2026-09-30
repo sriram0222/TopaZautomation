@@ -174,7 +174,14 @@ CONFIG = {
     # Where uploaded per-BU Word doc templates are stored (both the
     # original upload and the auto-generated fillable version).
 
-    "ad_lookup_mode": "ssrs_report",
+    "ad_lookup_mode": "ldap",
+    # "ldap"    = (default) asks Active Directory DIRECTLY over LDAP, using
+    #             the signed-in Windows user's own login (no password is
+    #             stored or typed anywhere) - usually well under a second,
+    #             no hidden browser window involved. See ad_lookup_ldap
+    #             below. If LDAP can't be reached at all (off VPN, pywin32
+    #             missing, etc.) the app automatically falls back to the
+    #             mode named in ad_lookup_ldap.fallback_mode.
     # "ssrs_report" = for an SSRS/ReportViewer-style "Active Directory
     #             Search" report: an ASP.NET report page with a multi-line
     #             ID textbox and a "View Report" button (not a plain web
@@ -189,6 +196,25 @@ CONFIG = {
     #             box + submit button with stable CSS selectors/IDs).
     # "direct"  = plain HTTP request to a fixed URL pattern, no login
     #             handling (only works if your portal doesn't need SSO).
+
+    "ad_lookup_ldap": {
+        # Which AD attribute holds the Employee ID. "employeeID" is the
+        # standard one (confirmed working with a PowerShell [adsisearcher]
+        # test on the office PC); change to e.g. "employeeNumber" only if
+        # your directory stores it somewhere else.
+        "employee_id_attribute": "employeeID",
+        # Where to search. Blank = the signed-in user's own domain (read
+        # automatically from LDAP://RootDSE) - which is exactly what the
+        # PowerShell test used. Set to e.g. "GC://DC=uhc,DC=com" to search
+        # the whole forest via the Global Catalog if some employees live
+        # in a different domain.
+        "search_base": "",
+        "timeout_seconds": 10,
+        # Used ONLY when LDAP itself is unavailable (not when it simply
+        # finds no match) - keeps the old SSRS browser lookup as a safety
+        # net. Set to "" to disable the fallback.
+        "fallback_mode": "ssrs_report",
+    },
 
     "ad_lookup_ssrs": {
         # REQUIRED: the AD lookup report's URL (the "bookmark this URL"
@@ -401,13 +427,11 @@ CONFIG = {
         # Enhancement 9) - "Refresh Data" in the app always forces a fresh
         # download regardless of this cache.
         "cache_max_age_hours": 24,
-        # Submission types where SSRS is the PRIMARY lookup source (checked
-        # automatically the moment an Employee ID is entered - see
-        # _ssrs_autocheck_now/_batch_try_ssrs_autofill_identity) - AD is
-        # only used as a fallback for these, e.g. when SSRS has no manager
-        # name (SSRS's column map doesn't include one). LWD/Contractor
-        # LWD/Site Transfer are intentionally NOT in this list - for those,
-        # AD + the imported Excel data remain the (only) lookup sources.
+        # Submission types whose New Device Serial Number is filled from
+        # a matched SSRS row. (Employee Name/Manager Name always come from
+        # Active Directory/LDAP now - SSRS only decides the submission type
+        # and the new serial; see _ssrs_check_current_id /
+        # _batch_apply_ssrs_for_row.)
         "new_hire_submission_types": ["New Hire", "Break Fix", "Mixed Build", "Additional Laptop"],
         # SSRS column name -> app field. Edit the right-hand column names
         # here if the real report's headers differ slightly (e.g. a
@@ -427,16 +451,25 @@ CONFIG = {
             "power_adapter": "Peripherals Power Chords",
             "battery": "Peripherals Battery",
             # The report's own request-type column (e.g. "New Hire",
-            # "UHC MVS", "M & A") - used to auto-select the "New Hire"
-            # submission type the moment SSRS matches a New Hire row (see
-            # _ssrs_autocheck_now/_batch_try_ssrs_autofill_identity). Never
-            # overwrites a submission type the operator already picked.
+            # "UHC MVS", "M & A") - used to auto-select the submission type
+            # the moment SSRS matches a row (see request_type_to_
+            # submission_type below). Never overwrites a submission type
+            # the operator already picked.
             "request_type": "Request Type",
         },
         # The exact value(s) in the request_type column that mean "New
         # Hire" - compared case-insensitively, trimmed. Add more strings
         # here if the report ever spells it differently.
         "new_hire_request_type_values": ["New Hire"],
+        # SSRS "Request Type" value -> the app's submission type to select
+        # automatically when an Employee ID matches a row in the report
+        # (compared case-insensitively). Add a line here for any other
+        # Request Type the report uses (e.g. "UHC MVS": "Break Fix") -
+        # a matched row whose Request Type isn't listed shows "matched -
+        # pick the submission type" instead of guessing.
+        "request_type_to_submission_type": {
+            "New Hire": "New Hire",
+        },
     },
 
     "servicenow": {
@@ -721,8 +754,238 @@ def _uses_webview_lookup(config):
     process (BrowserLookupSession) rather than a plain HTTP GET. Both
     "browser" (a generic web form) and "ssrs_report" (an SSRS ReportViewer
     report) need the real embedded browser window for SSO/session reuse -
-    only "direct" mode skips it."""
+    "direct" and "ldap" modes skip it (ldap only ever starts the browser
+    helper lazily, as a fallback - see lookup_ad_candidates)."""
     return config.get("ad_lookup_mode", "browser") in ("browser", "ssrs_report")
+
+
+def _webview_helper_mode(config):
+    """Which page the embedded-browser AD helper should drive. In "ldap"
+    mode the helper only exists as a fallback, so it drives whatever
+    ad_lookup_ldap.fallback_mode names (the SSRS report by default)."""
+    mode = config.get("ad_lookup_mode", "ssrs_report")
+    if mode == "ldap":
+        mode = (config.get("ad_lookup_ldap", {}) or {}).get("fallback_mode") or "ssrs_report"
+    return mode
+
+
+# ============================================================================
+# AD LOOKUP - direct LDAP mode (ad_lookup_mode = "ldap")
+#
+# Queries Active Directory through Windows' own ADSI provider (via pywin32,
+# which this app already depends on for Word/Outlook), so the query runs as
+# the signed-in Windows user - the same way PowerShell's [adsisearcher]
+# does. No password, no service account, no browser window.
+# ============================================================================
+
+class LdapUnavailable(Exception):
+    """LDAP itself couldn't be used (pywin32 missing, not on the domain/VPN,
+    access denied, ...). Distinct from "searched fine, no such employee",
+    which just returns an empty list - only THIS triggers the fallback."""
+    pass
+
+
+LDAP_USER_ATTRIBUTES = [
+    "displayName", "givenName", "sn", "mail", "userPrincipalName",
+    "sAMAccountName", "employeeID", "employeeNumber", "employeeType", "title",
+    "department", "telephoneNumber", "mobile", "manager",
+    "userAccountControl", "distinguishedName",
+]
+LDAP_MANAGER_ATTRIBUTES = ["displayName", "mail", "sAMAccountName", "employeeID"]
+
+
+def _ldap_escape_filter_value(value):
+    """RFC 4515 escaping for a value placed inside an LDAP filter."""
+    out = []
+    for ch in str(value):
+        if ch in "\\*()\x00":
+            out.append("\\%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _ldap_first(value):
+    """ADSI returns multi-valued attributes as tuples - keep the first."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    return "" if value is None else str(value).strip()
+
+
+def _adsi_default_search_base():
+    import win32com.client
+    root = win32com.client.GetObject("LDAP://RootDSE")
+    return "LDAP://" + root.Get("defaultNamingContext")
+
+
+def _adsi_search(search_base, ldap_filter, attributes, timeout_seconds=10):
+    """Runs one subtree search through the ADsDSOObject (ADSI) OLE DB
+    provider and returns a list of {attribute: value} dicts."""
+    import win32com.client
+    conn = win32com.client.Dispatch("ADODB.Connection")
+    conn.Provider = "ADsDSOObject"
+    conn.Open("Active Directory Provider")
+    try:
+        cmd = win32com.client.Dispatch("ADODB.Command")
+        cmd.ActiveConnection = conn
+        try:
+            cmd.Properties("Timeout").Value = int(timeout_seconds)
+            cmd.Properties("Page Size").Value = 50
+        except Exception:
+            logger.debug("LDAP: could not set ADODB command properties (non-fatal)", exc_info=True)
+        cmd.CommandText = f"<{search_base}>;{ldap_filter};{','.join(attributes)};subtree"
+        result = cmd.Execute()
+        rs = result[0] if isinstance(result, tuple) else result
+        rows = []
+        while not rs.EOF:
+            row = {}
+            for attr in attributes:
+                try:
+                    row[attr] = rs.Fields(attr).Value
+                except Exception:
+                    row[attr] = None
+            rows.append(row)
+            rs.MoveNext()
+        return rows
+    finally:
+        try:
+            conn.Close()
+        except Exception:
+            pass
+
+
+def _adsi_read_object(dn, attributes):
+    """Binds directly to one directory object by its DN (e.g. the manager
+    entry an employee's `manager` attribute points to)."""
+    import win32com.client
+    obj = win32com.client.GetObject("LDAP://" + dn.replace("/", "\\/"))
+    out = {}
+    for attr in attributes:
+        try:
+            out[attr] = obj.Get(attr)
+        except Exception:
+            out[attr] = None  # attribute simply not set on this object
+    return out
+
+
+def _map_ldap_user_to_fields(user, manager):
+    """Maps raw AD attributes into the same field dict the SSRS lookup
+    produces (see _map_ssrs_row_to_fields), so every caller treats both
+    sources identically."""
+    fields = {key: "" for key in FIELD_LABEL_MAP}
+    fields["emp_name"] = _ldap_first(user.get("displayName")) or " ".join(
+        p for p in (_ldap_first(user.get("givenName")), _ldap_first(user.get("sn"))) if p
+    )
+    fields["manager_name"] = _ldap_first((manager or {}).get("displayName"))
+    fields["contact_number"] = _ldap_first(user.get("telephoneNumber")) or _ldap_first(user.get("mobile"))
+    fields["department"] = _ldap_first(user.get("department"))
+    fields["email"] = _ldap_first(user.get("mail")) or _ldap_first(user.get("userPrincipalName"))
+    fields["designation"] = _ldap_first(user.get("employeeType")) or _ldap_first(user.get("title"))
+    fields["msid"] = _ldap_first(user.get("sAMAccountName"))
+    fields["employee_id_confirmed"] = _ldap_first(user.get("employeeID")) or _ldap_first(user.get("employeeNumber"))
+    fields["manager_email"] = _ldap_first((manager or {}).get("mail"))
+    fields["manager_msid"] = _ldap_first((manager or {}).get("sAMAccountName"))
+    fields["manager_employee_id"] = _ldap_first((manager or {}).get("employeeID"))
+    uac = _ldap_first(user.get("userAccountControl"))
+    try:
+        fields["account_enabled"] = "FALSE" if int(uac) & 0x2 else "TRUE"
+    except (TypeError, ValueError):
+        fields["account_enabled"] = ""
+    return fields
+
+
+def ldap_lookup_employee(emp_id, config):
+    """Looks an employee up in Active Directory by Employee ID. Returns a
+    list of candidate field dicts (usually 1; [] = no match). Raises
+    LdapUnavailable if LDAP itself can't be used."""
+    ldap_cfg = (config or {}).get("ad_lookup_ldap", {}) or {}
+    id_attr = (ldap_cfg.get("employee_id_attribute") or "employeeID").strip()
+    timeout = ldap_cfg.get("timeout_seconds", 10)
+    emp_id = (emp_id or "").strip()
+    if not emp_id:
+        return []
+
+    try:
+        import pythoncom
+        import win32com.client  # noqa: F401 - just checking it's installed
+    except ImportError as exc:
+        raise LdapUnavailable("pywin32 isn't installed (pip install pywin32).") from exc
+
+    start = time.time()
+    # Each worker thread needs COM initialized before touching ADSI.
+    pythoncom.CoInitialize()
+    try:
+        try:
+            base = (ldap_cfg.get("search_base") or "").strip() or _adsi_default_search_base()
+            # Try the ID exactly as typed first, then without leading zeros
+            # (e.g. '002225112' vs '2225112') in case AD stores it that way.
+            variants = [emp_id]
+            stripped = emp_id.lstrip("0")
+            if stripped and stripped != emp_id:
+                variants.append(stripped)
+            users = []
+            for variant in variants:
+                ldap_filter = (
+                    "(&(objectCategory=person)(objectClass=user)"
+                    f"({id_attr}={_ldap_escape_filter_value(variant)}))"
+                )
+                users = _adsi_search(base, ldap_filter, LDAP_USER_ATTRIBUTES, timeout)
+                if users:
+                    break
+        except LdapUnavailable:
+            raise
+        except Exception as exc:
+            logger.exception("LDAP lookup: directory search failed for emp_id=%r", emp_id)
+            raise LdapUnavailable(f"Could not query Active Directory ({exc}).") from exc
+
+        candidates = []
+        for user in users:
+            manager = None
+            manager_dn = _ldap_first(user.get("manager"))
+            if manager_dn:
+                try:
+                    manager = _adsi_read_object(manager_dn, LDAP_MANAGER_ATTRIBUTES)
+                except Exception:
+                    # Non-fatal: the employee's own details are still good.
+                    logger.warning("LDAP lookup: could not read manager entry %r for emp_id=%r",
+                                   manager_dn, emp_id, exc_info=True)
+            candidates.append(_map_ldap_user_to_fields(user, manager))
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    logger.info(
+        "LDAP lookup: emp_id=%r -> %d candidate(s) in %.2fs (emp_name=%r manager_name=%r)",
+        emp_id, len(candidates), time.time() - start,
+        candidates[0].get("emp_name") if candidates else None,
+        candidates[0].get("manager_name") if candidates else None,
+    )
+    return candidates
+
+
+def lookup_ad_candidates(emp_id, config, browser_session):
+    """The ONE entry point every AD lookup in the app goes through (single
+    tab, bulk tab, and the background manager-name fallbacks), whatever
+    ad_lookup_mode is set to. Returns a list of candidate field dicts or
+    raises RuntimeError with a readable message."""
+    mode = config.get("ad_lookup_mode", "ssrs_report")
+    if mode == "ldap":
+        try:
+            return ldap_lookup_employee(emp_id, config)
+        except LdapUnavailable as exc:
+            fallback = (config.get("ad_lookup_ldap", {}) or {}).get("fallback_mode") or ""
+            if fallback in ("browser", "ssrs_report"):
+                logger.warning("LDAP unavailable (%s) - falling back to %s lookup for emp_id=%r",
+                               exc, fallback, emp_id)
+                return browser_session.search(emp_id)
+            if fallback == "direct":
+                return [fetch_employee_details(emp_id, config)]
+            raise RuntimeError(str(exc)) from exc
+    if _uses_webview_lookup(config):
+        return browser_session.search(emp_id)
+    return [fetch_employee_details(emp_id, config)]
 
 
 # ============================================================================
@@ -1508,7 +1771,9 @@ def _run_webview_helper():
     # independently, or it would silently keep using the CONFIG default.
     config = CONFIG
     _apply_admin_settings_overrides(config)
-    mode = config.get("ad_lookup_mode", "ssrs_report")
+    # In "ldap" mode this helper only runs as a fallback, so drive the
+    # fallback page (the SSRS report by default), never "ldap" itself.
+    mode = _webview_helper_mode(config)
     profile_dir = os.path.join(os.path.expanduser("~"), ".it_asset_form_webview_profile")
 
     if mode == "ssrs_report":
@@ -4511,6 +4776,32 @@ def parse_ssrs_asset_workbook(xlsx_path, column_map):
         wb.close()
 
 
+def _ssrs_find_record(ssrs_state, emp_id):
+    """Looks an Employee ID up in the loaded SSRS asset report index, by
+    its literal text or a digits-only variant (see parse_ssrs_asset_workbook)."""
+    index = (ssrs_state or {}).get("index", {}) or {}
+    emp_id = (emp_id or "").strip()
+    return index.get(emp_id) or index.get("".join(c for c in emp_id if c.isdigit()))
+
+
+def _ssrs_submission_type_for(config, record):
+    """The app submission type a matched SSRS row should auto-select,
+    from its Request Type column (ssrs_asset_report.
+    request_type_to_submission_type, plus the older new_hire_request_type_
+    values list). Returns None if the Request Type isn't mapped, or maps
+    to something that isn't a real submission type."""
+    ssrs_cfg = (config or {}).get("ssrs_asset_report", {}) or {}
+    request_type = ((record or {}).get("request_type") or "").strip().lower()
+    if not request_type:
+        return None
+    mapping = {str(k).strip().lower(): v for k, v in (ssrs_cfg.get("request_type_to_submission_type") or {}).items()}
+    for v in ssrs_cfg.get("new_hire_request_type_values", ["New Hire"]):
+        mapping.setdefault(str(v).strip().lower(), "New Hire")
+    sub_type = mapping.get(request_type)
+    valid = (config.get("submission_type_row1", []) or []) + (config.get("submission_type_row2", []) or [])
+    return sub_type if sub_type in valid else None
+
+
 # ============================================================================
 # SERVICENOW LIVE NEW HIRE LOOKUP
 #
@@ -5052,6 +5343,12 @@ class WizardApp(tk.Tk):
                 self._refresh_ssrs_status_labels()
                 if hasattr(self, "ssrs_refresh_button"):
                     self.ssrs_refresh_button.config(state="normal")
+                # An Employee ID may have been typed while the report was
+                # still downloading (e.g. right after startup) - re-check it
+                # against the freshly loaded report now, instead of leaving
+                # a stale "SSRS report not loaded yet" on screen.
+                if hasattr(self, "emp_id_var") and self.emp_id_var.get().strip():
+                    self._ssrs_check_current_id()
                 logger.info(
                     "SSRS asset report: status=%r records=%d error=%r",
                     status, records, error_detail,
@@ -5533,8 +5830,11 @@ class WizardApp(tk.Tk):
         ttk.Label(header, text="Employee ID", font=("Segoe UI", 11, "bold")).pack(side="left")
         self._add_info_tooltip(
             header,
-            "Scan or type the Employee ID, then press Enter to look it up automatically - SSRS is "
-            "checked first (instant, no click needed); if it has no match, AD Lookup runs instead.",
+            "Scan or type the Employee ID - Employee Name and Manager Name are filled in "
+            "automatically from Active Directory (LDAP), no click needed. The SSRS asset report "
+            "is checked at the same time: if the person is in it, the submission type (and New "
+            "Device Serial Number) are picked automatically; if not, you'll see 'Not in SSRS "
+            "report' and can fill those in by hand.",
         )
 
         row = ttk.Frame(parent)
@@ -5607,12 +5907,9 @@ class WizardApp(tk.Tk):
         # The Employee ID itself just changed - clear whatever name/manager
         # is currently on screen right away (not after the 600ms debounce),
         # so a previous employee's details never linger while a new ID is
-        # typed or a wrong one is entered. Bug fix: previously these fields
-        # were only ever *filled*, never cleared, so typing a new/wrong
-        # Employee ID kept showing the last match until something else
-        # (like "Start Next Employee") happened to reset the whole form.
+        # typed or a wrong one is entered.
         self._clear_identity_fields_for_new_id()
-        self._ssrs_check_after_id = self.after(600, self._ssrs_autocheck_now)
+        self._ssrs_check_after_id = self.after(600, self._on_employee_id_entered)
 
     def _clear_identity_fields_for_new_id(self):
         """Wipes the Employee Name / Manager Name fields and the SSRS
@@ -5623,6 +5920,7 @@ class WizardApp(tk.Tk):
         self._ssrs_matched_record = None
         self._ssrs_match_status = ""
         self._identity_lookup_source = "Manual"
+        self._ad_lookup_emp_id = None  # allows a fresh automatic lookup for the new ID
         self.emp_name_var.set("")
         self.manager_name_var.set("")
         if hasattr(self, "ssrs_check_label"):
@@ -5630,85 +5928,100 @@ class WizardApp(tk.Tk):
         if hasattr(self, "manual_entry_hint"):
             self.manual_entry_hint.config(text="")
 
-    def _ssrs_autocheck_now(self):
+    def _on_employee_id_entered(self):
+        """Runs once the operator stops typing/scanning an Employee ID:
+          1. the SSRS asset report (already downloaded, instant) decides
+             the submission type + New Device Serial Number - or says
+             "Not in SSRS report" so they're entered by hand, and
+          2. Active Directory (LDAP) fills Employee Name + Manager Name,
+             automatically - no Enter/button press needed."""
         self._ssrs_check_after_id = None
+        emp_id = self.emp_id_var.get().strip()
+        if not emp_id or not emp_id.isdigit():
+            if hasattr(self, "ssrs_check_label"):
+                self.ssrs_check_label.config(text="")
+            return
+        self._ssrs_check_current_id()
+        self._do_lookup(auto=True)
+
+    # Kept under the old name - other code (and older call sites) still
+    # refer to the SSRS auto-check by this name.
+    def _ssrs_autocheck_now(self):
+        self._on_employee_id_entered()
+
+    def _ssrs_check_current_id(self):
+        """SSRS asset report check for the Employee ID on screen. Never
+        touches Employee Name/Manager Name (those come from LDAP) -
+        only the submission type, the New Device Serial Number, and the
+        match message next to the Employee ID box."""
         self._ssrs_matched_record = None
         emp_id = self.emp_id_var.get().strip()
-        if not hasattr(self, "ssrs_check_label"):
+        if not hasattr(self, "ssrs_check_label") or not emp_id.isdigit():
             return
-        if not emp_id or not emp_id.isdigit():
-            self.ssrs_check_label.config(text="")
-            self._ssrs_match_status = ""
-            return
-        index = self.ssrs_state.get("index", {})
-        record = index.get(emp_id) or index.get("".join(c for c in emp_id if c.isdigit()))
+        record = _ssrs_find_record(self.ssrs_state, emp_id)
         if not record:
-            self._ssrs_match_status = "Not Found" if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE else ""
-            if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE:
-                self.ssrs_check_label.config(text="SSRS: no match - use Lookup (AD)", foreground="#a05a00")
+            if self.ssrs_state.get("status") in (SSRS_STATUS_AVAILABLE, SSRS_STATUS_STALE):
+                self._ssrs_match_status = "Not Found"
+                self.ssrs_check_label.config(
+                    text="Not in SSRS report - select the submission type and enter asset details manually",
+                    foreground="#a05a00",
+                )
             else:
-                self.ssrs_check_label.config(text="")
+                self._ssrs_match_status = ""
+                self.ssrs_check_label.config(
+                    text="SSRS report not loaded yet - select the submission type manually",
+                    foreground="#888",
+                )
             return
         self._ssrs_match_status = "Matched"
         self._ssrs_matched_record = record
-        self._identity_lookup_source = "SSRS"
-        self.ssrs_check_label.config(
-            text=f"SSRS: matched - {record.get('employee_name', '') or emp_id}", foreground="#1a7f37",
-        )
-        if record.get("employee_name") and not self.emp_name_var.get().strip():
-            self.emp_name_var.set(record["employee_name"])
-            self.manual_entry_hint.config(text="Employee name auto-filled from SSRS Report.")
-        # Auto-select the submission type BEFORE filling asset fields -
-        # selecting a type rebuilds the Asset Details widgets from scratch
-        # (fresh StringVars), which would wipe out a serial number filled
-        # a moment earlier if this ran after _apply_ssrs_record_to_asset_fields.
-        self._auto_select_new_hire_from_ssrs(record)
+        # Select the submission type BEFORE filling asset fields - selecting
+        # a type rebuilds the Asset Details widgets from scratch (fresh
+        # StringVars), which would wipe a serial number filled a moment
+        # earlier if this ran after _apply_ssrs_record_to_asset_fields.
+        picked = self._auto_select_submission_type_from_ssrs(record)
         self._apply_ssrs_record_to_asset_fields(record)
-        # SSRS's column map has no manager field - if the manager name is
-        # still blank after an SSRS match, quietly fall back to AD in the
-        # background just for that (never overwrites a name SSRS already
-        # supplied, and never pops up the multi-candidate picker for a
-        # silent background fill).
-        self._fetch_manager_via_ad_fallback(emp_id)
+        request_type = (record.get("request_type") or "").strip()
+        if picked:
+            text = f"In SSRS report - submission type set to \"{picked}\""
+        elif self.submission_type_var.get():
+            text = "In SSRS report"
+        else:
+            text = (f"In SSRS report (Request Type \"{request_type or 'blank'}\") - "
+                    "select the submission type")
+        self.ssrs_check_label.config(text=text, foreground="#1a7f37")
 
+    def _auto_select_submission_type_from_ssrs(self, record):
+        """Selects the submission type the SSRS row's Request Type maps to
+        (ssrs_asset_report.request_type_to_submission_type). Never
+        overrides a type the operator already picked. Returns the type it
+        selected, or None."""
+        if not hasattr(self, "submission_type_var") or self.submission_type_var.get():
+            return None
+        sub_type = _ssrs_submission_type_for(self.config_data, record)
+        if not sub_type:
+            return None
+        self.submission_type_var.set(sub_type)
+        self._on_submission_type_changed()
+        if hasattr(self, "submission_type_hint"):
+            self.submission_type_hint.config(
+                text=f'Auto-selected "{sub_type}" from the SSRS report.', foreground="#1a7f37",
+            )
+        return sub_type
+
+    # Backwards-compatible alias (older name, New Hire only).
     def _auto_select_new_hire_from_ssrs(self, record):
-        """If SSRS's own Request Type column says this is a New Hire, and
-        the operator hasn't picked a submission type yet, auto-select
-        "New Hire" - saves a click for the most common case, without ever
-        overriding a type the operator already chose (manually or via a
-        previous match)."""
-        if not hasattr(self, "submission_type_var"):
-            return
-        if self.submission_type_var.get():
-            return  # operator already picked one - never override it
-        request_type = (record.get("request_type") or "").strip().lower()
-        if not request_type:
-            return
-        new_hire_values = [
-            v.strip().lower()
-            for v in self.config_data.get("ssrs_asset_report", {}).get("new_hire_request_type_values", ["New Hire"])
-        ]
-        if request_type in new_hire_values and "New Hire" in (
-            self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
-        ):
-            self.submission_type_var.set("New Hire")
-            self._on_submission_type_changed()
-            if hasattr(self, "submission_type_hint"):
-                self.submission_type_hint.config(
-                    text='Auto-selected "New Hire" from the SSRS Request Type column.', foreground="#1a7f37",
-                )
+        return self._auto_select_submission_type_from_ssrs(record)
 
     def _fetch_manager_via_ad_fallback(self, emp_id):
+        """Fills ONLY the Manager Name from AD, in the background, if it's
+        still blank - never touches the Employee Name."""
         if self.manager_name_var.get().strip():
             return
-        uses_webview = _uses_webview_lookup(self.config_data)
 
         def worker():
             try:
-                if uses_webview:
-                    candidates = self.browser_session.search(emp_id)
-                else:
-                    candidates = [fetch_employee_details(emp_id, self.config_data)]
+                candidates = lookup_ad_candidates(emp_id, self.config_data, self.browser_session)
                 self.after(0, self._on_manager_fallback_result, emp_id, candidates)
             except Exception:
                 logger.debug("Manager AD fallback: lookup failed for %r (non-fatal)", emp_id, exc_info=True)
@@ -5748,26 +6061,49 @@ class WizardApp(tk.Tk):
         if hasattr(self, "ssrs_autofill_hint"):
             self.ssrs_autofill_hint.config(text="Filled from SSRS.", foreground="#1a7f37")
 
-    def _do_lookup(self):
+    def _do_lookup(self, auto=False):
+        """Looks the Employee ID up in Active Directory (LDAP by default -
+        see lookup_ad_candidates). Runs automatically once an ID is typed
+        (auto=True), and again on Enter / the Lookup (AD) button."""
         emp_id = self.emp_id_var.get().strip()
         if not emp_id:
-            messagebox.showwarning("Missing Employee ID", "Please enter an Employee ID first.")
+            if not auto:
+                messagebox.showwarning("Missing Employee ID", "Please enter an Employee ID first.")
             return
-        uses_webview = _uses_webview_lookup(self.config_data)
-        self.status_var.set(f"Searching for {emp_id}...")
+        if auto and getattr(self, "_ad_lookup_emp_id", None) == emp_id:
+            # Already looked up (or in flight) for this exact ID - e.g. a
+            # barcode scanner types the digits AND presses Enter, which
+            # would otherwise fire two identical lookups back to back.
+            return
+        self._ad_lookup_emp_id = emp_id
+        self.status_var.set(f"Looking up {emp_id} in Active Directory...")
+        self.manual_entry_hint.config(text="Looking up in Active Directory...", foreground="#888")
         self.lookup_button.config(state="disabled")
 
         def worker():
             try:
-                if uses_webview:
-                    candidates = self.browser_session.search(emp_id)
-                else:
-                    candidates = [fetch_employee_details(emp_id, self.config_data)]
+                candidates = lookup_ad_candidates(emp_id, self.config_data, self.browser_session)
                 self.after(0, self._on_lookup_success, emp_id, candidates)
             except Exception as exc:
-                self.after(0, self._on_lookup_failure, exc)
+                self.after(0, self._on_lookup_failure, emp_id, exc)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _fill_name_from_ssrs_if_ad_missed(self):
+        """Last resort only: if AD had no usable result but the SSRS report
+        did match this person, use SSRS's name rather than leave it blank.
+        Returns True if it filled something."""
+        record = self._ssrs_matched_record
+        if record and record.get("employee_name") and not self.emp_name_var.get().strip():
+            self.emp_name_var.set(record["employee_name"])
+            self._identity_lookup_source = "SSRS"
+            self.manual_entry_hint.config(
+                text="Not found in Active Directory - name taken from the SSRS report. "
+                     "Please enter the Manager Name manually.",
+                foreground="#a05a00",
+            )
+            return True
+        return False
 
     def _on_lookup_success(self, emp_id, candidates):
         self.lookup_button.config(state="normal")
@@ -5776,8 +6112,14 @@ class WizardApp(tk.Tk):
             # these results are for the old ID, not the one on screen now.
             return
         if not candidates:
+            if self._fill_name_from_ssrs_if_ad_missed():
+                self.status_var.set(f"{emp_id} not found in Active Directory - used SSRS name.")
+                return
             self.status_var.set(f"No results for {emp_id} - enter details manually.")
-            self.manual_entry_hint.config(text="No match found. Please enter the employee's name and manager manually below.")
+            self.manual_entry_hint.config(
+                text="No match found in Active Directory. Please enter the employee's name and manager manually below.",
+                foreground="#a05a00",
+            )
             return
         if len(candidates) == 1:
             chosen = candidates[0]
@@ -5785,24 +6127,36 @@ class WizardApp(tk.Tk):
             chosen = self._prompt_candidate_selection(candidates)
             if chosen is None:
                 self.status_var.set("Selection cancelled.")
+                self.manual_entry_hint.config(text="")
                 return
         self.emp_name_var.set(chosen.get("emp_name", ""))
         self.manager_name_var.set(chosen.get("manager_name", ""))
         self._identity_lookup_source = "AD"
-        self.manual_entry_hint.config(text="" if chosen.get("emp_name") else "Found a result, but no name field - enter manually.")
+        if not chosen.get("emp_name"):
+            self.manual_entry_hint.config(text="Found a result, but no name field - enter manually.", foreground="#a05a00")
+        elif not chosen.get("manager_name"):
+            self.manual_entry_hint.config(text="No manager recorded in Active Directory - enter it manually.", foreground="#a05a00")
+        else:
+            self.manual_entry_hint.config(text="Filled from Active Directory.", foreground="#1a7f37")
         self.status_var.set(f"Employee {emp_id} found.")
 
-    def _on_lookup_failure(self, exc):
+    def _on_lookup_failure(self, emp_id, exc):
         # Friendly on-screen message - the real exception (connection
         # errors, missing config, etc.) goes to application.log only, not
         # in front of the operator.
         logger.error(
-            "AD lookup failed for the active Employee ID (showing friendly message to operator): %s", exc,
+            "AD lookup failed for emp_id=%r (showing friendly message to operator): %s", emp_id, exc,
             exc_info=(type(exc), exc, exc.__traceback__),
         )
         self.lookup_button.config(state="normal")
+        if emp_id != self.emp_id_var.get().strip():
+            return
+        self._ad_lookup_emp_id = None  # let Enter / the button retry it
+        if self._fill_name_from_ssrs_if_ad_missed():
+            self.status_var.set("Active Directory unavailable - used SSRS name.")
+            return
         self.status_var.set("Lookup unavailable - enter details manually.")
-        self.manual_entry_hint.config(text="⚠ Employee lookup unavailable. Please enter details manually.")
+        self.manual_entry_hint.config(text="⚠ Employee lookup unavailable. Please enter details manually.", foreground="#a05a00")
 
     # ----------------------------------------------------- 3: phone
     def _build_contact_section(self, parent):
@@ -6904,90 +7258,92 @@ class WizardApp(tk.Tk):
 
         self._batch_refresh_tree()
 
+        # Same rules as the Single Person tab:
+        #  - SSRS asset report (instant, already downloaded) decides the
+        #    submission type + New Device Serial Number, or shows "Not in
+        #    SSRS report" so they're entered by hand;
+        #  - Employee Name / Manager Name come from Active Directory (LDAP),
+        #    unless the imported Excel row already supplied the name.
+        self._batch_apply_ssrs_for_row(index)
         if not item.get("employee_name"):
-            # SSRS check first (Enhancement 7 relocation, no network call -
-            # checked against the already-downloaded/cached report): only
-            # fall through to the slower AD Lookup if SSRS has no match.
-            if self._batch_try_ssrs_autofill_identity(index):
-                self._batch_check_identity_resolved()
-            else:
-                self._batch_run_lookup_for_active()
+            self._batch_run_lookup_for_active()
         else:
+            if not self.b_manager_name_var.get().strip():
+                self._batch_fetch_manager_via_ad_fallback(index, item.get("employee_id") or "")
             self._batch_check_identity_resolved()
 
-    def _batch_try_ssrs_autofill_identity(self, index):
-        """Returns True (and fills the name/asset fields immediately) if the
-        SSRS asset report cache has a row for this employee_id; False if
-        not, so the caller falls back to AD Lookup exactly as before."""
+    def _batch_apply_ssrs_for_row(self, index):
+        """Bulk-tab SSRS asset report check: never touches the name/manager
+        (those come from LDAP or the Excel file) - only the submission type,
+        the New Device Serial Number and the match message. Returns True on
+        a match."""
         item = self.batch_queue[index]
         emp_id = (item.get("employee_id") or "").strip()
-        ssrs_idx = self.ssrs_state.get("index", {})
-        record = ssrs_idx.get(emp_id) or ssrs_idx.get("".join(c for c in emp_id if c.isdigit()))
         if not hasattr(self, "b_ssrs_check_label"):
             return False
+        record = _ssrs_find_record(self.ssrs_state, emp_id)
         if not record:
-            self._b_ssrs_match_status = "Not Found" if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE else ""
-            if self.ssrs_state.get("status") == SSRS_STATUS_AVAILABLE:
-                self.b_ssrs_check_label.config(text="SSRS: no match - checking AD...", foreground="#888")
+            if self.ssrs_state.get("status") in (SSRS_STATUS_AVAILABLE, SSRS_STATUS_STALE):
+                self._b_ssrs_match_status = "Not Found"
+                self.b_ssrs_check_label.config(
+                    text="Not in SSRS report - select the submission type and enter asset details manually",
+                    foreground="#a05a00",
+                )
             else:
-                self.b_ssrs_check_label.config(text="")
+                self._b_ssrs_match_status = ""
+                self.b_ssrs_check_label.config(text="SSRS report not loaded yet", foreground="#888")
             return False
         self._b_ssrs_match_status = "Matched"
         item["_ssrs_record"] = record
-        item["_lookup_source"] = "SSRS"
-        if record.get("employee_name"):
-            self.b_emp_name_var.set(record["employee_name"])
-        self.b_ssrs_check_label.config(
-            text=f"SSRS: matched - {record.get('employee_name', '') or emp_id}", foreground="#1a7f37",
-        )
-        self.status_var.set(f"Batch: {self.b_emp_name_var.get() or emp_id} found via SSRS.")
-        # Auto-select the submission type BEFORE filling asset fields, same
-        # ordering reason as the Single Person tab: selecting a type
-        # rebuilds the Asset Details widgets, which would wipe a serial
-        # number filled a moment earlier if done the other way round.
-        self._batch_auto_select_new_hire_from_ssrs(index, record)
+        # Select the submission type BEFORE filling asset fields (selecting a
+        # type rebuilds the Asset Details widgets, which would wipe a serial
+        # number filled a moment earlier).
+        picked = self._batch_auto_select_submission_type_from_ssrs(index, record)
         self._apply_ssrs_record_to_batch_asset_fields(record)
-        # Same manager-name AD fallback as the Single Person tab - SSRS has
-        # no manager column, so if the imported Excel data didn't supply
-        # one either, quietly fetch it from AD in the background.
-        self._batch_fetch_manager_via_ad_fallback(index, emp_id)
+        if picked:
+            text = f"In SSRS report - submission type set to \"{picked}\""
+        elif self.b_submission_type_var.get():
+            text = "In SSRS report"
+        else:
+            request_type = (record.get("request_type") or "").strip() or "blank"
+            text = f"In SSRS report (Request Type \"{request_type}\") - select the submission type"
+        self.b_ssrs_check_label.config(text=text, foreground="#1a7f37")
         return True
 
-    def _batch_auto_select_new_hire_from_ssrs(self, index, record):
-        """Bulk-tab equivalent of _auto_select_new_hire_from_ssrs - only
-        acts if this row's type wasn't already recognized from the
-        imported Excel file (item.get("type_recognized")), and never
-        overrides a type the operator has since picked in the dropdown."""
+    # Backwards-compatible name used by older code/tests.
+    def _batch_try_ssrs_autofill_identity(self, index):
+        return self._batch_apply_ssrs_for_row(index)
+
+    def _batch_auto_select_submission_type_from_ssrs(self, index, record):
+        """Bulk-tab equivalent of _auto_select_submission_type_from_ssrs -
+        only acts if this row's type wasn't already recognized from the
+        imported Excel file (the file wins), and never overrides a type the
+        operator has since picked. Returns the type selected, or None."""
         item = self.batch_queue[index]
         if item.get("type_recognized"):
-            return  # the imported file already said what type this is
+            return None
         if not hasattr(self, "b_submission_type_var") or self.b_submission_type_var.get():
-            return
-        request_type = (record.get("request_type") or "").strip().lower()
-        if not request_type:
-            return
-        new_hire_values = [
-            v.strip().lower()
-            for v in self.config_data.get("ssrs_asset_report", {}).get("new_hire_request_type_values", ["New Hire"])
-        ]
-        if request_type in new_hire_values and "New Hire" in (
-            self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
-        ):
-            self.b_submission_type_var.set("New Hire")
-            item["type"] = "New Hire"
-            self._batch_on_submission_type_changed()
+            return None
+        sub_type = _ssrs_submission_type_for(self.config_data, record)
+        if not sub_type:
+            return None
+        self.b_submission_type_var.set(sub_type)
+        item["type"] = sub_type
+        item["type_recognized"] = True
+        self.b_type_hint.config(text=f'Auto-selected "{sub_type}" from the SSRS report.', foreground="#1a7f37")
+        self._batch_on_submission_type_changed()
+        return sub_type
+
+    def _batch_auto_select_new_hire_from_ssrs(self, index, record):
+        return self._batch_auto_select_submission_type_from_ssrs(index, record)
 
     def _batch_fetch_manager_via_ad_fallback(self, index, emp_id):
-        if self.b_manager_name_var.get().strip():
+        if not emp_id or self.b_manager_name_var.get().strip():
             return
-        uses_webview = _uses_webview_lookup(self.config_data)
 
         def worker():
             try:
-                if uses_webview:
-                    candidates = self.browser_session.search(emp_id)
-                else:
-                    candidates = [fetch_employee_details(emp_id, self.config_data)]
+                candidates = lookup_ad_candidates(emp_id, self.config_data, self.browser_session)
                 self.after(0, self._batch_on_manager_fallback_result, index, candidates)
             except Exception:
                 logger.debug("Batch manager AD fallback: lookup failed for %r (non-fatal)", emp_id, exc_info=True)
@@ -7160,14 +7516,10 @@ class WizardApp(tk.Tk):
         item = self.batch_queue[index]
         self.status_var.set(f"Looking up {item['employee_id']}...")
         self.b_identity_hint.config(text="Looking up via AD...")
-        uses_webview = _uses_webview_lookup(self.config_data)
 
         def worker():
             try:
-                if uses_webview:
-                    candidates = self.browser_session.search(item["employee_id"])
-                else:
-                    candidates = [fetch_employee_details(item["employee_id"], self.config_data)]
+                candidates = lookup_ad_candidates(item["employee_id"], self.config_data, self.browser_session)
                 self.after(0, self._batch_on_lookup_success, index, candidates)
             except Exception as exc:
                 self.after(0, self._batch_on_lookup_failure, index, exc)
@@ -7178,6 +7530,8 @@ class WizardApp(tk.Tk):
         if index != self._batch_active_index:
             return  # operator already moved to a different person
         if not candidates:
+            if self._batch_fill_name_from_ssrs_if_ad_missed(index):
+                return
             self._batch_mark_needs_attention("No AD match found - enter details manually.")
             return
         if len(candidates) == 1:
@@ -7190,7 +7544,9 @@ class WizardApp(tk.Tk):
         self.b_emp_name_var.set(chosen.get("emp_name", ""))
         self.b_manager_name_var.set(chosen.get("manager_name", ""))
         self.batch_queue[index]["_lookup_source"] = "AD"
-        self.b_identity_hint.config(text="")
+        self.b_identity_hint.config(
+            text="" if chosen.get("manager_name") else "No manager recorded in Active Directory - enter it manually."
+        )
         self.status_var.set(f"Batch: {self.b_emp_name_var.get()} found.")
         self._batch_check_identity_resolved()
 
@@ -7201,7 +7557,27 @@ class WizardApp(tk.Tk):
         )
         if index != self._batch_active_index:
             return
+        if self._batch_fill_name_from_ssrs_if_ad_missed(index):
+            return
         self._batch_mark_needs_attention("⚠ Employee lookup unavailable. Please enter details manually.")
+
+    def _batch_fill_name_from_ssrs_if_ad_missed(self, index):
+        """Last resort only (same as the Single Person tab): AD had nothing
+        usable but the SSRS report matched this row - use its name rather
+        than leave it blank. Returns True if it filled the name."""
+        item = self.batch_queue[index]
+        record = item.get("_ssrs_record")
+        if not record or not record.get("employee_name") or self.b_emp_name_var.get().strip():
+            return False
+        self.b_emp_name_var.set(record["employee_name"])
+        item["_lookup_source"] = "SSRS"
+        self.b_identity_hint.config(
+            text="Not found in Active Directory - name taken from the SSRS report. "
+                 "Please enter the Manager Name manually."
+        )
+        self.status_var.set(f"Batch: {record['employee_name']} - name from SSRS (not in AD).")
+        self._batch_check_identity_resolved()
+        return True
 
     def _batch_mark_needs_attention(self, message):
         index = self._batch_active_index
