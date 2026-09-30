@@ -432,7 +432,7 @@ CONFIG = {
         # Active Directory/LDAP now - SSRS only decides the submission type
         # and the new serial; see _ssrs_check_current_id /
         # _batch_apply_ssrs_for_row.)
-        "new_hire_submission_types": ["New Hire", "Break Fix", "Mixed Build", "Additional Laptop"],
+        "new_hire_submission_types": ["New Hire", "Break Fix", "Mixed Build", "Additional Laptop", "Site Transfer"],
         # SSRS column name -> app field. Edit the right-hand column names
         # here if the real report's headers differ slightly (e.g. a
         # trailing space, or a renamed column) - nothing else needs to
@@ -470,6 +470,31 @@ CONFIG = {
         "request_type_to_submission_type": {
             "New Hire": "New Hire",
         },
+    },
+
+    "tracit_report": {
+        # TracIT's EUC asset report, downloaded from TracIT (Export) and
+        # loaded ONCE - then every LWD/Contractor LWD/Break Fix lookup is
+        # an instant in-memory match instead of driving the TracIT page
+        # per employee. The app picks the newest matching file up
+        # automatically from the Downloads folder (or "Load TracIT
+        # Report..." in the header to choose one by hand).
+        "watch_folder": "",  # blank = the signed-in user's Downloads folder
+        # A file counts as "the TracIT report" if its name contains any
+        # of these (case-insensitive) and it's .xlsx/.xls/.csv.
+        "file_name_contains": ["euc"],
+        # Column headers are matched case-insensitively, ignoring spaces
+        # and punctuation - add the real report's wording here if it
+        # differs from all of these.
+        "employee_id_columns": ["User Employee Id", "Employee ID", "EmployeeID", "Emp ID",
+                                "Empl ID", "User Employee ID", "Employee Number"],
+        "serial_columns": ["Serial Number", "Serial No", "Serial", "SerialNumber", "Asset Serial Number"],
+        # Used to prefer the LAPTOP row when an employee has several assets.
+        "asset_type_columns": ["Asset Type", "Asset Category", "Category", "Device Type",
+                               "Hardware Type", "Product Type", "Asset Class", "Model", "Model Name"],
+        "laptop_keywords": ["laptop", "notebook", "latitude", "elitebook", "thinkpad", "probook", "surface"],
+        "hostname_columns": ["Hostname", "Host Name", "Computer Name", "Asset Name", "Device Name"],
+        "cache_max_age_hours": 24,  # older than this = shown as "Stale" in the header
     },
 
     "servicenow": {
@@ -2534,6 +2559,18 @@ def resolve_submission_type(raw_type, type_aliases):
         if key == canonical.lower() or key in [a.lower() for a in aliases]:
             return canonical, True
     return str(raw_type).strip(), False
+
+
+def _parse_pasted_employee_ids(text):
+    """Employee IDs out of whatever was pasted - one per line, comma/tab/
+    space separated, an Excel column, even an email with other text:
+    every run of 5+ digits counts. Duplicates dropped, order kept."""
+    seen, out = set(), []
+    for match in re.findall(r"\d{5,}", text or ""):
+        if match not in seen:
+            seen.add(match)
+            out.append(match)
+    return out
 
 
 def load_queue(xlsx_path, type_aliases, sheet_name=None):
@@ -4776,12 +4813,178 @@ def parse_ssrs_asset_workbook(xlsx_path, column_map):
         wb.close()
 
 
+def _norm_header(text):
+    """'User Employee Id' / 'user_employee_id' / 'UserEmployeeID' -> 'useremployeeid'."""
+    return "".join(c for c in str(text or "").lower() if c.isalnum())
+
+
+def _employee_id_keys(emp_id):
+    """Every form an Employee ID can reasonably be stored in across SSRS,
+    TracIT and AD: as typed, digits only, and without leading zeros."""
+    emp_id = str(emp_id or "").strip()
+    if emp_id.endswith(".0") and emp_id[:-2].isdigit():  # Excel number cells
+        emp_id = emp_id[:-2]
+    digits = "".join(c for c in emp_id if c.isdigit())
+    keys = [emp_id, digits, digits.lstrip("0")]
+    out = []
+    for k in keys:
+        if k and k not in out:
+            out.append(k)
+    return out
+
+
 def _ssrs_find_record(ssrs_state, emp_id):
     """Looks an Employee ID up in the loaded SSRS asset report index, by
-    its literal text or a digits-only variant (see parse_ssrs_asset_workbook)."""
+    its literal text, digits only, or without leading zeros."""
     index = (ssrs_state or {}).get("index", {}) or {}
-    emp_id = (emp_id or "").strip()
-    return index.get(emp_id) or index.get("".join(c for c in emp_id if c.isdigit()))
+    for key in _employee_id_keys(emp_id):
+        if key in index:
+            return index[key]
+    stripped = {k.lstrip("0"): v for k, v in index.items()} if index else {}
+    for key in _employee_id_keys(emp_id):
+        if key.lstrip("0") in stripped:
+            return stripped[key.lstrip("0")]
+    return None
+
+
+# ============================================================================
+# TRACIT EUC REPORT (downloaded file) - LWD/Contractor LWD/Break Fix laptop
+# serial numbers without driving the TracIT web page per employee.
+# ============================================================================
+
+TRACIT_REPORT_EXTENSIONS = (".xlsx", ".xlsm", ".csv")
+
+
+def _tracit_report_cache_path(ext):
+    cache_dir = os.path.join(_app_dir(), "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "tracit_report" + ext)
+
+
+def _default_downloads_folder():
+    return os.path.join(os.path.expanduser("~"), "Downloads")
+
+
+def find_newest_tracit_report(cfg):
+    """Newest file in the watch folder (Downloads by default) whose name
+    looks like the TracIT EUC report. Returns a path or None."""
+    folder = (cfg.get("watch_folder") or "").strip() or _default_downloads_folder()
+    needles = [n.lower() for n in (cfg.get("file_name_contains") or ["euc"]) if n]
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+    best, best_mtime = None, -1.0
+    for name in names:
+        low = name.lower()
+        if not low.endswith(TRACIT_REPORT_EXTENSIONS) or low.startswith("~$"):
+            continue
+        if needles and not any(n in low for n in needles):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = path, mtime
+    return best
+
+
+def _read_tabular_rows(path, max_rows=None):
+    """Rows (lists of cell values) from an .xlsx/.xlsm or .csv file."""
+    if path.lower().endswith(".csv"):
+        for enc in ("utf-8-sig", "cp1252"):
+            try:
+                with open(path, newline="", encoding=enc) as f:
+                    return [row for row in csv.reader(f)]
+            except UnicodeDecodeError:
+                continue
+        raise RuntimeError(f"Could not read {os.path.basename(path)} as text.")
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb[wb.sheetnames[0]]
+        return [list(r) for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()
+
+
+def _find_column(header_cells, candidates):
+    wanted = [_norm_header(c) for c in candidates if c]
+    normed = [_norm_header(h) for h in header_cells]
+    for w in wanted:  # exact (normalized) match first, in priority order
+        if w in normed:
+            return normed.index(w)
+    for w in wanted:  # then "contains" (e.g. 'Serial Number (Asset)')
+        for i, h in enumerate(normed):
+            if w and h and w in h:
+                return i
+    return None
+
+
+def parse_tracit_report(path, cfg):
+    """Returns (index, record_count) where index is {employee_id_key:
+    [ {serial, asset_type, hostname}, ... ]} - every asset row per
+    employee, indexed under each form of the ID (see _employee_id_keys)."""
+    rows = _read_tabular_rows(path)
+    header_idx = None
+    for i, row in enumerate(rows[:15]):
+        if _find_column(row, cfg.get("employee_id_columns", [])) is not None and \
+                _find_column(row, cfg.get("serial_columns", [])) is not None:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise RuntimeError(
+            f"{os.path.basename(path)} doesn't look like the TracIT report - couldn't find an "
+            "Employee ID column and a Serial Number column in its first rows. If the real "
+            "headers are worded differently, add them to tracit_report.employee_id_columns / "
+            "serial_columns in CONFIG."
+        )
+    header = [str(h).strip() if h is not None else "" for h in rows[header_idx]]
+    emp_col = _find_column(header, cfg.get("employee_id_columns", []))
+    serial_col = _find_column(header, cfg.get("serial_columns", []))
+    type_col = _find_column(header, cfg.get("asset_type_columns", []))
+    host_col = _find_column(header, cfg.get("hostname_columns", []))
+
+    def cell(row, idx):
+        if idx is None or idx >= len(row) or row[idx] is None:
+            return ""
+        return str(row[idx]).strip()
+
+    index, count = {}, 0
+    for row in rows[header_idx + 1:]:
+        emp = cell(row, emp_col)
+        if not emp:
+            continue
+        rec = {"serial": cell(row, serial_col), "asset_type": cell(row, type_col),
+               "hostname": cell(row, host_col)}
+        for key in _employee_id_keys(emp):
+            index.setdefault(key, []).append(rec)
+        count += 1
+    return index, count
+
+
+def tracit_best_laptop(records, cfg):
+    """Picks the laptop out of an employee's asset rows: a row whose asset
+    type/model mentions a laptop keyword wins; otherwise the first row
+    that has a serial at all. Returns the record dict or None."""
+    with_serial = [r for r in (records or []) if r.get("serial")]
+    if not with_serial:
+        return None
+    keywords = [k.lower() for k in (cfg.get("laptop_keywords") or [])]
+    for r in with_serial:
+        text = (r.get("asset_type", "") + " " + r.get("hostname", "")).lower()
+        if any(k in text for k in keywords):
+            return r
+    return with_serial[0]
+
+
+def tracit_find_laptop(tracit_state, emp_id, cfg):
+    index = (tracit_state or {}).get("index", {}) or {}
+    for key in _employee_id_keys(emp_id):
+        if key in index:
+            return tracit_best_laptop(index[key], cfg)
+    return None
 
 
 def _ssrs_submission_type_for(config, record):
@@ -4798,6 +5001,18 @@ def _ssrs_submission_type_for(config, record):
     for v in ssrs_cfg.get("new_hire_request_type_values", ["New Hire"]):
         mapping.setdefault(str(v).strip().lower(), "New Hire")
     sub_type = mapping.get(request_type)
+    if not sub_type:
+        # Not explicitly mapped - accept it if it simply IS one of the app's
+        # submission types (any spacing/case: "Break Fix", "BREAKFIX",
+        # "Site-Transfer"), or one of the bulk-import synonyms.
+        wanted = _norm_header(request_type)
+        for t in (config.get("submission_type_row1", []) or []) + (config.get("submission_type_row2", []) or []):
+            if _norm_header(t) == wanted:
+                sub_type = t
+                break
+        if not sub_type:
+            resolved, ok = resolve_submission_type(request_type, config.get("bulk_type_aliases", {}))
+            sub_type = resolved if ok else None
     valid = (config.get("submission_type_row1", []) or []) + (config.get("submission_type_row2", []) or [])
     return sub_type if sub_type in valid else None
 
@@ -4968,6 +5183,10 @@ class WizardApp(tk.Tk):
             "status": SSRS_STATUS_NOT_AVAILABLE, "records": 0,
             "last_updated": None, "index": {}, "error": "",
         }
+        self.tracit_report_state = {
+            "status": "Not loaded", "records": 0, "index": {},
+            "file": None, "last_updated": None, "error": "",
+        }
         logger.info(
             "WizardApp: starting up. ad_lookup_mode=%r use_topaz_pad=%r bu_templates_folder=%r "
             "root_save_folder=%r operator_name=%r",
@@ -5026,81 +5245,157 @@ class WizardApp(tk.Tk):
         # health check update live as soon as it finishes - neither blocks
         # the app from being usable in the meantime.
         self._ssrs_refresh(force=False)
+        self._tracit_report_refresh()
         self.after(400, self._show_startup_health_check)
 
         logger.info("WizardApp: GUI ready")
 
-    # ------------------------------------------------------------ look & feel
+    # Palette shared by the ttk styles below and the few plain-tk widgets
+    # (header accent strip, canvas backgrounds) that ttk can't style.
+    UI_ACCENT = "#E35205"        # Optum orange
+    UI_ACCENT_DARK = "#B83F00"
+    UI_PAGE = "#F2F4F7"          # page background behind the cards
+    UI_SURFACE = "#FFFFFF"       # cards, header, inputs
+    UI_BORDER = "#D9DEE5"
+    UI_TEXT = "#1F2937"
+    UI_MUTED = "#6B7280"
+    UI_SUCCESS = "#1a7f37"
+    UI_WARN = "#a05a00"
+
     def _apply_ui_theme(self):
-        """A bounded visual-polish pass: consistent fonts, an Optum-orange
-        accent color on primary actions/headers, and light section framing.
-        Deliberately NOT a layout rewrite - every existing widget, grid/pack
-        call and callback is untouched; this only changes ttk.Style
-        defaults, so nothing about how the form behaves changes."""
-        ACCENT = "#EB690B"       # Optum orange
-        ACCENT_DARK = "#C4550A"
-        BG = "#F7F7F5"
-        SURFACE = "#FFFFFF"
-        TEXT = "#222222"
-        MUTED = "#666666"
-        BORDER = "#DDDDDD"
+        """Visual theme only - no widget, callback or layout logic lives
+        here. Default widgets are WHITE (they sit inside white "cards");
+        only page containers use the grey Page.* styles, so every existing
+        label/checkbox/radio inside a card automatically matches it."""
+        ACCENT, ACCENT_DARK = self.UI_ACCENT, self.UI_ACCENT_DARK
+        PAGE, SURFACE, BORDER = self.UI_PAGE, self.UI_SURFACE, self.UI_BORDER
+        TEXT, MUTED = self.UI_TEXT, self.UI_MUTED
 
         try:
-            self.configure(background=BG)
+            self.configure(background=PAGE)
         except Exception:
             pass
 
         style = ttk.Style(self)
         try:
             # 'clam' renders custom colors far more reliably on Windows than
-            # the default 'vista'/'winnative' theme, which ignores most
-            # ttk.Style color overrides.
+            # the default 'vista' theme, which ignores most color overrides.
             style.theme_use("clam")
         except Exception:
             logger.debug("UI theme: 'clam' unavailable, keeping default theme", exc_info=True)
 
         base_font = ("Segoe UI", 10)
         try:
-            self.option_add("*Font", base_font)
+            # NOT a blanket "*Font": that would override the per-style fonts
+            # below (card titles, header) for every ttk widget. Only the
+            # classic tk widgets and ttk text inputs get the base font here.
+            for cls in ("Label", "Button", "Listbox", "Text", "Entry", "TEntry", "TCombobox", "Menu"):
+                self.option_add(f"*{cls}.font", base_font)
+            self.option_add("*TCombobox*Listbox.font", base_font)
+            self.option_add("*Toplevel.background", SURFACE)  # dialogs match the cards
         except Exception:
             pass
 
-        style.configure(".", background=BG, foreground=TEXT, font=base_font)
-        style.configure("TFrame", background=BG)
-        style.configure("TLabelframe", background=BG, bordercolor=BORDER)
-        style.configure("TLabelframe.Label", background=BG, foreground=ACCENT_DARK, font=("Segoe UI", 10, "bold"))
-        style.configure("TLabel", background=BG, foreground=TEXT)
-        style.configure("TCheckbutton", background=BG)
-        style.configure("TRadiobutton", background=BG)
+        style.configure(".", background=SURFACE, foreground=TEXT, font=base_font,
+                        bordercolor=BORDER, lightcolor=SURFACE, darkcolor=BORDER,
+                        focuscolor=ACCENT, troughcolor=PAGE)
+
+        # --- containers
+        style.configure("TFrame", background=SURFACE)
+        style.configure("Page.TFrame", background=PAGE)
+        style.configure("Header.TFrame", background=SURFACE)
+        style.configure("Card.TFrame", background=SURFACE, relief="solid", borderwidth=1,
+                        bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        style.configure("ActionBar.TFrame", background=SURFACE)
+        style.configure("TLabelframe", background=SURFACE, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        style.configure("TLabelframe.Label", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9, "bold"))
         style.configure("TSeparator", background=BORDER)
+        style.configure("TPanedwindow", background=PAGE)
+        style.configure("Sash", sashthickness=8, gripcount=0, background=PAGE)
 
-        style.configure("TEntry", fieldbackground=SURFACE, bordercolor=BORDER)
-        style.configure("TCombobox", fieldbackground=SURFACE)
+        # --- text
+        style.configure("TLabel", background=SURFACE, foreground=TEXT)
+        style.configure("Muted.TLabel", background=SURFACE, foreground=MUTED)
+        style.configure("FieldLabel.TLabel", background=SURFACE, foreground="#374151")
+        style.configure("CardTitle.TLabel", background=SURFACE, foreground=TEXT, font=("Segoe UI", 11, "bold"))
+        style.configure("Page.TLabel", background=PAGE, foreground=TEXT)
+        style.configure("PageTitle.TLabel", background=PAGE, foreground=TEXT, font=("Segoe UI", 14, "bold"))
+        style.configure("PageSub.TLabel", background=PAGE, foreground=MUTED)
+        style.configure("HeaderTitle.TLabel", background=SURFACE, foreground=TEXT, font=("Segoe UI", 13, "bold"))
+        style.configure("HeaderSub.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Brand.TLabel", background=SURFACE, foreground=ACCENT, font=("Segoe UI", 18, "bold"))
+        style.configure("StatusName.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 8, "bold"))
+        style.configure("StatusValue.TLabel", background=SURFACE, foreground=TEXT, font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#E9ECF1", foreground=MUTED, padding=(10, 4))
+        style.configure("TCheckbutton", background=SURFACE)
+        style.configure("TRadiobutton", background=SURFACE)
+        style.map("TCheckbutton", background=[("active", SURFACE)])
+        style.map("TRadiobutton", background=[("active", SURFACE)])
 
-        style.configure(
-            "TButton", background=ACCENT, foreground="white",
-            font=("Segoe UI", 10, "bold"), padding=(10, 5), borderwidth=0,
-        )
-        style.map(
-            "TButton",
-            background=[("active", ACCENT_DARK), ("disabled", "#C9C9C9")],
-            foreground=[("disabled", "#888888")],
-        )
+        # --- inputs
+        style.configure("TEntry", fieldbackground=SURFACE, bordercolor=BORDER, lightcolor=SURFACE,
+                        padding=(6, 4))
+        style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)])
+        style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE, bordercolor=BORDER,
+                        arrowcolor=TEXT, padding=(6, 3))
+        style.map("TCombobox", fieldbackground=[("readonly", SURFACE)], bordercolor=[("focus", ACCENT)])
 
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure(
-            "TNotebook.Tab", background="#EDEDEA", foreground=TEXT,
-            font=("Segoe UI", 10, "bold"), padding=(16, 8),
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", SURFACE)],
-            foreground=[("selected", ACCENT_DARK)],
-        )
+        # --- buttons: secondary (default) vs primary (the one main action)
+        style.configure("TButton", background=SURFACE, foreground=TEXT, bordercolor=BORDER,
+                        lightcolor=SURFACE, darkcolor=BORDER, padding=(12, 5), font=("Segoe UI", 10))
+        style.map("TButton",
+                  background=[("disabled", "#F3F4F6"), ("pressed", "#E5E7EB"), ("active", "#F3F4F6")],
+                  foreground=[("disabled", "#9CA3AF")],
+                  bordercolor=[("active", "#9CA3AF")])
+        style.configure("Primary.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT,
+                        lightcolor=ACCENT, darkcolor=ACCENT_DARK, padding=(16, 6),
+                        font=("Segoe UI", 10, "bold"))
+        style.map("Primary.TButton",
+                  background=[("disabled", "#F3B08C"), ("pressed", ACCENT_DARK), ("active", ACCENT_DARK)],
+                  foreground=[("disabled", "white")],
+                  bordercolor=[("active", ACCENT_DARK)])
+        style.configure("Icon.TButton", padding=(6, 2), font=("Segoe UI", 11))
+        style.configure("Link.TButton", background=SURFACE, foreground="#1D4ED8", bordercolor=SURFACE,
+                        lightcolor=SURFACE, darkcolor=SURFACE, padding=(2, 0))
+        style.map("Link.TButton", background=[("active", SURFACE)], foreground=[("active", "#1E3A8A")])
 
-        # Status bar at the bottom - kept visually distinct/muted rather
-        # than looking like an editable field.
-        style.configure("Status.TLabel", background="#EDEDEA", foreground=MUTED, padding=(6, 3))
+        # --- notebook
+        style.configure("TNotebook", background=PAGE, borderwidth=0, tabmargins=(12, 8, 12, 0))
+        style.configure("TNotebook.Tab", background="#E5E8ED", foreground=MUTED,
+                        font=("Segoe UI", 10, "bold"), padding=(18, 8), bordercolor=BORDER,
+                        lightcolor="#E5E8ED")
+        style.map("TNotebook.Tab",
+                  background=[("selected", PAGE)],
+                  foreground=[("selected", ACCENT_DARK)],
+                  lightcolor=[("selected", PAGE)])
+
+        # --- lists
+        style.configure("Treeview", background=SURFACE, fieldbackground=SURFACE, foreground=TEXT,
+                        rowheight=26, bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER)
+        style.configure("Treeview.Heading", background="#F3F4F6", foreground="#374151",
+                        font=("Segoe UI", 9, "bold"), relief="flat", padding=(6, 5), bordercolor=BORDER)
+        style.map("Treeview.Heading", background=[("active", "#E5E7EB")])
+        style.map("Treeview", background=[("selected", "#FDE7DA")], foreground=[("selected", TEXT)])
+        style.configure("Vertical.TScrollbar", background="#E5E7EB", troughcolor=PAGE, bordercolor=PAGE,
+                        arrowcolor=MUTED, lightcolor="#E5E7EB", darkcolor="#E5E7EB")
+
+    def _card(self, parent, title=None, subtitle=None, padding=16):
+        """A white bordered 'card' with an optional bold title (and muted
+        subtitle). Returns (card, body) - build the card's content into
+        body."""
+        card = ttk.Frame(parent, style="Card.TFrame", padding=1)
+        inner = ttk.Frame(card, padding=padding)
+        inner.pack(fill="both", expand=True)
+        if title:
+            head = ttk.Frame(inner)
+            head.pack(fill="x", pady=(0, 10))
+            ttk.Label(head, text=title, style="CardTitle.TLabel").pack(side="left")
+            if subtitle:
+                ttk.Label(head, text=subtitle, style="Muted.TLabel").pack(side="left", padx=(10, 0))
+            inner.card_head = head
+        body = ttk.Frame(inner)
+        body.pack(fill="both", expand=True)
+        return card, body
 
     # ------------------------------------------------------------ tooltips
     def _add_info_tooltip(self, parent, text, side="left", padx=(4, 0)):
@@ -5188,22 +5483,22 @@ class WizardApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 
-        self.single_tab = ttk.Frame(self.notebook)
-        self.bulk_tab = ttk.Frame(self.notebook)
-        self.history_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.single_tab, text="Single Person")
-        self.notebook.add(self.bulk_tab, text="Bulk Batch")
-        self.notebook.add(self.history_tab, text="Generated Documents")
+        self.single_tab = ttk.Frame(self.notebook, style="Page.TFrame")
+        self.bulk_tab = ttk.Frame(self.notebook, style="Page.TFrame")
+        self.history_tab = ttk.Frame(self.notebook, style="Page.TFrame")
+        self.notebook.add(self.single_tab, text="  Single Person  ")
+        self.notebook.add(self.bulk_tab, text="  Bulk Batch  ")
+        self.notebook.add(self.history_tab, text="  Generated Documents  ")
 
     # ------------------------------------------------------- branding/header
     def _build_header_bar(self):
-        """Enhancement 1 (Optum branding) + the SSRS Asset Report status
-        dashboard (Enhancements 10/11) + a 'Settings...' button to reopen
-        the one-time setup dialog (Enhancement 2-4) any time."""
-        header = ttk.Frame(self, padding=(10, 6))
+        """Branding + live status of the two downloaded data sources (SSRS
+        asset report, TracIT EUC report) + Settings."""
+        header = ttk.Frame(self, padding=(18, 10), style="Header.TFrame")
         header.pack(fill="x", side="top")
+        tk.Frame(self, height=3, background=self.UI_ACCENT).pack(fill="x", side="top")
 
-        brand = ttk.Frame(header)
+        brand = ttk.Frame(header, style="Header.TFrame")
         brand.pack(side="left")
         self._header_logo_image = None  # kept as an attribute so Tk doesn't GC it
         logo_path = os.path.join(_app_dir(), "assets", "optum_logo.png")
@@ -5212,61 +5507,63 @@ class WizardApp(tk.Tk):
                 img = Image.open(logo_path)
                 img.thumbnail((140, 40))
                 self._header_logo_image = ImageTk.PhotoImage(img)
-                ttk.Label(brand, image=self._header_logo_image).pack(side="left", padx=(0, 10))
+                ttk.Label(brand, image=self._header_logo_image).pack(side="left", padx=(0, 14))
             except Exception:
                 logger.exception("Header: could not load logo at %r (falling back to text)", logo_path)
         if self._header_logo_image is None:
-            # No real logo file provided yet - drop assets/optum_logo.png next
-            # to app.py to show the actual logo here instead of this text
-            # fallback. PDF templates already contain the real logo and are
-            # untouched either way.
-            ttk.Label(brand, text="OPTUM", font=("Segoe UI", 16, "bold"), foreground="#EB690B").pack(
-                side="left", padx=(0, 10)
-            )
-        title_box = ttk.Frame(brand)
+            # Drop assets/optum_logo.png next to app.py to show the real logo.
+            ttk.Label(brand, text="OPTUM", style="Brand.TLabel").pack(side="left", padx=(0, 14))
+        tk.Frame(brand, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=(0, 14))
+        title_box = ttk.Frame(brand, style="Header.TFrame")
         title_box.pack(side="left")
-        ttk.Label(
-            title_box, text="IT Asset Submission Acknowledgement System", font=("Segoe UI", 11, "bold")
-        ).pack(anchor="w")
+        ttk.Label(title_box, text="IT Asset Submission Acknowledgement", style="HeaderTitle.TLabel").pack(anchor="w")
         self.header_operator_var = tk.StringVar(value=self._format_operator_line())
-        ttk.Label(title_box, textvariable=self.header_operator_var, foreground="#666").pack(anchor="w")
+        ttk.Label(title_box, textvariable=self.header_operator_var, style="HeaderSub.TLabel").pack(anchor="w")
 
-        right = ttk.Frame(header)
+        right = ttk.Frame(header, style="Header.TFrame")
         right.pack(side="right")
 
-        ssrs_box = ttk.LabelFrame(right, text="SSRS Asset Report", padding=6)
-        ssrs_box.pack(side="left", padx=(0, 10))
-        self.ssrs_status_var = tk.StringVar(value=f"Status: {SSRS_STATUS_NOT_AVAILABLE}")
+        # SSRS asset report status (vars kept for _refresh_ssrs_status_labels)
+        self.ssrs_status_var = tk.StringVar(value=SSRS_STATUS_NOT_AVAILABLE)
         self.ssrs_records_var = tk.StringVar(value="Records Loaded: 0")
         self.ssrs_updated_var = tk.StringVar(value="Last Updated: never")
-        ttk.Label(ssrs_box, textvariable=self.ssrs_status_var).pack(anchor="w")
-        ttk.Label(ssrs_box, textvariable=self.ssrs_records_var).pack(anchor="w")
-        ttk.Label(ssrs_box, textvariable=self.ssrs_updated_var).pack(anchor="w")
-        # Icon-only (⟳) instead of "Refresh Data" to save space, same as
-        # the Settings gear above - a hover tooltip still spells it out.
-        self.ssrs_refresh_button = ttk.Button(
-            ssrs_box, text="⟳", width=3, command=lambda: self._ssrs_refresh(force=True)
+        self.ssrs_refresh_button = self._header_status_block(
+            right, "SSRS ASSET REPORT", self.ssrs_status_var, "⟳",
+            lambda: self._ssrs_refresh(force=True), "Download the SSRS report again now",
         )
-        self.ssrs_refresh_button.pack(anchor="w", pady=(4, 0))
-        self._attach_hover_tooltip(self.ssrs_refresh_button, "Refresh Data")
-
-        # Icon-only instead of "Settings..." to save header space - the
-        # gear (⚙) is a widely-recognized settings symbol, and a hover
-        # tooltip still spells out "Settings" for discoverability.
+        tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=14)
+        self.tracit_report_status_var = tk.StringVar(value="Not loaded")
+        self.tracit_report_button = self._header_status_block(
+            right, "TRACIT EUC REPORT", self.tracit_report_status_var, "Load…",
+            self._load_tracit_report_dialog,
+            "Load the TracIT EUC report you exported (the newest one in Downloads is picked up automatically)",
+        )
+        tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=14)
         settings_button = ttk.Button(
-            right, text="⚙", width=3, command=lambda: self._show_settings_dialog(first_run=False)
+            right, text="⚙", width=3, style="Icon.TButton",
+            command=lambda: self._show_settings_dialog(first_run=False),
         )
         settings_button.pack(side="left")
         self._attach_hover_tooltip(settings_button, "Settings")
 
-        ttk.Separator(self, orient="horizontal").pack(fill="x", side="top")
+    def _header_status_block(self, parent, name, value_var, icon, command, tooltip):
+        block = ttk.Frame(parent, style="Header.TFrame")
+        block.pack(side="left")
+        text_box = ttk.Frame(block, style="Header.TFrame")
+        text_box.pack(side="left")
+        ttk.Label(text_box, text=name, style="StatusName.TLabel").pack(anchor="w")
+        ttk.Label(text_box, textvariable=value_var, style="StatusValue.TLabel").pack(anchor="w")
+        button = ttk.Button(block, text=icon, width=3 if len(icon) == 1 else 0, style="Icon.TButton", command=command)
+        button.pack(side="left", padx=(10, 0))
+        self._attach_hover_tooltip(button, tooltip)
+        return button
 
     def _format_operator_line(self):
         name = self.user_settings.get("operator_name") or ""
         location = self.user_settings.get("location") or ""
         if not name and not location:
-            return "Operator not set up yet - click Settings to configure."
-        return "Operator: " + name + (f"  |  {location}" if location else "")
+            return "Operator not set up yet - click ⚙ Settings to configure."
+        return "Operator: " + name + (f"  ·  {location}" if location else "")
 
     def _refresh_header_operator_label(self):
         if hasattr(self, "header_operator_var"):
@@ -5276,12 +5573,18 @@ class WizardApp(tk.Tk):
         if not hasattr(self, "ssrs_status_var"):
             return
         state = self.ssrs_state
-        self.ssrs_status_var.set(f"Status: {state.get('status', SSRS_STATUS_NOT_AVAILABLE)}")
-        self.ssrs_records_var.set(f"Records Loaded: {state.get('records', 0)}")
         last_updated = state.get("last_updated")
+        records = state.get("records", 0)
+        self.ssrs_records_var.set(f"Records Loaded: {records}")
         self.ssrs_updated_var.set(
             "Last Updated: " + (last_updated.strftime("%d-%b-%Y %I:%M %p") if last_updated else "never")
         )
+        parts = [state.get("status", SSRS_STATUS_NOT_AVAILABLE)]
+        if records:
+            parts.append(f"{records:,} rows")
+        if last_updated:
+            parts.append(last_updated.strftime("%d-%b %I:%M %p"))
+        self.ssrs_status_var.set(" · ".join(parts))
         self.status_var.set(
             f"SSRS asset report: {state.get('status')}"
             + (f" - {state['error']}" if state.get("error") else "")
@@ -5301,7 +5604,7 @@ class WizardApp(tk.Tk):
         if hasattr(self, "ssrs_refresh_button"):
             self.ssrs_refresh_button.config(state="disabled")
         if hasattr(self, "ssrs_status_var"):
-            self.ssrs_status_var.set("Status: Downloading...")
+            self.ssrs_status_var.set("Downloading...")
 
         def worker():
             cfg = self.config_data.get("ssrs_asset_report", {})
@@ -5349,6 +5652,7 @@ class WizardApp(tk.Tk):
                 # a stale "SSRS report not loaded yet" on screen.
                 if hasattr(self, "emp_id_var") and self.emp_id_var.get().strip():
                     self._ssrs_check_current_id()
+                self._batch_reenrich_from_reports()
                 logger.info(
                     "SSRS asset report: status=%r records=%d error=%r",
                     status, records, error_detail,
@@ -5357,6 +5661,110 @@ class WizardApp(tk.Tk):
             self.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ------------------------------------------------------ TracIT report
+    def _tracit_report_refresh(self, chosen_path=None):
+        """Loads the TracIT EUC report in the background: the file the
+        operator just picked (chosen_path), else the newest matching file
+        in Downloads if it's newer than the cached copy, else the cached
+        copy from last time. The file is copied into cache/ so it keeps
+        working even after Downloads is cleaned out."""
+        cfg = self.config_data.get("tracit_report", {})
+        if hasattr(self, "tracit_report_status_var"):
+            self.tracit_report_status_var.set("Loading...")
+
+        def worker():
+            error, index, records, source, updated = "", {}, 0, None, None
+            try:
+                cached = next((_tracit_report_cache_path(ext) for ext in TRACIT_REPORT_EXTENSIONS
+                               if os.path.exists(_tracit_report_cache_path(ext))), None)
+                candidate = chosen_path or find_newest_tracit_report(cfg)
+                if candidate and (chosen_path or not cached
+                                  or os.path.getmtime(candidate) > os.path.getmtime(cached)):
+                    ext = os.path.splitext(candidate)[1].lower()
+                    ext = ext if ext in TRACIT_REPORT_EXTENSIONS else ".xlsx"
+                    for old_ext in TRACIT_REPORT_EXTENSIONS:
+                        old = _tracit_report_cache_path(old_ext)
+                        if os.path.exists(old):
+                            os.remove(old)
+                    cached = _tracit_report_cache_path(ext)
+                    shutil.copy2(candidate, cached)
+                    source = candidate
+                    logger.info("TracIT report: loaded new file %r", candidate)
+                if cached:
+                    index, records = parse_tracit_report(cached, cfg)
+                    updated = datetime.fromtimestamp(os.path.getmtime(cached))
+                    source = source or cached
+            except Exception as exc:
+                logger.exception("TracIT report: could not load")
+                error = str(exc)
+
+            def apply():
+                if error:
+                    status = "Error"
+                elif not records:
+                    status = "Not loaded"
+                else:
+                    age_h = (datetime.now() - updated).total_seconds() / 3600.0 if updated else 999
+                    status = "Available" if age_h <= cfg.get("cache_max_age_hours", 24) else "Stale"
+                self.tracit_report_state = {
+                    "status": status, "records": records, "index": index,
+                    "file": source, "last_updated": updated, "error": error,
+                }
+                logger.info("TracIT report: status=%r records=%d error=%r", status, records, error)
+                self._refresh_tracit_report_labels()
+                if error and chosen_path:
+                    messagebox.showerror("TracIT report", error)
+                # Fill the on-screen form now if it was waiting on this.
+                if hasattr(self, "current_serial_var"):
+                    self._apply_tracit_report_to_current_serial()
+                self._batch_reenrich_from_reports()
+
+            self.after(0, apply)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_tracit_report_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select the TracIT EUC report you downloaded",
+            initialdir=(self.config_data.get("tracit_report", {}).get("watch_folder") or _default_downloads_folder()),
+            filetypes=[("Excel / CSV", "*.xlsx *.xlsm *.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self._tracit_report_refresh(chosen_path=path)
+
+    def _refresh_tracit_report_labels(self):
+        if not hasattr(self, "tracit_report_status_var"):
+            return
+        st = self.tracit_report_state
+        if st.get("records"):
+            when = st["last_updated"].strftime("%d-%b %I:%M %p") if st.get("last_updated") else ""
+            self.tracit_report_status_var.set(f"{st['status']} · {st['records']:,} rows · {when}")
+        else:
+            self.tracit_report_status_var.set(
+                "Error - see log" if st.get("status") == "Error" else "Not loaded - export it from TracIT"
+            )
+
+    def _apply_tracit_report_to_current_serial(self):
+        """Single Person tab: fill Current Device Serial Number from the
+        loaded TracIT report for LWD / Contractor LWD / Break Fix. Never
+        overwrites something already typed."""
+        if not hasattr(self, "current_serial_var") or not hasattr(self, "submission_type_var"):
+            return
+        if self.submission_type_var.get() not in self.config_data.get("tracit_submission_types", []):
+            return
+        emp_id = self.emp_id_var.get().strip()
+        if not emp_id or self.current_serial_var.get().strip():
+            return
+        rec = tracit_find_laptop(self.tracit_report_state, emp_id, self.config_data.get("tracit_report", {}))
+        hint = getattr(self, "tracit_fetch_hint", None)
+        if rec:
+            self.current_serial_var.set(rec["serial"])
+            if hint is not None:
+                extra = f" ({rec['asset_type']})" if rec.get("asset_type") else ""
+                hint.config(text=f"Filled from TracIT report{extra}.", foreground="#1a7f37")
+        elif hint is not None and self.tracit_report_state.get("records"):
+            hint.config(text="Not in TracIT report - use Fetch from TracIT or type it.", foreground="#a05a00")
 
     def _show_startup_health_check(self):
         """Enhancement 13 - a quick, non-blocking startup readiness panel.
@@ -5525,6 +5933,7 @@ class WizardApp(tk.Tk):
             if hasattr(self, "_batch_refresh_save_path"):
                 self._batch_refresh_save_path()
             self._refresh_header_operator_label()
+            self._refresh_save_location_hint()
             dlg.destroy()
 
         ttk.Button(btn_row, text="Save", command=do_save).pack(side="left", padx=6)
@@ -5535,30 +5944,22 @@ class WizardApp(tk.Tk):
         dlg.grab_set()
         self.wait_window(dlg)
 
-    def _make_scrollable(self, container):
+    def _make_scrollable(self, container, style="Page.TFrame", padding=16):
         """Wraps `container` in a vertically-scrolling canvas and returns
-        the inner content frame to build widgets into.
-
-        Mousewheel/touchpad scrolling works anywhere over this area - not
-        just when the cursor is directly over the canvas's own gutter (the
-        old per-canvas <Enter>/<Leave> bind_all approach silently stopped
-        working the moment the cursor was over any child widget, like an
-        Entry or a Frame, since those swallow the Enter/Leave events before
-        the canvas ever sees them). Instead every scrollable canvas
-        registers itself once with the app-wide dispatcher set up in
-        _init_global_mousewheel_scrolling(), which figures out - on every
-        wheel/touchpad event, anywhere in the window - which registered
-        canvas (if any) the cursor is currently over and scrolls that one."""
-        outer = ttk.Frame(container)
+        the inner content frame to build widgets into. Scrolling (mouse
+        wheel AND touchpad) is handled once, app-wide, by
+        _init_global_mousewheel_scrolling()."""
+        outer = ttk.Frame(container, style=style)
         outer.pack(fill="both", expand=True)
 
-        canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0)
+        bg = self.UI_PAGE if style == "Page.TFrame" else self.UI_SURFACE
+        canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0, background=bg)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
+        canvas.configure(yscrollcommand=vsb.set, yscrollincrement=20)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        content = ttk.Frame(canvas, padding=16)
+        content = ttk.Frame(canvas, padding=padding, style=style)
         window = canvas.create_window((0, 0), window=content, anchor="nw")
 
         content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -5574,40 +5975,122 @@ class WizardApp(tk.Tk):
         self._scrollable_canvases.append(canvas)
 
     def _init_global_mousewheel_scrolling(self):
-        """Binds mousewheel/touchpad scrolling ONCE for the whole window -
-        every canvas registered via _register_scrollable_canvas() (Single
-        Person, Bulk Batch, and any future scrollable panel) then scrolls
-        correctly no matter where over that panel the cursor is, with no
-        need to click the scrollbar itself first."""
+        """Mouse-wheel AND touchpad scrolling for every registered canvas,
+        bound ONCE for the whole window.
 
-        def _scroll_amount(event):
-            # Windows/macOS send event.delta (multiples of 120 on Windows);
-            # X11/Linux send Button-4 (up) / Button-5 (down) instead.
-            if getattr(event, "num", None) == 4:
-                return -1
-            if getattr(event, "num", None) == 5:
-                return 1
-            delta = getattr(event, "delta", 0)
-            if delta == 0:
-                return 0
-            return int(-1 * (delta / 120)) if abs(delta) >= 120 else (-1 if delta > 0 else 1)
+        Why touchpads didn't scroll before: a regular mouse sends one wheel
+        event per notch (delta = +/-120) and the pointer position in the
+        event is reliable. Precision touchpads send a rapid stream of
+        TINY deltas (often +/-1..30) and, on some drivers, the event's
+        pointer coordinates don't point at the widget under the finger -
+        so the old "which canvas is under event.x_root/y_root?" check
+        found nothing and silently did nothing. Now:
+          1. small deltas are accumulated and turned into smooth scrolling
+             (instead of one full step per tiny event),
+          2. the target is found from the event position, then the REAL
+             current pointer position, then the widget that received the
+             event, and finally the scrollable area of the visible tab -
+             so a wheel/touchpad event over the window always scrolls
+             something sensible,
+          3. the first few wheel events are written to application.log
+             (delta, target) so a device that still misbehaves can be
+             diagnosed from the log without a screen recording."""
+        self._wheel_accum = 0.0
+        self._wheel_events_logged = 0
 
-        def _dispatch(event):
-            amount = _scroll_amount(event)
-            if amount == 0:
-                return
+        def _is_scrollable(canvas):
             try:
-                widget = self.winfo_containing(event.x_root, event.y_root)
+                first, last = canvas.yview()
+                return not (first <= 0.0 and last >= 1.0)
             except Exception:
-                widget = None
+                return False
+
+        def _canvas_from(widget):
             while widget is not None:
                 if widget in self._scrollable_canvases:
-                    widget.yview_scroll(amount, "units")
-                    return
-                widget = widget.master
+                    return widget
+                if isinstance(widget, ttk.Treeview):
+                    return widget  # lists scroll themselves
+                widget = getattr(widget, "master", None)
+            return None
+
+        def _visible_tab_canvas():
+            try:
+                tab = self.nametowidget(self.notebook.select())
+            except Exception:
+                return None
+            for canvas in self._scrollable_canvases:
+                w = canvas
+                while w is not None and w is not tab:
+                    w = getattr(w, "master", None)
+                if w is tab and canvas.winfo_ismapped() and _is_scrollable(canvas):
+                    return canvas
+            return None
+
+        def _target(event):
+            candidates = []
+            try:
+                candidates.append(self.winfo_containing(event.x_root, event.y_root))
+            except Exception:
+                pass
+            try:
+                px, py = self.winfo_pointerxy()
+                candidates.append(self.winfo_containing(px, py))
+            except Exception:
+                pass
+            candidates.append(getattr(event, "widget", None))
+            for widget in candidates:
+                if isinstance(widget, str):
+                    try:
+                        widget = self.nametowidget(widget)
+                    except Exception:
+                        continue
+                canvas = _canvas_from(widget)
+                if canvas is not None:
+                    return canvas
+            return _visible_tab_canvas()
+
+        def _dispatch(event):
+            num = getattr(event, "num", None)
+            if num == 4:
+                delta = 120
+            elif num == 5:
+                delta = -120
+            else:
+                delta = getattr(event, "delta", 0) or 0
+            if delta == 0:
+                return
+            target = _target(event)
+            if self._wheel_events_logged < 5:
+                self._wheel_events_logged += 1
+                logger.debug("Scroll event: delta=%s num=%s widget=%s -> target=%s",
+                             delta, num, getattr(event, "widget", None), target)
+            if target is None:
+                return
+            if isinstance(target, ttk.Treeview) and target not in self._scrollable_canvases:
+                return  # the list's own class binding already scrolls it
+            # 120 = one mouse-wheel notch = 3 lines. Touchpads deliver the
+            # same distance as many small deltas; accumulate them.
+            self._wheel_accum += -delta / 40.0
+            steps = int(self._wheel_accum)
+            if steps:
+                self._wheel_accum -= steps
+                target.yview_scroll(steps, "units")
+            return "break"
 
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.bind_all(seq, _dispatch)
+
+        # Keyboard fallback that works on any device: Page Up/Down scroll
+        # the visible form when focus isn't in a text box.
+        def _page(event, direction):
+            if isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox)):
+                return
+            canvas = _visible_tab_canvas()
+            if canvas is not None:
+                canvas.yview_scroll(direction, "pages")
+        self.bind_all("<Prior>", lambda e: _page(e, -1))
+        self.bind_all("<Next>", lambda e: _page(e, 1))
 
     def _refresh_bu_combos(self):
         self._bu_templates_cache = list_templates(_resolve_path(self.config_data, "bu_templates_folder", "bu_templates"))
@@ -5739,155 +6222,163 @@ class WizardApp(tk.Tk):
     def _build_single_tab_shell(self):
         tab = self.single_tab
 
-        bottom = ttk.Frame(tab, padding=(16, 8))
-        bottom.pack(fill="x", side="bottom")
+        # Bottom action bar: always visible, primary action on the right.
+        tk.Frame(tab, height=1, background=self.UI_BORDER).pack(fill="x", side="bottom")
+        bottom = ttk.Frame(tab, padding=(18, 10), style="ActionBar.TFrame")
+        bottom.pack(fill="x", side="bottom", before=tab.winfo_children()[0])
 
-        # Enhancement: no manual Save-to/path/Choose Location on the main
-        # screen anymore - the PDF always saves automatically to the root
-        # folder configured once in Settings, under the automatic
-        # <SubmissionType>/<Date>/<Operator>/ folder structure and
-        # automatic <EmployeeID>_<Type>_<timestamp>.pdf filename (see
-        # _compute_default_output_path). Where it landed is shown on the
-        # success screen after Generate, with one-click Open PDF/Open Folder.
+        # No manual save-location picker: the PDF always saves automatically
+        # to the Settings root folder, <SubmissionType>/<Date>/<Operator>/,
+        # named <EmployeeID>_<Type>_<timestamp>.pdf (see
+        # _compute_default_output_path). The success dialog shows where.
         self.output_path_override = None
 
-        # The compact "Recent Documents" panel that used to live here was
-        # removed - it duplicated the dedicated Generated Documents tab,
-        # which already covers the same (and more) with a full searchable
-        # history, Open PDF and Open Folder.
-        btn_row = ttk.Frame(bottom)
-        btn_row.pack(fill="x")
-        ttk.Button(btn_row, text="Generate Signed PDF", command=self._on_generate).pack(side="left")
-        ttk.Button(btn_row, text="Start Another Form", command=self._on_start_another).pack(side="left", padx=10)
+        self.save_location_hint = ttk.Label(bottom, text="", style="Muted.TLabel")
+        self.save_location_hint.pack(side="left")
+        ttk.Button(bottom, text="Generate Signed PDF", style="Primary.TButton",
+                   command=self._on_generate).pack(side="right")
+        ttk.Button(bottom, text="Start Another Form", command=self._on_start_another).pack(side="right", padx=10)
+        self._refresh_save_location_hint()
 
-        self.single_content = self._make_scrollable(tab)
+        self.single_content = self._make_scrollable(tab, padding=(18, 16))
 
         self._sig_preview_image = {}
         self._signature_paths = {"employee_signature_path": None, "asset_receiver_signature_path": None}
+
+    def _refresh_save_location_hint(self):
+        if not hasattr(self, "save_location_hint"):
+            return
+        root = (self.user_settings.get("root_save_folder") or "").strip() or _resolve_path(
+            self.config_data, "pdf_save_folder", "generated_forms"
+        )
+        self.save_location_hint.config(text=f"PDFs save automatically to  {root}")
 
     def _clear_single_content(self):
         for child in self.single_content.winfo_children():
             child.destroy()
 
     def _build_form(self):
+        """Single Person form as cards:  Employee | Submission Type
+        (side by side), then Asset Details, then Signatures."""
         self._clear_single_content()
-        parent = self.single_content
+        page = self.single_content
+        page.columnconfigure(0, weight=1, uniform="cols")
+        page.columnconfigure(1, weight=1, uniform="cols")
 
-        self._build_bu_section(parent)
-        ttk.Separator(parent).pack(fill="x", pady=8)
-        self._build_employee_section(parent)
-        ttk.Separator(parent).pack(fill="x", pady=8)
-        self._build_contact_section(parent)
-        ttk.Separator(parent).pack(fill="x", pady=8)
-        self._build_submission_type_section(parent)
-        self.asset_details_frame = ttk.Frame(parent)
-        self.asset_details_frame.pack(fill="x", anchor="w", pady=(2, 0))
-        self._rebuild_asset_details()
-        ttk.Separator(parent).pack(fill="x", pady=8)
-
-        sig_row = ttk.Frame(parent)
-        sig_row.pack(fill="x", anchor="w")
-        emp_sig_frame = ttk.Frame(sig_row)
-        emp_sig_frame.pack(side="left", padx=(0, 40), anchor="n")
-        self._build_signature_section(
-            emp_sig_frame, "employee_signature_path", "Employee Signature", "Employee: sign here"
-        )
-        ar_sig_frame = ttk.Frame(sig_row)
-        ar_sig_frame.pack(side="left", anchor="n")
-        self._build_signature_section(
-            ar_sig_frame, "asset_receiver_signature_path", "Asset Receiver Signature", "Asset Receiver: sign here"
-        )
-
-    # -------------------------------------------------------- 1: BU
-    def _build_bu_section(self, parent):
-        header = ttk.Frame(parent)
-        header.pack(anchor="w", fill="x")
-        ttk.Label(header, text="Business Unit", font=("Segoe UI", 11, "bold")).pack(side="left")
+        emp_card, emp_body = self._card(page, "Employee")
+        emp_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 16))
         self._add_info_tooltip(
-            header,
-            "Its Word template supplies the letterhead, address, and layout. Upload a BU's base "
-            "Word (.docx) form once via 'Add New BU Template...' - the app automatically makes it "
-            "fillable, no Acrobat or manual setup needed.",
-        )
-
-        templates = list_templates(_resolve_path(self.config_data, "bu_templates_folder", "bu_templates"))
-        self._bu_templates_cache = templates
-
-        row = ttk.Frame(parent)
-        row.pack(anchor="w", fill="x", pady=(4, 0))
-        self.bu_var = tk.StringVar(value="")
-        names = [t["name"] for t in templates]
-        self.bu_combo = ttk.Combobox(row, textvariable=self.bu_var, values=names, state="readonly", width=36)
-        self.bu_combo.pack(side="left")
-        if not names:
-            self.status_var.set("No Business Unit templates yet - click 'Add New BU Template...'.")
-        ttk.Button(row, text="Add New BU Template...", command=self._add_bu_template).pack(side="left", padx=8)
-
-    # ----------------------------------------------------- 2: employee id
-    def _build_employee_section(self, parent):
-        header = ttk.Frame(parent)
-        header.pack(anchor="w", fill="x")
-        ttk.Label(header, text="Employee ID", font=("Segoe UI", 11, "bold")).pack(side="left")
-        self._add_info_tooltip(
-            header,
+            emp_body.master.card_head,
             "Scan or type the Employee ID - Employee Name and Manager Name are filled in "
             "automatically from Active Directory (LDAP), no click needed. The SSRS asset report "
             "is checked at the same time: if the person is in it, the submission type (and New "
             "Device Serial Number) are picked automatically; if not, you'll see 'Not in SSRS "
             "report' and can fill those in by hand.",
         )
+        emp_body.columnconfigure(1, weight=1)
+        self._build_bu_section(emp_body)
+        self._build_employee_section(emp_body)
+        self._build_contact_section(emp_body)
 
+        type_card, type_body = self._card(page, "Submission Type")
+        type_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 16))
+        self._build_submission_type_section(type_body)
+
+        asset_card, asset_body = self._card(page, "Asset Details")
+        asset_card.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 16))
+        self.asset_details_frame = ttk.Frame(asset_body)
+        self.asset_details_frame.pack(fill="x", anchor="w")
+        self._rebuild_asset_details()
+
+        sig_card, sig_body = self._card(page, "Signatures",
+                                        "Topaz pad if connected, otherwise on-screen - signed into the PDF")
+        sig_card.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+        sig_body.columnconfigure(0, weight=1, uniform="sig")
+        sig_body.columnconfigure(1, weight=1, uniform="sig")
+        emp_sig_frame = ttk.Frame(sig_body)
+        emp_sig_frame.grid(row=0, column=0, sticky="nw")
+        self._build_signature_section(
+            emp_sig_frame, "employee_signature_path", "Employee Signature", "Employee: sign here"
+        )
+        ar_sig_frame = ttk.Frame(sig_body)
+        ar_sig_frame.grid(row=0, column=1, sticky="nw")
+        self._build_signature_section(
+            ar_sig_frame, "asset_receiver_signature_path", "Asset Receiver Signature", "Asset Receiver: sign here"
+        )
+
+    # Grid rows used inside the Employee card (label column 0, field column 1).
+    _EMP_ROW_BU, _EMP_ROW_ID, _EMP_ROW_SSRS, _EMP_ROW_NAME, _EMP_ROW_MANAGER, \
+        _EMP_ROW_CONTACT, _EMP_ROW_HINT = range(7)
+
+    def _field_label(self, parent, text, row):
+        ttk.Label(parent, text=text, style="FieldLabel.TLabel").grid(
+            row=row, column=0, sticky="w", padx=(0, 14), pady=5)
+
+    # -------------------------------------------------------- 1: BU
+    def _build_bu_section(self, parent):
+        templates = list_templates(_resolve_path(self.config_data, "bu_templates_folder", "bu_templates"))
+        self._bu_templates_cache = templates
+
+        self._field_label(parent, "Business Unit", self._EMP_ROW_BU)
         row = ttk.Frame(parent)
-        row.pack(anchor="w", pady=(4, 0))
-        ttk.Label(row, text="Employee ID:").pack(side="left")
+        row.grid(row=self._EMP_ROW_BU, column=1, sticky="ew", pady=5)
+        self.bu_var = tk.StringVar(value="")
+        names = [t["name"] for t in templates]
+        self.bu_combo = ttk.Combobox(row, textvariable=self.bu_var, values=names, state="readonly", width=30)
+        self.bu_combo.pack(side="left")
+        if not names:
+            self.status_var.set("No Business Unit templates yet - click 'Add BU Template...'.")
+        add_btn = ttk.Button(row, text="+ Add BU Template", command=self._add_bu_template)
+        add_btn.pack(side="left", padx=(8, 0))
+        self._attach_hover_tooltip(
+            add_btn,
+            "Upload a Business Unit's base Word (.docx) form once - the app makes it fillable "
+            "automatically. Its template supplies the letterhead, address and layout.",
+        )
+
+    # ----------------------------------------------------- 2: employee id
+    def _build_employee_section(self, parent):
+        self._field_label(parent, "Employee ID", self._EMP_ROW_ID)
+        row = ttk.Frame(parent)
+        row.grid(row=self._EMP_ROW_ID, column=1, sticky="ew", pady=5)
         self.emp_id_var = tk.StringVar(value="")
         digits_only_vcmd = (self.register(self._validate_digits_only), "%P")
         emp_id_entry = ttk.Entry(
-            row, textvariable=self.emp_id_var, width=24,
-            validate="key", validatecommand=digits_only_vcmd,
+            row, textvariable=self.emp_id_var, width=22,
+            validate="key", validatecommand=digits_only_vcmd, font=("Segoe UI", 11),
         )
-        emp_id_entry.pack(side="left", padx=8)
+        emp_id_entry.pack(side="left")
         self.lookup_button = ttk.Button(row, text="Lookup (AD)", command=self._do_lookup)
-        self.lookup_button.pack(side="left", padx=4)
+        self.lookup_button.pack(side="left", padx=(8, 0))
         emp_id_entry.bind("<Return>", lambda e: self._do_lookup())
 
-        # Enhancement 7 (relocated) - checked automatically the moment an
-        # Employee ID is entered, right next to Lookup (AD), instead of a
-        # separate checkbox buried in Asset Details further down. If SSRS
-        # has a match it fills instantly (no network call - it's checked
-        # against the already-downloaded/cached report); if not, this just
-        # goes quiet and the normal Lookup (AD) button above still works
-        # exactly as before.
-        self.ssrs_check_label = ttk.Label(row, text="", foreground="#888")
-        self.ssrs_check_label.pack(side="left", padx=(10, 0))
+        # SSRS asset report result for this ID ("In SSRS report - type set
+        # to ..." / "Not in SSRS report - ...") - see _ssrs_check_current_id.
+        self.ssrs_check_label = ttk.Label(parent, text="", style="Muted.TLabel", wraplength=460)
+        self.ssrs_check_label.grid(row=self._EMP_ROW_SSRS, column=1, sticky="w", pady=(0, 6))
         self._ssrs_matched_record = None
         self._ssrs_check_after_id = None
-
-        result_box = ttk.LabelFrame(parent, text="Employee Details", padding=8)
-        result_box.pack(fill="x", pady=8)
 
         self.emp_name_var = tk.StringVar(value="")
         self.manager_name_var = tk.StringVar(value="")
         self._identity_lookup_source = "Manual"  # tracked for the audit log's Lookup Source column
 
-        ttk.Label(result_box, text="Employee Name:").grid(row=0, column=0, sticky="w", pady=4)
-        emp_name_entry = ttk.Entry(result_box, textvariable=self.emp_name_var, width=40)
-        emp_name_entry.grid(row=0, column=1, sticky="w", pady=4, padx=6)
+        self._field_label(parent, "Employee Name", self._EMP_ROW_NAME)
+        emp_name_entry = ttk.Entry(parent, textvariable=self.emp_name_var, width=40)
+        emp_name_entry.grid(row=self._EMP_ROW_NAME, column=1, sticky="ew", pady=5)
         self._bind_enter_advances_focus(emp_name_entry)
 
-        ttk.Label(result_box, text="Manager Name:").grid(row=1, column=0, sticky="w", pady=4)
-        manager_name_entry = ttk.Entry(result_box, textvariable=self.manager_name_var, width=40)
-        manager_name_entry.grid(row=1, column=1, sticky="w", pady=4, padx=6)
+        self._field_label(parent, "Manager Name", self._EMP_ROW_MANAGER)
+        manager_name_entry = ttk.Entry(parent, textvariable=self.manager_name_var, width=40)
+        manager_name_entry.grid(row=self._EMP_ROW_MANAGER, column=1, sticky="ew", pady=5)
         self._bind_enter_advances_focus(manager_name_entry)
 
-        self.manual_entry_hint = ttk.Label(result_box, text="", foreground="#a05a00", wraplength=620)
-        self.manual_entry_hint.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.manual_entry_hint = ttk.Label(parent, text="", foreground=self.UI_WARN, wraplength=460)
+        self.manual_entry_hint.grid(row=self._EMP_ROW_HINT, column=1, sticky="w", pady=(4, 0))
 
         def _refresh_save_path(*_a):
-            # No visible "Save to" field anymore (it always auto-saves to
-            # the Settings root folder + automatic subfolder/filename) -
-            # kept as a callable no-op since other code still calls it
-            # after things like a submission-type change.
+            # No visible "Save to" field (it always auto-saves) - kept as a
+            # callable no-op since other code still calls it.
             pass
 
         self._refresh_save_path = _refresh_save_path  # reused when submission type changes too
@@ -5942,6 +6433,7 @@ class WizardApp(tk.Tk):
                 self.ssrs_check_label.config(text="")
             return
         self._ssrs_check_current_id()
+        self._apply_tracit_report_to_current_serial()
         self._do_lookup(auto=True)
 
     # Kept under the old name - other code (and older call sites) still
@@ -6160,36 +6652,34 @@ class WizardApp(tk.Tk):
 
     # ----------------------------------------------------- 3: phone
     def _build_contact_section(self, parent):
-        ttk.Label(parent, text="Contact Number", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        row = ttk.Frame(parent)
-        row.pack(anchor="w", pady=(4, 0))
-        ttk.Label(row, text="Contact Number:").pack(side="left")
+        self._field_label(parent, "Contact Number", self._EMP_ROW_CONTACT)
         self.contact_var = tk.StringVar(value="")
-        contact_entry = ttk.Entry(row, textvariable=self.contact_var, width=24)
-        contact_entry.pack(side="left", padx=8)
+        contact_entry = ttk.Entry(parent, textvariable=self.contact_var, width=24)
+        contact_entry.grid(row=self._EMP_ROW_CONTACT, column=1, sticky="w", pady=5)
         self._bind_enter_advances_focus(contact_entry)
 
     # ------------------------------------------------- 4: submission type
     def _build_submission_type_section(self, parent):
-        ttk.Label(parent, text="Submission Type", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-
         all_types = self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
         self.submission_type_var = tk.StringVar(value="")
 
         box = ttk.Frame(parent)
-        box.pack(anchor="w")
+        box.pack(anchor="w", fill="x")
+        box.columnconfigure(0, weight=1, uniform="t")
+        box.columnconfigure(1, weight=1, uniform="t")
         for i, label in enumerate(all_types):
             ttk.Radiobutton(
                 box, text=label, value=label, variable=self.submission_type_var,
                 command=self._on_submission_type_changed,
-            ).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=4)
+            ).grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 12), pady=5)
 
-        self.submission_type_hint = ttk.Label(parent, text="", foreground="#a05a00")
-        self.submission_type_hint.pack(anchor="w", pady=(4, 0))
+        self.submission_type_hint = ttk.Label(parent, text="", foreground=self.UI_WARN, wraplength=420)
+        self.submission_type_hint.pack(anchor="w", pady=(8, 0))
 
     def _on_submission_type_changed(self):
         self.submission_type_hint.config(text="")
         self._rebuild_asset_details()
+        self._apply_tracit_report_to_current_serial()
         if hasattr(self, "_refresh_save_path"):
             self._refresh_save_path()  # picks up the per-submission-type subfolder
 
@@ -6201,7 +6691,6 @@ class WizardApp(tk.Tk):
 
         sub_type = self.submission_type_var.get()
 
-        ttk.Label(parent, text="Asset Details", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(6, 2))
 
         self.current_serial_var = tk.StringVar(value="")
         self.new_serial_var = tk.StringVar(value="")
@@ -6210,7 +6699,7 @@ class WizardApp(tk.Tk):
         self.asset_checkbox_vars = {}
 
         if not sub_type:
-            ttk.Label(parent, text="(select a submission type above)", foreground="#888").pack(anchor="w")
+            ttk.Label(parent, text="Select a submission type to see the asset fields.", style="Muted.TLabel").pack(anchor="w")
             return
 
         # The real production form always shows every asset field, for
@@ -6223,7 +6712,7 @@ class WizardApp(tk.Tk):
         if show_current_serial:
             row1 = ttk.Frame(parent)
             row1.pack(anchor="w", pady=4)
-            ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
+            ttk.Label(row1, text="Current Device Serial Number", width=34, style="FieldLabel.TLabel").pack(side="left")
             ttk.Entry(row1, textvariable=self.current_serial_var, width=30).pack(side="left", padx=8)
             if sub_type in self.config_data.get("tracit_submission_types", []):
                 self.tracit_fetch_button = ttk.Button(
@@ -6251,7 +6740,7 @@ class WizardApp(tk.Tk):
         if sub_type in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
             ssrs_row = ttk.Frame(parent)
             ssrs_row.pack(anchor="w", pady=(0, 4))
-            ttk.Label(ssrs_row, text="SSRS Report:", foreground="#666").pack(side="left")
+            ttk.Label(ssrs_row, text="SSRS Report", width=34, style="FieldLabel.TLabel").pack(side="left")
             self.ssrs_autofill_hint = ttk.Label(ssrs_row, text="", foreground="#888")
             self.ssrs_autofill_hint.pack(side="left", padx=(6, 0))
             # Auto-fill is checked automatically near the Employee ID field
@@ -6263,10 +6752,10 @@ class WizardApp(tk.Tk):
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
-        ttk.Label(row2, text="New Device Serial Number:").pack(side="left")
+        ttk.Label(row2, text="New Device Serial Number", width=34, style="FieldLabel.TLabel").pack(side="left")
         ttk.Entry(row2, textvariable=self.new_serial_var, width=30).pack(side="left", padx=8)
 
-        ttk.Label(parent, text="List of Assets Issued/Return:").pack(anchor="w", pady=(14, 2))
+        ttk.Label(parent, text="Assets Issued / Returned", style="FieldLabel.TLabel").pack(anchor="w", pady=(14, 4))
         checklist_frame = ttk.Frame(parent)
         checklist_frame.pack(anchor="w")
         items = self.config_data.get("asset_checklist_items", [])
@@ -6279,12 +6768,12 @@ class WizardApp(tk.Tk):
 
         row3 = ttk.Frame(parent)
         row3.pack(anchor="w", pady=(10, 4))
-        ttk.Label(row3, text="Others (specify):").pack(side="left")
+        ttk.Label(row3, text="Others (specify)", width=34, style="FieldLabel.TLabel").pack(side="left")
         ttk.Entry(row3, textvariable=self.assets_other_var, width=40).pack(side="left", padx=8)
 
         row4 = ttk.Frame(parent)
         row4.pack(anchor="w", pady=4)
-        ttk.Label(row4, text="Asset Pending for Submission (if any):").pack(side="left")
+        ttk.Label(row4, text="Asset Pending for Submission (if any)", width=34, style="FieldLabel.TLabel").pack(side="left")
         ttk.Entry(row4, textvariable=self.asset_pending_var, width=40).pack(side="left", padx=8)
 
     @staticmethod
@@ -6308,16 +6797,12 @@ class WizardApp(tk.Tk):
 
     # ---------------------------------------------- 6/7: signatures
     def _build_signature_section(self, parent, data_key, title, capture_title):
-        ttk.Label(parent, text=title, font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(
-            parent,
-            text="Captured by this app (Topaz pad if enabled, otherwise on-screen) and "
-            "cryptographically signed into the final PDF - no Adobe Acrobat needed.",
-            wraplength=320, foreground="#555",
-        ).pack(anchor="w", pady=(4, 10))
-
-        preview_label = ttk.Label(parent, text="(not signed yet)", relief="groove", width=40, anchor="center")
-        preview_label.pack(pady=(0, 10))
+        ttk.Label(parent, text=title, style="FieldLabel.TLabel", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        preview_label = tk.Label(parent, text="Not signed yet", width=40, height=6, anchor="center",
+                                 background="#F9FAFB", foreground="#9CA3AF",
+                                 highlightthickness=1, highlightbackground=self.UI_BORDER,
+                                 font=("Segoe UI", 9))
+        preview_label.pack(anchor="w", pady=(6, 8))
         setattr(self, f"_preview_label_{data_key}", preview_label)
 
         def show_preview(path):
@@ -6337,7 +6822,7 @@ class WizardApp(tk.Tk):
                 photo = ImageTk.PhotoImage(img)
                 self._sig_preview_image[data_key] = photo  # keep a reference alive
                 preview_label.image = photo  # belt-and-suspenders against GC
-                preview_label.config(image=photo, text="", compound="image")
+                preview_label.config(image=photo, text="", compound="image", width=0, height=0)
             except Exception:
                 logger.exception("Signature preview: could not render thumbnail for %s (%s)", data_key, path)
                 preview_label.config(text="(signature captured)")
@@ -6353,7 +6838,7 @@ class WizardApp(tk.Tk):
                 show_preview(path)
                 self.status_var.set(f"{title.split('. ', 1)[-1]} captured.")
 
-        ttk.Button(parent, text="Sign Now...", command=sign_now).pack()
+        ttk.Button(parent, text="✍  Sign Now", command=sign_now).pack(anchor="w")
 
     def _reset_signature_previews(self):
         for key in ("employee_signature_path", "asset_receiver_signature_path"):
@@ -6361,7 +6846,7 @@ class WizardApp(tk.Tk):
             self._sig_preview_image.pop(key, None)
             label = getattr(self, f"_preview_label_{key}", None)
             if label is not None:
-                label.config(image="", text="(not signed yet)")
+                label.config(image="", text="Not signed yet", width=40, height=6)
 
     # ------------------------------------------------- save location
     def _compute_default_output_path(self):
@@ -6775,100 +7260,259 @@ class WizardApp(tk.Tk):
         self.batch_queue = []
         self._batch_active_index = None
         self._batch_auto_advance = False
+        self._batch_prefill_token = 0
 
-        ttk.Label(tab, text="Bulk Batch Processing", font=("Segoe UI", 13, "bold")).pack(
-            anchor="w", padx=16, pady=(14, 2)
-        )
-        ttk.Label(
-            tab,
-            text="Import an Excel list of people, then process them one at a time - in any order you like. "
-            "Each row's status updates live as you go.",
-            foreground="#666", wraplength=880,
-        ).pack(anchor="w", padx=16, pady=(0, 10))
+        page = ttk.Frame(tab, style="Page.TFrame", padding=(18, 14, 18, 12))
+        page.pack(fill="both", expand=True)
 
-        toolbar = ttk.Frame(tab, padding=(16, 0))
-        toolbar.pack(fill="x")
-        ttk.Label(toolbar, text="Business Unit (default for this batch):").pack(side="left")
+        # ---- 1. Load people
+        load_card, load_body = self._card(page, "Load people", padding=14)
+        load_card.pack(fill="x")
+        row1 = ttk.Frame(load_body)
+        row1.pack(fill="x")
+        ttk.Button(row1, text="Paste Employee IDs…", style="Primary.TButton",
+                   command=self._batch_paste_ids_dialog).pack(side="left")
+        ttk.Button(row1, text="Import from Excel…", command=self._batch_import_excel).pack(side="left", padx=(8, 0))
+        ttk.Button(row1, text="Excel Template", command=self._batch_download_template).pack(side="left", padx=(8, 0))
+        ttk.Label(row1, text="Business Unit", style="FieldLabel.TLabel").pack(side="left", padx=(28, 8))
         self.bulk_bu_var = tk.StringVar(value="")
         self.bulk_bu_combo = ttk.Combobox(
-            toolbar, textvariable=self.bulk_bu_var,
-            values=[t["name"] for t in self._bu_templates_cache], state="readonly", width=30,
+            row1, textvariable=self.bulk_bu_var,
+            values=[t["name"] for t in self._bu_templates_cache], state="readonly", width=28,
         )
-        self.bulk_bu_combo.pack(side="left", padx=8)
+        self.bulk_bu_combo.pack(side="left")
         self.bulk_bu_combo.bind("<<ComboboxSelected>>", self._batch_on_default_bu_changed)
-        ttk.Button(toolbar, text="Add New BU Template...", command=self._add_bu_template).pack(side="left", padx=(10, 0))
+        ttk.Button(row1, text="+ Add BU Template", command=self._add_bu_template).pack(side="left", padx=(8, 0))
         ttk.Label(
-            toolbar, text="(a person's own 'Business Unit' column in the Excel file overrides this)",
-            foreground="#888",
-        ).pack(side="left", padx=10)
+            load_body,
+            text="Just paste Employee IDs: name & manager come from Active Directory, type & new serial "
+                 "from the SSRS report, current laptop serial from the TracIT report.",
+            style="Muted.TLabel", wraplength=1100,
+        ).pack(anchor="w", pady=(10, 0))
 
-        import_row = ttk.Frame(tab, padding=(16, 10, 16, 4))
-        import_row.pack(fill="x")
-        ttk.Button(import_row, text="Import Batch from Excel...", command=self._batch_import_excel).pack(side="left")
-        ttk.Button(import_row, text="Download Excel Template...", command=self._batch_download_template).pack(
-            side="left", padx=10
-        )
-        ttk.Label(
-            import_row, text="New to this? Download the template, fill it in, then import it.",
-            foreground="#555",
-        ).pack(side="left", padx=10)
+        # ---- 2. People list (top) / person being processed (bottom), resizable
+        panes = ttk.Panedwindow(page, orient="vertical")
+        panes.pack(fill="both", expand=True, pady=(14, 0))
 
-        summary_row = ttk.Frame(tab, padding=(16, 4, 16, 8))
-        summary_row.pack(fill="x")
+        list_card, list_body = self._card(panes, padding=12)
+        panes.add(list_card, weight=2)
+
+        summary_row = ttk.Frame(list_body)
+        summary_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(summary_row, text="People", style="CardTitle.TLabel").pack(side="left")
         self.batch_summary_var = tk.StringVar(value="No batch loaded yet.")
-        ttk.Label(summary_row, textvariable=self.batch_summary_var, font=("Segoe UI", 10, "bold")).pack(side="left")
-        self.process_all_button = ttk.Button(summary_row, text="Process All (auto-advance)", command=self._batch_process_all)
+        ttk.Label(summary_row, textvariable=self.batch_summary_var, style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        self.process_all_button = ttk.Button(summary_row, text="▶  Process All", style="Primary.TButton",
+                                             command=self._batch_process_all)
         self.process_all_button.pack(side="right")
-        self.stop_auto_button = ttk.Button(summary_row, text="Stop Auto-Advance", command=self._batch_stop_auto)
+        self.stop_auto_button = ttk.Button(summary_row, text="■  Stop Auto-Advance", command=self._batch_stop_auto)
 
-        list_frame = ttk.Frame(tab, padding=(16, 0, 16, 4))
-        list_frame.pack(fill="both", expand=False)
-        columns = ("row", "emp_id", "name", "manager", "type", "serial", "status")
-        headers = {"row": "Row", "emp_id": "Employee ID", "name": "Name", "manager": "Manager",
-                   "type": "Type", "serial": "Laptop Serial", "status": "Status"}
-        widths = {"row": 45, "emp_id": 100, "name": 160, "manager": 150, "type": 110, "serial": 110, "status": 130}
-        self.batch_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=9)
+        list_frame = ttk.Frame(list_body)
+        list_frame.pack(fill="both", expand=True)
+        columns = ("row", "emp_id", "name", "manager", "type", "serial", "new_serial", "status")
+        headers = {"row": "#", "emp_id": "Employee ID", "name": "Name", "manager": "Manager",
+                   "type": "Type", "serial": "Current Serial", "new_serial": "New Serial", "status": "Status"}
+        widths = {"row": 40, "emp_id": 105, "name": 190, "manager": 180, "type": 120,
+                  "serial": 130, "new_serial": 130, "status": 130}
+        self.batch_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=7)
         for c in columns:
             self.batch_tree.heading(c, text=headers[c])
-            self.batch_tree.column(c, width=widths[c], anchor="w")
+            self.batch_tree.column(c, width=widths[c], anchor="w", stretch=c in ("name", "manager"))
         vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.batch_tree.yview)
         self.batch_tree.configure(yscrollcommand=vsb.set)
         self.batch_tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         self.batch_tree.bind("<Double-1>", lambda e: self._batch_process_selected())
-        self.batch_tree.tag_configure("completed", background="#dff0d8")
-        self.batch_tree.tag_configure("skipped", background="#eeeeee", foreground="#777777")
-        self.batch_tree.tag_configure("attention", background="#fff3cd")
+        self.batch_tree.tag_configure("completed", background="#E7F5EC")
+        self.batch_tree.tag_configure("skipped", background="#F3F4F6", foreground="#9CA3AF")
+        self.batch_tree.tag_configure("attention", background="#FFF6E0")
         self.batch_tree.tag_configure("pending", background="white")
-        self.batch_tree.tag_configure("active", background="#cfe2ff")
+        self.batch_tree.tag_configure("active", background="#E8F0FE")
 
-        row_btns = ttk.Frame(tab, padding=(16, 0, 16, 8))
-        row_btns.pack(fill="x")
+        row_btns = ttk.Frame(list_body)
+        row_btns.pack(fill="x", pady=(8, 0))
         ttk.Button(row_btns, text="Process Selected", command=self._batch_process_selected).pack(side="left")
-        ttk.Button(row_btns, text="Skip Selected", command=self._batch_skip_selected).pack(side="left", padx=10)
-        ttk.Button(row_btns, text="Requeue Selected", command=self._batch_requeue_selected).pack(side="left")
-        ttk.Label(
-            row_btns,
-            text="Tip: double-click any row to process that person now - or Skip and come back to them later.",
-            foreground="#888",
-        ).pack(side="left", padx=14)
+        ttk.Button(row_btns, text="Skip", command=self._batch_skip_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(row_btns, text="Requeue", command=self._batch_requeue_selected).pack(side="left", padx=(8, 0))
+        ttk.Label(row_btns, text="Tip: double-click a row to process that person now.",
+                  style="Muted.TLabel").pack(side="left", padx=14)
 
-        ttk.Separator(tab).pack(fill="x", padx=16, pady=(4, 0))
-
-        panel_container = ttk.Frame(tab)
-        panel_container.pack(fill="both", expand=True)
-        self.batch_panel_content = self._make_scrollable(panel_container)
+        panel_card, panel_body = self._card(panes, padding=0)
+        panes.add(panel_card, weight=3)
+        self.batch_panel_content = self._make_scrollable(panel_body, style="TFrame", padding=(16, 14))
 
         self.batch_placeholder = ttk.Label(
             self.batch_panel_content,
-            text="Select a person from the list above (double-click a row), or click "
-            "'Process All (auto-advance)' to begin.",
-            foreground="#888",
+            text="Double-click a person in the list above, or click  ▶ Process All  to begin.",
+            style="Muted.TLabel",
         )
         self.batch_placeholder.pack(anchor="w", pady=20)
         self.batch_person_frame = ttk.Frame(self.batch_panel_content)
 
         self._batch_refresh_tree()
+
+    # ---------------------------------------------------------- paste IDs
+    AUTO_TYPE_LABEL = "Auto-detect from SSRS report"
+
+    def _batch_paste_ids_dialog(self):
+        """Paste a list of Employee IDs (one per line, or comma/space/tab
+        separated, straight from Excel or an email) - no Excel template
+        needed. Everything else is collected automatically."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Paste Employee IDs")
+        dlg.transient(self)
+        dlg.configure(background=self.UI_SURFACE)
+        dlg.geometry("600x600")
+        dlg.minsize(520, 480)
+        frm = ttk.Frame(dlg, padding=18)
+        frm.pack(fill="both", expand=True)
+
+        # Buttons are packed FIRST at the bottom so they can never be pushed
+        # off-screen by the text box on a small/scaled display.
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", fill="x", pady=(16, 0))
+
+        ttk.Label(frm, text="Paste Employee IDs", style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(frm, text="One per line, or separated by commas/spaces - copy a column straight from Excel.",
+                  style="Muted.TLabel", wraplength=540).pack(anchor="w", pady=(2, 10))
+
+        text_frame = ttk.Frame(frm)
+        text_frame.pack(fill="both", expand=True)
+        text = tk.Text(text_frame, height=12, wrap="word", relief="flat", font=("Consolas", 11),
+                       highlightthickness=1, highlightbackground=self.UI_BORDER,
+                       highlightcolor=self.UI_ACCENT, padx=8, pady=6)
+        tsb = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=tsb.set)
+        text.pack(side="left", fill="both", expand=True)
+        tsb.pack(side="right", fill="y")
+        text.focus_set()
+
+        count_var = tk.StringVar(value="0 Employee IDs found")
+        ttk.Label(frm, textvariable=count_var, style="Muted.TLabel").pack(anchor="w", pady=(6, 12))
+
+        type_row = ttk.Frame(frm)
+        type_row.pack(fill="x")
+        ttk.Label(type_row, text="Submission type", style="FieldLabel.TLabel").pack(side="left")
+        all_types = self.config_data.get("submission_type_row1", []) + self.config_data.get("submission_type_row2", [])
+        type_var = tk.StringVar(value=self.AUTO_TYPE_LABEL)
+        ttk.Combobox(type_row, textvariable=type_var, values=[self.AUTO_TYPE_LABEL] + all_types,
+                     state="readonly", width=32).pack(side="left", padx=(10, 0))
+        ttk.Label(
+            frm,
+            text="Auto-detect: people in the SSRS report get their type from it (New Hire, Break Fix, "
+                 "Mixed Build, Site Transfer...); anyone not in it is flagged so you can pick. "
+                 "For a list of exits, choose LWD - their laptop serials come from the TracIT report.",
+            style="Muted.TLabel", wraplength=540,
+        ).pack(anchor="w", pady=(8, 0))
+
+        def ids():
+            return _parse_pasted_employee_ids(text.get("1.0", "end"))
+
+        def update_count(_e=None):
+            n = len(ids())
+            count_var.set(f"{n} Employee ID{'s' if n != 1 else ''} found")
+        text.bind("<KeyRelease>", update_count)
+        text.bind("<<Paste>>", lambda e: dlg.after(50, update_count))
+
+        def do_load():
+            found = ids()
+            if not found:
+                messagebox.showwarning("No Employee IDs", "Paste at least one Employee ID (digits).", parent=dlg)
+                return
+            if self.batch_queue and any(it["status"] != "Completed" for it in self.batch_queue):
+                if not messagebox.askyesno("Replace current list?",
+                                           "This replaces the people currently in the list. Continue?",
+                                           parent=dlg):
+                    return
+            chosen = type_var.get()
+            dlg.destroy()
+            self._batch_load_pasted_ids(found, None if chosen == self.AUTO_TYPE_LABEL else chosen)
+
+        ttk.Button(btns, text="Load People", style="Primary.TButton", command=do_load).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="right", padx=(0, 8))
+        dlg.grab_set()
+
+    def _batch_load_pasted_ids(self, emp_ids, fixed_type=None):
+        """Builds the bulk list from bare Employee IDs, fills in everything
+        that's instant right away (SSRS type/new serial, TracIT laptop
+        serial), then looks names/managers up in AD in the background."""
+        queue = []
+        for n, emp_id in enumerate(emp_ids, start=1):
+            item = {
+                "employee_id": emp_id, "type": fixed_type or "", "type_recognized": bool(fixed_type),
+                "employee_name": None, "manager_name": None, "contact_number": None,
+                "business_unit": None, "last_working_date": None, "laptop_serial_number": None,
+                "row_number": n, "status": "Pending", "_source": "paste",
+            }
+            self._batch_enrich_item_from_reports(item)
+            if not item["type"]:
+                item["status"] = "Needs Attention"
+            queue.append(item)
+        self.batch_queue = queue
+        self._batch_active_index = None
+        self._batch_auto_advance = False
+        self._batch_clear_panel()
+        self._batch_refresh_tree()
+        self._batch_prefill_names_async()
+
+    def _batch_enrich_item_from_reports(self, item):
+        """SSRS (type + new serial) and TracIT report (current laptop
+        serial) for one bulk row - both in-memory, instant."""
+        record = _ssrs_find_record(self.ssrs_state, item["employee_id"])
+        if record:
+            item["_ssrs_record"] = record
+            if not item.get("type_recognized"):
+                sub_type = _ssrs_submission_type_for(self.config_data, record)
+                if sub_type:
+                    item["type"], item["type_recognized"] = sub_type, True
+        item["_ssrs_status"] = "Matched" if record else "Not Found"
+        rec = tracit_find_laptop(self.tracit_report_state, item["employee_id"],
+                                 self.config_data.get("tracit_report", {}))
+        if rec:
+            item["_tracit_serial"] = rec["serial"]
+
+    def _batch_prefill_names_async(self):
+        """Looks up every row's name + manager in AD in the background, so
+        the list fills in on its own while the operator starts working.
+        A newer paste/import cancels an older run (token check)."""
+        self._batch_prefill_token += 1
+        token = self._batch_prefill_token
+        todo = [(i, it["employee_id"]) for i, it in enumerate(self.batch_queue) if not it.get("employee_name")]
+        if not todo:
+            return
+        total = len(todo)
+
+        def worker():
+            for done, (index, emp_id) in enumerate(todo, start=1):
+                if token != self._batch_prefill_token:
+                    return
+                try:
+                    candidates = lookup_ad_candidates(emp_id, self.config_data, self.browser_session)
+                except Exception:
+                    logger.debug("Bulk prefill: AD lookup failed for %r", emp_id, exc_info=True)
+                    candidates = None
+                self.after(0, self._batch_on_prefill_result, token, index, emp_id, candidates, done, total)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _batch_on_prefill_result(self, token, index, emp_id, candidates, done, total):
+        if token != self._batch_prefill_token or index >= len(self.batch_queue):
+            return
+        item = self.batch_queue[index]
+        if item["employee_id"] != emp_id:
+            return
+        if candidates and len(candidates) == 1 and not item.get("employee_name"):
+            item["employee_name"] = candidates[0].get("emp_name") or None
+            item["manager_name"] = candidates[0].get("manager_name") or None
+            item["_lookup_source"] = "AD"
+            if index == self._batch_active_index and hasattr(self, "b_emp_name_var"):
+                if not self.b_emp_name_var.get().strip():
+                    self.b_emp_name_var.set(item["employee_name"] or "")
+                if not self.b_manager_name_var.get().strip():
+                    self.b_manager_name_var.set(item["manager_name"] or "")
+        self._batch_refresh_tree()
+        if done < total:
+            self.batch_summary_var.set(self.batch_summary_var.get() + f"   ·   looking up names {done}/{total}…")
 
     # =====================================================================
     # GENERATED DOCUMENTS TAB (Enhancement 15) - a read-only, searchable
@@ -6877,41 +7521,42 @@ class WizardApp(tk.Tk):
     # =====================================================================
     def _build_history_tab_shell(self):
         tab = self.history_tab
-        ttk.Label(tab, text="Generated Documents", font=("Segoe UI", 13, "bold")).pack(
-            anchor="w", padx=16, pady=(14, 2)
-        )
-        ttk.Label(
-            tab,
-            text="Every PDF this app has generated on this machine, newest first.",
-            foreground="#666",
-        ).pack(anchor="w", padx=16, pady=(0, 10))
+        page = ttk.Frame(tab, style="Page.TFrame", padding=(18, 14, 18, 12))
+        page.pack(fill="both", expand=True)
 
-        toolbar = ttk.Frame(tab)
-        toolbar.pack(fill="x", padx=16, pady=(0, 8))
-        ttk.Label(toolbar, text="Search:").pack(side="left")
+        card, body = self._card(page, "Generated Documents",
+                                "Every PDF this app has generated on this machine, newest first")
+        card.pack(fill="both", expand=True)
+
+        toolbar = ttk.Frame(body)
+        toolbar.pack(fill="x", pady=(0, 10))
+        ttk.Label(toolbar, text="Search", style="FieldLabel.TLabel").pack(side="left")
         self.history_search_var = tk.StringVar(value="")
-        search_entry = ttk.Entry(toolbar, textvariable=self.history_search_var, width=30)
-        search_entry.pack(side="left", padx=6)
+        search_entry = ttk.Entry(toolbar, textvariable=self.history_search_var, width=34)
+        search_entry.pack(side="left", padx=(8, 0))
         search_entry.bind("<KeyRelease>", lambda e: self._history_refresh())
-        ttk.Button(toolbar, text="Refresh", command=self._history_refresh).pack(side="left", padx=(6, 0))
+        ttk.Button(toolbar, text="⟳  Refresh", command=self._history_refresh).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Open Folder", command=self._history_open_folder).pack(side="right")
+        ttk.Button(toolbar, text="Open PDF", style="Primary.TButton",
+                   command=self._history_open_pdf).pack(side="right", padx=(0, 8))
 
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill="both", expand=True)
         columns = ("employee_id", "submission_type", "timestamp", "pdf_location")
-        self.history_tree = ttk.Treeview(tab, columns=columns, show="headings", height=16)
+        self.history_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=16)
         self.history_tree.heading("employee_id", text="Employee ID")
         self.history_tree.heading("submission_type", text="Submission Type")
-        self.history_tree.heading("timestamp", text="Generated Date")
+        self.history_tree.heading("timestamp", text="Generated")
         self.history_tree.heading("pdf_location", text="PDF Location")
-        self.history_tree.column("employee_id", width=110, anchor="w")
-        self.history_tree.column("submission_type", width=140, anchor="w")
-        self.history_tree.column("timestamp", width=150, anchor="w")
-        self.history_tree.column("pdf_location", width=420, anchor="w")
-        self.history_tree.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-        self._register_scrollable_canvas(self.history_tree)  # same global mousewheel dispatcher
-
-        action_row = ttk.Frame(tab)
-        action_row.pack(anchor="w", padx=16, pady=(0, 14))
-        ttk.Button(action_row, text="Open PDF", command=self._history_open_pdf).pack(side="left")
-        ttk.Button(action_row, text="Open Folder", command=self._history_open_folder).pack(side="left", padx=8)
+        self.history_tree.column("employee_id", width=120, anchor="w", stretch=False)
+        self.history_tree.column("submission_type", width=150, anchor="w", stretch=False)
+        self.history_tree.column("timestamp", width=170, anchor="w", stretch=False)
+        self.history_tree.column("pdf_location", width=520, anchor="w", stretch=True)
+        hsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=hsb.set)
+        self.history_tree.pack(side="left", fill="both", expand=True)
+        hsb.pack(side="right", fill="y")
+        self.history_tree.bind("<Double-1>", lambda e: self._history_open_pdf())
 
         self._history_refresh()
 
@@ -6995,6 +7640,7 @@ class WizardApp(tk.Tk):
             return  # cancelled - nothing added
 
         for item in queue:
+            self._batch_enrich_item_from_reports(item)  # Excel's own Type still wins
             if not item["type_recognized"]:
                 item["status"] = "Needs Attention"
 
@@ -7003,6 +7649,7 @@ class WizardApp(tk.Tk):
         self._batch_auto_advance = False
         self._batch_clear_panel()
         self._batch_refresh_tree()
+        self._batch_prefill_names_async()
         messagebox.showinfo(
             "Batch loaded",
             f"{len(queue)} people added to the list below. Pick a Business Unit above, then click "
@@ -7039,10 +7686,17 @@ class WizardApp(tk.Tk):
             }.get(item["status"], "pending")
             if i == self._batch_active_index:
                 tag = "active"
+            excel_serial = item.get("laptop_serial_number") or ""
+            is_new_hire = item.get("type") in self.config_data.get("no_current_asset_submission_types", [])
+            serial = ("" if is_new_hire else excel_serial) or item.get("_tracit_serial") or ""
+            new_serial = (excel_serial if is_new_hire else "") or \
+                (item.get("_ssrs_record") or {}).get("serial_number") or ""
+            type_text = item.get("type") if item.get("type_recognized") else (
+                f"{item['type']} (?)" if item.get("type") else "— pick type —")
+            name_text = item.get("employee_name") or ("looking up…" if item.get("_source") == "paste" else "")
             self.batch_tree.insert("", "end", iid=str(i), values=(
-                item["row_number"], item["employee_id"], item.get("employee_name") or "",
-                item.get("manager_name") or "", item.get("type") or "",
-                item.get("laptop_serial_number") or "", item["status"],
+                item["row_number"], item["employee_id"], name_text,
+                item.get("manager_name") or "", type_text, serial, new_serial, item["status"],
             ), tags=(tag,))
 
         total = len(self.batch_queue)
@@ -7159,12 +7813,11 @@ class WizardApp(tk.Tk):
 
         parent = self.batch_person_frame
         ttk.Label(
-            parent, text=f"Now Processing: {item.get('employee_name') or '(looking up...)'}   -   ID {item['employee_id']}",
-            font=("Segoe UI", 12, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
-        ttk.Label(parent, text=f"Row {item['row_number']} in the imported file.", foreground="#666").pack(
-            anchor="w", pady=(0, 14)
-        )
+            parent, text=f"Now processing  ·  {item.get('employee_name') or 'looking up…'}",
+            style="CardTitle.TLabel",
+        ).pack(anchor="w", pady=(0, 2))
+        ttk.Label(parent, text=f"Employee ID {item['employee_id']}   ·   #{item['row_number']} in the list",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
 
         bu_match = self._batch_resolve_bu(item)
         bu_row = ttk.Frame(parent)
@@ -7178,7 +7831,7 @@ class WizardApp(tk.Tk):
 
         ttk.Separator(parent).pack(fill="x", pady=10)
 
-        details_box = ttk.LabelFrame(parent, text="Employee Details", padding=10)
+        details_box = ttk.LabelFrame(parent, text="EMPLOYEE", padding=10)
         details_box.pack(fill="x", pady=(0, 12))
         self.b_emp_name_var = tk.StringVar(value=item.get("employee_name") or "")
         self.b_manager_name_var = tk.StringVar(value=item.get("manager_name") or "")
@@ -7216,8 +7869,7 @@ class WizardApp(tk.Tk):
             ).grid(row=i // 3, column=i % 3, sticky="w", padx=10, pady=4)
         self.b_type_hint = ttk.Label(
             parent,
-            text="" if item.get("type_recognized")
-            else f"Type '{item.get('type')}' from the file wasn't recognized - please pick one above.",
+            text="" if item.get("type_recognized") else self._batch_type_needed_text(item),
             foreground="#a05a00",
         )
         self.b_type_hint.pack(anchor="w", pady=(4, 10))
@@ -7252,7 +7904,8 @@ class WizardApp(tk.Tk):
 
         action_row = ttk.Frame(parent)
         action_row.pack(anchor="w", pady=(4, 20))
-        ttk.Button(action_row, text="Save & Mark Complete", command=self._batch_save_and_complete).pack(side="left")
+        ttk.Button(action_row, text="Save & Mark Complete", style="Primary.TButton",
+                   command=self._batch_save_and_complete).pack(side="left")
         ttk.Button(action_row, text="Skip This Person", command=self._batch_skip_active).pack(side="left", padx=10)
         ttk.Button(action_row, text="Cancel", command=self._batch_cancel_active).pack(side="left")
 
@@ -7409,7 +8062,7 @@ class WizardApp(tk.Tk):
         self.b_asset_checkbox_vars = {}
 
         if not sub_type:
-            ttk.Label(parent, text="(select a submission type above)", foreground="#888").pack(anchor="w")
+            ttk.Label(parent, text="Select a submission type to see the asset fields.", style="Muted.TLabel").pack(anchor="w")
             return
 
         prefill_note = " (from the imported file - check it, then edit if needed)" if known_serial else ""
@@ -7417,7 +8070,7 @@ class WizardApp(tk.Tk):
         if show_current_serial:
             row1 = ttk.Frame(parent)
             row1.pack(anchor="w", pady=4)
-            ttk.Label(row1, text="Current Device Serial Number:").pack(side="left")
+            ttk.Label(row1, text="Current Device Serial Number", width=34, style="FieldLabel.TLabel").pack(side="left")
             ttk.Entry(row1, textvariable=self.b_current_serial_var, width=30).pack(side="left", padx=8)
             if sub_type in self.config_data.get("tracit_submission_types", []):
                 self.b_tracit_fetch_button = ttk.Button(
@@ -7434,6 +8087,21 @@ class WizardApp(tk.Tk):
             if prefill_note:
                 ttk.Label(row1, text=prefill_note, foreground="#888").pack(side="left")
 
+        # LWD / Contractor LWD / Break Fix: current laptop serial straight
+        # from the downloaded TracIT report (unless the Excel file already
+        # gave one).
+        if show_current_serial and not known_serial and \
+                sub_type in self.config_data.get("tracit_submission_types", []):
+            rec = tracit_find_laptop(self.tracit_report_state, active_emp_id,
+                                     self.config_data.get("tracit_report", {}))
+            hint = getattr(self, "b_tracit_fetch_hint", None)
+            if rec:
+                self.b_current_serial_var.set(rec["serial"])
+                if hint is not None:
+                    hint.config(text="Filled from TracIT report.", foreground="#1a7f37")
+            elif hint is not None and self.tracit_report_state.get("records"):
+                hint.config(text="Not in TracIT report - Fetch from TracIT or type it.", foreground="#a05a00")
+
         # Enhancement 7 (relocated) - same automatic SSRS check as the
         # single-tab form; matching is done as soon as the row loads (see
         # _batch_try_ssrs_autofill_identity), this just re-displays/
@@ -7442,7 +8110,7 @@ class WizardApp(tk.Tk):
         if sub_type in self.config_data.get("ssrs_asset_report", {}).get("new_hire_submission_types", []):
             ssrs_row = ttk.Frame(parent)
             ssrs_row.pack(anchor="w", pady=(0, 4))
-            ttk.Label(ssrs_row, text="SSRS Report:", foreground="#666").pack(side="left")
+            ttk.Label(ssrs_row, text="SSRS Report", width=34, style="FieldLabel.TLabel").pack(side="left")
             self.b_ssrs_autofill_hint = ttk.Label(ssrs_row, text="", foreground="#888")
             self.b_ssrs_autofill_hint.pack(side="left", padx=(6, 0))
             cached_record = None
@@ -7453,10 +8121,10 @@ class WizardApp(tk.Tk):
 
         row2 = ttk.Frame(parent)
         row2.pack(anchor="w", pady=4)
-        ttk.Label(row2, text="New Device Serial Number:").pack(side="left")
+        ttk.Label(row2, text="New Device Serial Number", width=34, style="FieldLabel.TLabel").pack(side="left")
         ttk.Entry(row2, textvariable=self.b_new_serial_var, width=30).pack(side="left", padx=8)
 
-        ttk.Label(parent, text="List of Assets Issued/Return:").pack(anchor="w", pady=(14, 2))
+        ttk.Label(parent, text="Assets Issued / Returned", style="FieldLabel.TLabel").pack(anchor="w", pady=(14, 4))
         checklist_frame = ttk.Frame(parent)
         checklist_frame.pack(anchor="w")
         items = self.config_data.get("asset_checklist_items", [])
@@ -7469,12 +8137,12 @@ class WizardApp(tk.Tk):
 
         row3 = ttk.Frame(parent)
         row3.pack(anchor="w", pady=(10, 4))
-        ttk.Label(row3, text="Others (specify):").pack(side="left")
+        ttk.Label(row3, text="Others (specify)", width=34, style="FieldLabel.TLabel").pack(side="left")
         ttk.Entry(row3, textvariable=self.b_assets_other_var, width=40).pack(side="left", padx=8)
 
         row4 = ttk.Frame(parent)
         row4.pack(anchor="w", pady=4)
-        ttk.Label(row4, text="Asset Pending for Submission (if any):").pack(side="left")
+        ttk.Label(row4, text="Asset Pending for Submission (if any)", width=34, style="FieldLabel.TLabel").pack(side="left")
         ttk.Entry(row4, textvariable=self.b_asset_pending_var, width=40).pack(side="left", padx=8)
 
     def _batch_build_signature_widget(self, parent, data_key, title, capture_title):
@@ -7582,19 +8250,42 @@ class WizardApp(tk.Tk):
     def _batch_mark_needs_attention(self, message):
         index = self._batch_active_index
         self.batch_queue[index]["status"] = "Needs Attention"
+        self.batch_queue[index]["_needs_identity"] = True
         self.batch_queue[index]["_lookup_source"] = "Manual"
         self.b_identity_hint.config(text=message)
         self.status_var.set(f"Batch: {message}")
         self._batch_refresh_tree()
+
+    @staticmethod
+    def _batch_type_needed_text(item):
+        if item.get("type"):
+            return f"Type '{item.get('type')}' from the file wasn't recognized - please pick one above."
+        return "Not in the SSRS report - please pick the submission type above."
+
+    def _batch_reenrich_from_reports(self):
+        """A report finished (re)loading after people were already in the
+        bulk list - fill in whatever it can for rows still missing a type
+        or laptop serial."""
+        if not getattr(self, "batch_queue", None):
+            return
+        changed = False
+        for item in self.batch_queue:
+            if item["status"] in ("Completed", "Skipped"):
+                continue
+            before = (item.get("type"), item.get("_tracit_serial"), item.get("_ssrs_record"))
+            self._batch_enrich_item_from_reports(item)
+            if item.get("type_recognized") and item["status"] == "Needs Attention" and not item.get("_needs_identity"):
+                item["status"] = "Pending"
+            changed |= before != (item.get("type"), item.get("_tracit_serial"), item.get("_ssrs_record"))
+        if changed:
+            self._batch_refresh_tree()
 
     def _batch_check_identity_resolved(self):
         index = self._batch_active_index
         item = self.batch_queue[index]
         if not self.b_submission_type_var.get():
             item["status"] = "Needs Attention"
-            self.b_type_hint.config(
-                text=f"Type '{item.get('type')}' from the file wasn't recognized - please pick one above."
-            )
+            self.b_type_hint.config(text=self._batch_type_needed_text(item))
         elif item["status"] not in ("Completed", "Skipped"):
             item["status"] = "Pending"
         self._batch_refresh_tree()
