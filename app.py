@@ -3083,6 +3083,274 @@ def _replace_sdt_content(xml, tag, new_inner_xml, required=True):
     return xml[: m.start()] + m.group(1) + new_inner_xml + m.group(2) + xml[m.end():]
 
 
+# ----------------------------------------------------------------------
+# FIXED-WIDTH FILLING (keeps the form's second-column labels in place)
+#
+# The real BU form puts two fields on one line, e.g.
+#     Emp Name: ________________          Contact Number: ________
+# with plain spaces between them. When a blank was replaced by the value,
+# everything after it on that line slid left or right with the value's
+# length - e.g. a short name pulled "Contact Number:" left, a long manager
+# name pushed "Last Working Date:" right (measured: up to ~70pt).
+# fill_docx now makes each value take up exactly the width of the
+# underscore blank it replaces: shorter values are padded with spaces,
+# longer ones are shrunk slightly to fit. Widths are measured with the
+# document's real font (Calibri etc. from C:\Windows\Fonts) via Pillow.
+# ----------------------------------------------------------------------
+
+_FONT_FILES = {
+    # family (lower-case): (regular, bold) - Windows file names first,
+    # then metric-compatible open fonts (used only on non-Windows machines).
+    "calibri": (["calibri.ttf", "Carlito-Regular.ttf"], ["calibrib.ttf", "Carlito-Bold.ttf"]),
+    "arial": (["arial.ttf", "LiberationSans-Regular.ttf"], ["arialbd.ttf", "LiberationSans-Bold.ttf"]),
+    "times new roman": (["times.ttf", "LiberationSerif-Regular.ttf"], ["timesbd.ttf", "LiberationSerif-Bold.ttf"]),
+    "cambria": (["cambria.ttc", "Caladea-Regular.ttf"], ["cambriab.ttf", "Caladea-Bold.ttf"]),
+    "segoe ui": (["segoeui.ttf"], ["segoeuib.ttf"]),
+    "verdana": (["verdana.ttf"], ["verdanab.ttf"]),
+    "tahoma": (["tahoma.ttf"], ["tahomabd.ttf"]),
+    "georgia": (["georgia.ttf"], ["georgiab.ttf"]),
+    "aptos": (["aptos.ttf"], ["aptos-bold.ttf"]),
+}
+_font_file_index = None
+_font_cache = {}
+
+
+def _font_search_dirs():
+    dirs = []
+    windir = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+    if windir:
+        dirs.append(os.path.join(windir, "Fonts"))
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        dirs.append(os.path.join(local, "Microsoft", "Windows", "Fonts"))
+    dirs += ["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts")]
+    return dirs
+
+
+def _find_font_file(family, bold):
+    global _font_file_index
+    if _font_file_index is None:
+        _font_file_index = {}
+        for d in _font_search_dirs():
+            for root, _dirs, files in os.walk(d):
+                for f in files:
+                    _font_file_index.setdefault(f.lower(), os.path.join(root, f))
+    names = _FONT_FILES.get((family or "").strip().lower())
+    if not names:
+        names = _FONT_FILES["calibri"]  # Office's default body font
+    for candidate in names[1 if bold else 0]:
+        path = _font_file_index.get(candidate.lower())
+        if path:
+            return path
+    return None
+
+
+class _DocxFontInfo:
+    """Resolves a run's font family / bold / size the way Word does for the
+    cases these forms use (explicit w:rFonts, theme fonts, docDefaults)."""
+
+    def __init__(self, unpack_dir):
+        self.minor, self.major = "Calibri", "Cambria"
+        self.default_theme_font, self.default_font, self.default_sz = "minorHAnsi", None, 22
+        try:
+            with open(os.path.join(unpack_dir, "word", "theme", "theme1.xml"), encoding="utf-8") as f:
+                theme = f.read()
+            m = re.search(r"<a:minorFont>\s*<a:latin typeface=\"([^\"]+)\"", theme)
+            self.minor = m.group(1) if m else self.minor
+            m = re.search(r"<a:majorFont>\s*<a:latin typeface=\"([^\"]+)\"", theme)
+            self.major = m.group(1) if m else self.major
+        except OSError:
+            pass
+        try:
+            with open(os.path.join(unpack_dir, "word", "styles.xml"), encoding="utf-8") as f:
+                styles = f.read()
+            dd = re.search(r"<w:rPrDefault>.*?</w:rPrDefault>", styles, re.S)
+            if dd:
+                dd = dd.group(0)
+                m = re.search(r'<w:rFonts[^>]*w:ascii="([^"]+)"', dd)
+                self.default_font = m.group(1) if m else None
+                m = re.search(r'<w:rFonts[^>]*w:asciiTheme="([^"]+)"', dd)
+                self.default_theme_font = m.group(1) if m else self.default_theme_font
+                m = re.search(r'<w:sz w:val="(\d+)"', dd)
+                self.default_sz = int(m.group(1)) if m else self.default_sz
+        except OSError:
+            pass
+
+    def resolve(self, rpr):
+        m = re.search(r'<w:rFonts[^>]*w:ascii="([^"]+)"', rpr or "")
+        family = m.group(1) if m else None
+        if not family:
+            m = re.search(r'<w:rFonts[^>]*w:asciiTheme="([^"]+)"', rpr or "")
+            theme = m.group(1) if m else (None if self.default_font else self.default_theme_font)
+            family = (self.major if theme and theme.startswith("major") else self.minor) if theme else self.default_font
+        bold = bool(re.search(r"<w:b(?:\s*/>|\s+w:val=\"(?:1|true|on)\"\s*/>)", rpr or ""))
+        m = re.search(r'<w:sz w:val="(\d+)"', rpr or "")
+        sz = int(m.group(1)) if m else self.default_sz
+        return family or "Calibri", bold, sz  # sz in half-points
+
+    def text_width_pt(self, text, rpr, sz_override=None):
+        family, bold, sz = self.resolve(rpr)
+        sz = sz_override or sz
+        path = _find_font_file(family, bold)
+        if path:
+            key = (path, sz)
+            font = _font_cache.get(key)
+            if font is None:
+                try:
+                    # size in 1/10 pt for precision, then scale back
+                    font = ImageFont.truetype(path, sz * 5)
+                except Exception:
+                    font = False
+                _font_cache[key] = font
+            if font:
+                return font.getlength(text) / 10.0
+        # No font file available: average Calibri-ish advance widths (em).
+        em = sum(0.226 if c == " " else 0.498 if c == "_" else 0.52 if c.isupper() or c.isdigit() else 0.45
+                 for c in text)
+        return em * sz / 2.0
+
+
+def _underscore_blank_groups(xml):
+    """The runs forming each underscore blank ('Emp ID: ______'), in
+    document order - the same grouping insert_controls() uses to decide
+    which blank becomes which BLANK_TAGS field."""
+    run_pattern = re.compile(r"<w:r(?: [^>]*)?>(?:(?!</w:r>).)*?</w:r>", re.S)
+    groups, current = [], []
+    for m in run_pattern.finditer(xml):
+        t = re.search(r"<w:t[^>]*>([^<]*)</w:t>", m.group(0))
+        txt = t.group(1) if t else ""
+        if txt and re.fullmatch(r"[_\s]+", txt) and "_" in txt:
+            if current and current[-1][0].end() == m.start():
+                current.append((m, txt))
+            else:
+                if current:
+                    groups.append(current)
+                current = [(m, txt)]
+        elif current:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _original_blank_widths(fillable_docx_path):
+    """{tag: (width_in_points, starts_with_space)} of each underscore blank in the BU's ORIGINAL
+    upload (kept next to fillable.docx as original.docx - or source.docx
+    in older installs). {} if it can't be found, in which case filling
+    simply works the old way (no width matching)."""
+    folder = os.path.dirname(os.path.abspath(fillable_docx_path))
+    original = next((os.path.join(folder, n) for n in ("original.docx", "source.docx")
+                     if os.path.exists(os.path.join(folder, n))), None)
+    if not original:
+        return {}
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            with zipfile.ZipFile(original) as z:
+                z.extractall(tmp)
+            fonts = _DocxFontInfo(tmp)
+            with open(os.path.join(tmp, "word", "document.xml"), encoding="utf-8") as f:
+                xml = f.read()
+            groups = _underscore_blank_groups(xml)
+            widths = {}
+            for tag, group in zip(BLANK_TAGS, groups):
+                width = sum(fonts.text_width_pt(txt, _extract_rpr(m.group(0))) for m, txt in group)
+                # 'Emp ID: ______' where the space before the underscores is
+                # part of the blank run: keep that space in front of the value.
+                leading_space = group[0][1][:1].isspace()
+                widths[tag] = (width, leading_space)
+            return widths
+    except Exception:
+        logger.exception("fill_docx: could not measure the original blanks in %r (filling without width matching)",
+                         original)
+        return {}
+
+
+_MIN_LABEL_GAP_PT = 8.0  # always keep at least this much space before the next label
+
+
+def _gap_runs_after(xml, pos):
+    """The whitespace-only runs right after `pos` in the same paragraph -
+    the spacing the form uses between a blank and the next label on the
+    line. Returns [(start, end, text, rpr), ...]."""
+    out = []
+    run_re = re.compile(r"<w:r(?: [^>]*)?>((?:(?!</w:r>).)*?)</w:r>", re.S)
+    skip_re = re.compile(r"(?:\s|<w:(?:proofErr|bookmarkStart|bookmarkEnd)\b[^>]*/>)*")
+    i = pos
+    while True:
+        j = skip_re.match(xml, i).end()
+        m = run_re.match(xml, j)
+        if not m:
+            break
+        inner = m.group(1)
+        texts = re.findall(r"<w:t[^>]*>([^<]*)</w:t>", inner)
+        text = "".join(texts)
+        if not texts or text.strip() != "" or re.search(r"<w:(?:tab|br|drawing|sym|ptab)\b", inner):
+            break
+        out.append((m.start(), m.end(), text, _extract_rpr(inner)))
+        i = m.end()
+    return out
+
+
+def _shrink_rpr(rpr, new_sz):
+    size_tags = f'<w:sz w:val="{new_sz}"/><w:szCs w:val="{new_sz}"/>'
+    if not rpr:
+        return f"<w:rPr>{size_tags}</w:rPr>"
+    return re.sub(r"<w:sz(?:Cs)?\s[^/]*/>", "", rpr).replace("</w:rPr>", size_tags + "</w:rPr>")
+
+
+def _fill_blank_fixed_width(xml, tag, value, rpr, target_pt, fonts):
+    """Replaces the `tag` content control with `value`, keeping everything
+    after it on the line exactly where the blank template had it:
+      - shorter value: padded with spaces up to the blank's width;
+      - longer value: allowed to run into the spacing that follows the
+        blank (that many spaces are removed there instead), and only
+        shrunk (never below 7pt) if even that isn't enough."""
+    m = _sdt_pattern(tag).search(xml)
+    gap = _gap_runs_after(xml, m.end()) if m else []
+    gap_widths = [fonts.text_width_pt(t, r) for _s, _e, t, r in gap]
+    spare = max(0.0, sum(gap_widths) - _MIN_LABEL_GAP_PT)
+
+    value = value or ""
+    width = fonts.text_width_pt(value, rpr) if value else 0.0
+    if width > target_pt + spare:
+        _f, _b, sz = fonts.resolve(rpr)
+        new_sz = max(14, int(sz * (target_pt + spare) / width))  # half-points
+        if new_sz < sz:
+            rpr = _shrink_rpr(rpr, new_sz)
+            width = fonts.text_width_pt(value, rpr)
+    overflow = min(max(0.0, width - target_pt), spare)
+
+    # Decide how many spaces to take out of the gap for the overflow.
+    removals, removed = [], 0.0
+    for (_s, _e, text, grpr) in gap:
+        need = overflow - removed
+        if need <= 0:
+            removals.append(0)
+            continue
+        sp = fonts.text_width_pt(" ", grpr) or 1.0
+        n = min(len(text), int(-(-need // sp)))  # ceil
+        removals.append(n)
+        removed += n * sp
+    # Pad the value so (value + remaining gap) equals (blank + original gap).
+    space = fonts.text_width_pt(" ", rpr) or 1.0
+    pad = int(round((target_pt + removed - width) / space))
+    if pad > 0:
+        value = value + " " * pad
+
+    safe_value = _xml_escape(value) if value else " "
+    xml = _replace_sdt_content(xml, tag, f'<w:r>{rpr}<w:t xml:space="preserve">{safe_value}</w:t></w:r>')
+
+    if any(removals):
+        m = _sdt_pattern(tag).search(xml)
+        gap = _gap_runs_after(xml, m.end()) if m else []
+        for (start, end, text, grpr), n in reversed(list(zip(gap, removals))):
+            if n:
+                new_run = f'<w:r>{grpr}<w:t xml:space="preserve">{text[n:]}</w:t></w:r>'
+                xml = xml[:start] + new_run + xml[end:]
+    return xml
+
+
 def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, signature_images):
     """
     Fills every text/checkbox/signature-picture control previously inserted
@@ -3120,6 +3388,15 @@ def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, 
         date_rpr = _extract_rpr(date_match.group(1)) if date_match else ""
         date_size_tags = "".join(re.findall(r"<w:sz(?:Cs)?\s[^/]*/>", date_rpr))
 
+        # Width of each original underscore blank, so values can be made
+        # exactly that wide and the labels after them stay put (see
+        # _fit_value_to_width).
+        fonts = _DocxFontInfo(unpack_dir)
+        blank_widths = _original_blank_widths(fillable_docx_path)
+        if blank_widths:
+            logger.debug("fill_docx: matching blank widths (pt): %r",
+                         {k: round(v[0], 1) for k, v in blank_widths.items()})
+
         for tag, value in field_values.items():
             m = _sdt_pattern(tag).search(xml)
             if not m:
@@ -3127,6 +3404,12 @@ def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, 
             rpr = _extract_rpr(m.group(1))
             if tag in _FONT_SIZE_NORMALIZED_TAGS:
                 rpr = _rpr_with_date_font_size(rpr, date_size_tags)
+            if tag in blank_widths:
+                target_pt, leading_space = blank_widths[tag]
+                if leading_space and value and not value[:1].isspace():
+                    value = " " + value
+                xml = _fill_blank_fixed_width(xml, tag, value, rpr, target_pt, fonts)
+                continue
             safe_value = _xml_escape(value) if value else " "
             new_inner = f'<w:r>{rpr}<w:t xml:space="preserve">{safe_value}</w:t></w:r>'
             xml = _replace_sdt_content(xml, tag, new_inner)
@@ -6822,7 +7105,7 @@ class WizardApp(tk.Tk):
                 photo = ImageTk.PhotoImage(img)
                 self._sig_preview_image[data_key] = photo  # keep a reference alive
                 preview_label.image = photo  # belt-and-suspenders against GC
-                preview_label.config(image=photo, text="", compound="image", width=0, height=0)
+                preview_label.config(image=photo, text="", width=0, height=0)
             except Exception:
                 logger.exception("Signature preview: could not render thumbnail for %s (%s)", data_key, path)
                 preview_label.config(text="(signature captured)")
