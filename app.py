@@ -479,6 +479,23 @@ CONFIG = {
         # per employee. The app picks the newest matching file up
         # automatically from the Downloads folder (or "Load TracIT
         # Report..." in the header to choose one by hand).
+        # AUTOMATIC DOWNLOAD: TracIT's EUC Report screen gets its rows from
+        # one API call (POST .../Reports/GetEUCReportExtractNew - confirmed
+        # from the Edge network log); "Export as Excel" just turns those
+        # rows into a file inside the browser. That API only accepts the
+        # signed-in TracIT browser session (a plain Windows-login request
+        # gets HTTP 403), so the app makes the same call from inside its
+        # hidden TracIT window, which is already signed in. Once a day at
+        # startup (or the ⟳ button in the header). Falls back to the newest
+        # exported file in Downloads if this ever fails.
+        "auto_download": True,
+        "api_path": "/api/ham/api/Reports/GetEUCReportExtractNew",
+        # Same filter as on the TracIT screen ("Assigned Location"). Leave
+        # the list empty to fetch every location (much bigger download).
+        "assigned_locations": ["II033"],
+        "page_size": 6000,
+        "max_pages": 10,
+        "download_timeout_seconds": 240,
         "watch_folder": "",  # blank = the signed-in user's Downloads folder
         # A file counts as "the TracIT report" if its name contains any
         # of these (case-insensitive) and it's .xlsx/.xls/.csv.
@@ -486,12 +503,20 @@ CONFIG = {
         # Column headers are matched case-insensitively, ignoring spaces
         # and punctuation - add the real report's wording here if it
         # differs from all of these.
-        "employee_id_columns": ["User Employee Id", "Employee ID", "EmployeeID", "Emp ID",
-                                "Empl ID", "User Employee ID", "Employee Number"],
+        # ALL of these that exist are used (the EUC export has both an
+        # "Assigned Owner" and a "Computer User" Employee ID column).
+        "employee_id_columns": ["Assigned Owner Employee ID", "Computer User Employee ID",
+                                "Primary User Employee ID", "User Employee Id", "Employee ID",
+                                "EmployeeID", "Emp ID", "Empl ID", "Employee Number"],
         "serial_columns": ["Serial Number", "Serial No", "Serial", "SerialNumber", "Asset Serial Number"],
         # Used to prefer the LAPTOP row when an employee has several assets.
-        "asset_type_columns": ["Asset Type", "Asset Category", "Category", "Device Type",
-                               "Hardware Type", "Product Type", "Asset Class", "Model", "Model Name"],
+        "asset_type_columns": ["Device Type", "Asset Type", "Asset Category", "Category",
+                               "Hardware Type", "Product Type", "Asset Class", "Model Name", "Model"],
+        "status_columns": ["Lifecycle Status", "Status"],
+        # When someone has more than one laptop row, prefer one in these
+        # lifecycle states (e.g. their current "Active" laptop over an old
+        # "InStock" record).
+        "preferred_statuses": ["active", "deployed", "in use", "assigned"],
         "laptop_keywords": ["laptop", "notebook", "latitude", "elitebook", "thinkpad", "probook", "surface"],
         "hostname_columns": ["Hostname", "Host Name", "Computer Name", "Asset Name", "Device Name"],
         "cache_max_age_hours": 24,  # older than this = shown as "Stale" in the header
@@ -1257,6 +1282,40 @@ class TracitLookupSession:
 
     def is_running(self):
         return self._proc is not None and self._proc.poll() is None
+
+    def export_euc(self, timeout=300, assigned_locations=None):
+        """Downloads the TracIT EUC report rows through the hidden, signed-in
+        TracIT window (see _perform_tracit_euc_export). Returns a list of
+        compact row dicts; raises RuntimeError on failure."""
+        message = {"cmd": "export_euc"}
+        if assigned_locations is not None:
+            message["assigned_locations"] = list(assigned_locations)
+        result = self._request(message, timeout)
+        return result.get("rows") or []
+
+    def _request(self, message, timeout):
+        if not self.is_running():
+            self.start()
+        if self._fatal_error:
+            raise RuntimeError(self._fatal_error)
+        if self._proc is None:
+            raise RuntimeError("TracIT helper failed to start.")
+        request_id = uuid.uuid4().hex
+        event = threading.Event()
+        self._pending[request_id] = {"event": event, "result": None}
+        try:
+            self._proc.stdin.write(json.dumps(dict(message, request_id=request_id)) + "\n")
+            self._proc.stdin.flush()
+        except Exception as exc:
+            self._pending.pop(request_id, None)
+            raise RuntimeError(f"TracIT helper is not responding ({exc}).")
+        if not event.wait(timeout=timeout):
+            self._pending.pop(request_id, None)
+            raise RuntimeError("Timed out waiting for TracIT.")
+        result = self._pending.pop(request_id)["result"]
+        if "error" in result:
+            raise RuntimeError(result["error"])
+        return result
 
     def search(self, emp_id):
         """Blocks until a serial number is returned or raises RuntimeError.
@@ -2366,6 +2425,160 @@ def _perform_tracit_search(window, emp_id, cfg):
     return serial
 
 
+# ----------------------------------------------------------------------
+# TracIT EUC report - automatic download through the hidden TracIT window
+# ----------------------------------------------------------------------
+
+# The same request TracIT's own "EUC Report" screen sends (captured from
+# the Edge network log), with every filter empty except Assigned Location.
+TRACIT_EUC_COLUMNS = [
+    "serialNumber", "assetTag", "deviceType", "hostName", "partNumber", "modelNm", "manufacturerNm",
+    "osName", "lifecycleStatus", "lifecycleSubStatus", "poNumber", "lifecycleStatusUpdateDate",
+    "assignedOwnerEmpid", "assignedOwnerName", "assignedOwnerUserID", "computerUser", "computerUserEMPID",
+    "assetLocation", "assetLocationCountry", "assetLocationCity", "assignedLocation", "companyName",
+    "isIntegrated", "uhgOwned", "audOwner", "audOwnerMsId", "audRequestNumber", "audEffectiveDate",
+    "audFollowupDate", "audComment", "comment", "specialProjectHandlingType", "chargebackType",
+    "assetAging", "monthsInService", "purchaseInvoiceDate", "assetScanAging", "isAUD", "lastScanDate",
+    "lastScanSource", "lastLogonDate", "lastLogonUserId", "computraceAgent", "computraceEventStatus",
+    "computraceLastCall", "audCategoryName", "previousLifecycleStatus", "previousLifecycleDate",
+    "eucDeviceId", "svpVendorName",
+]
+
+
+def _tracit_euc_payload(cfg):
+    payload = {
+        "pageSize": int(cfg.get("page_size") or 6000), "pageNumber": 1,
+        "assetType": [], "lifecycleStatus": [], "lifecycleSubStatus": [], "assetLocationCountry": [],
+        "specialProjectHandlingType": [], "assetScanAging": [], "assetAging": [], "companyName": [],
+        "assignedLocation": list(cfg.get("assigned_locations") or []), "assetLocation": [], "aud": [],
+        "serialNumber": [], "assetTag": [], "machineName": [], "primaryUserEmployeeId": [],
+        "primaryUserMSId": [], "assignedOwnerEmployeeId": [], "assignedOwnerUserId": [], "poNumber": [],
+        "manufacturer": [], "audOwnerMSId": [], "modelNM": None, "partNumber": None, "osName": None,
+        "computraceAgent": [], "computraceEventStatus": [], "lastLogonDateFrom": None,
+        "lastLogonDateTo": None, "lifecycleStatusDateFrom": None, "lifecycleStatusDateTo": None,
+        "columns": TRACIT_EUC_COLUMNS,
+    }
+    return payload
+
+
+# Runs INSIDE the signed-in TracIT page: same-origin fetch, so the page's
+# own session cookies go with it. If TracIT answers 401/403 it retries once
+# with the page's stored sign-in token (MSAL keeps it in session/local
+# storage), in case the API wants a Bearer header rather than cookies.
+# Pages through results, keeps only the columns the app needs, and leaves
+# the outcome in window.__eucExport for Python to poll.
+_TRACIT_EUC_EXPORT_JS = r"""
+(function (cfg) {
+  window.__eucExport = { done: false };
+  function findToken() {
+    try {
+      var stores = [window.sessionStorage, window.localStorage];
+      for (var s = 0; s < stores.length; s++) {
+        var st = stores[s];
+        for (var i = 0; i < st.length; i++) {
+          var k = st.key(i);
+          if (!/accesstoken/i.test(k)) continue;
+          try { var v = JSON.parse(st.getItem(k)); if (v && v.secret) return v.secret; } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  function rowsOf(obj, depth) {
+    depth = depth || 0;
+    if (depth > 4 || obj === null || obj === undefined) return null;
+    if (Array.isArray(obj)) return (obj.length === 0 || typeof obj[0] === 'object') ? obj : null;
+    if (typeof obj === 'object') {
+      for (var k in obj) { var r = rowsOf(obj[k], depth + 1); if (r) return r; }
+    }
+    return null;
+  }
+  function pick(row, names) {
+    var lower = {};
+    for (var k in row) lower[k.toLowerCase()] = row[k];
+    for (var i = 0; i < names.length; i++) {
+      var v = lower[names[i].toLowerCase()];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    }
+    return '';
+  }
+  async function page(n, token) {
+    var body = JSON.parse(JSON.stringify(cfg.payload));
+    body.pageNumber = n;
+    var h = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
+    if (token) h['Authorization'] = 'Bearer ' + token;
+    var r = await fetch(cfg.url, { method: 'POST', credentials: 'include', headers: h, body: JSON.stringify(body) });
+    if (!r.ok) throw { status: r.status };
+    return rowsOf(await r.json()) || [];
+  }
+  (async function () {
+    var token = null, all = [], n = 1, auth = 'session';
+    try {
+      while (true) {
+        var rows;
+        try {
+          rows = await page(n, token);
+        } catch (e) {
+          if (e && (e.status === 401 || e.status === 403) && !token && (token = findToken())) {
+            auth = 'token';
+            rows = await page(n, token);
+          } else { throw e; }
+        }
+        for (var i = 0; i < rows.length; i++) {
+          var r = rows[i];
+          all.push({
+            serial: pick(r, ['serialNumber']),
+            owner: pick(r, ['assignedOwnerEmpid', 'assignedOwnerEmployeeId']),
+            user: pick(r, ['computerUserEMPID', 'computerUserEmpid', 'primaryUserEmployeeId']),
+            type: pick(r, ['deviceType', 'assetType']),
+            model: pick(r, ['modelNm', 'modelName']),
+            host: pick(r, ['hostName', 'machineName']),
+            status: pick(r, ['lifecycleStatus'])
+          });
+        }
+        if (rows.length < cfg.payload.pageSize || n >= cfg.maxPages) break;
+        n++;
+      }
+      window.__eucExport = { done: true, rows: all, pages: n, auth: auth };
+    } catch (e) {
+      window.__eucExport = { done: true, error: (e && e.status) ? ('HTTP ' + e.status) : String(e && e.message || e) };
+    }
+  })();
+  return 'started';
+})(%s);
+"""
+
+
+def _perform_tracit_euc_export(window, cfg):
+    """Fetches the EUC report rows through the (signed-in) TracIT window.
+    Returns the list of compact rows; raises RuntimeError on failure."""
+    js_cfg = {
+        "url": cfg.get("api_path") or "/api/ham/api/Reports/GetEUCReportExtractNew",
+        "payload": _tracit_euc_payload(cfg),
+        "maxPages": int(cfg.get("max_pages") or 10),
+    }
+    start = time.time()
+    window.evaluate_js(_TRACIT_EUC_EXPORT_JS % json.dumps(js_cfg))
+    timeout = float(cfg.get("download_timeout_seconds") or 240)
+    while time.time() - start < timeout:
+        raw = window.evaluate_js(
+            "(window.__eucExport && window.__eucExport.done) ? JSON.stringify(window.__eucExport) : null"
+        )
+        if raw:
+            result = json.loads(raw) if isinstance(raw, str) else raw
+            if result.get("error"):
+                raise RuntimeError(
+                    f"TracIT refused the EUC report request ({result['error']}). If TracIT asks you to "
+                    "sign in, open it once in Edge and try again - or use 'Load…' with an exported file."
+                )
+            rows = result.get("rows") or []
+            logger.info("TracIT EUC export: %d row(s) in %.1fs (%s page(s), auth=%s)",
+                        len(rows), time.time() - start, result.get("pages"), result.get("auth"))
+            return rows
+        time.sleep(0.5)
+    raise RuntimeError(f"TracIT EUC report download timed out after {int(timeout)}s.")
+
+
 def _run_tracit_webview_helper():
     import webview
 
@@ -2477,6 +2690,25 @@ def _run_tracit_webview_helper():
                 return
 
             request_id = req.get("request_id")
+
+            if req.get("cmd") == "export_euc":
+                logger.info("TracIT helper: EUC report download requested (request_id=%r)", request_id)
+                if not page_ready.wait(timeout=180):
+                    _send({"request_id": request_id,
+                           "error": "TracIT window never finished loading (sign-in taking too long?)."})
+                    continue
+                with window_lock:
+                    try:
+                        export_cfg = dict(cfg)
+                        if "assigned_locations" in req:  # current Settings value from the app
+                            export_cfg["assigned_locations"] = req["assigned_locations"]
+                        rows = _perform_tracit_euc_export(window, export_cfg)
+                        _send({"request_id": request_id, "rows": rows})
+                    except Exception as exc:
+                        logger.exception("TracIT helper: EUC report download failed")
+                        _send({"request_id": request_id, "error": str(exc)})
+                continue
+
             emp_id = (req.get("emp_id") or "").strip()
             logger.info("TracIT helper: received lookup request_id=%r emp_id=%r", request_id, emp_id)
 
@@ -4653,6 +4885,7 @@ def _safe_folder_name(name, fallback="Unspecified"):
 # ============================================================================
 
 DEFAULT_USER_SETTINGS = {
+    "tracit_assigned_locations": "",  # e.g. "II033" or "II033, II045" - blank = CONFIG default
     "root_save_folder": "",
     "operator_name": "",
     "location": "",
@@ -4829,6 +5062,8 @@ def _apply_admin_settings_overrides(config, admin_data=None):
                 value = float(value)
             except (TypeError, ValueError):
                 continue
+        if leaf == "assigned_locations" and isinstance(value, str):
+            value = [v.strip() for v in value.split(",") if v.strip()]
         node[leaf] = value
     return config
 
@@ -5138,6 +5373,24 @@ def _ssrs_find_record(ssrs_state, emp_id):
 TRACIT_REPORT_EXTENSIONS = (".xlsx", ".xlsm", ".csv")
 
 
+def _parse_location_codes(text):
+    """'II033, ii045 ;II050' -> ['II033', 'II045', 'II050'] (upper-cased, no dupes)."""
+    out = []
+    for code in re.split(r"[,;\s]+", str(text or "")):
+        code = code.strip().upper()
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def _tracit_cache_locations(json_cache):
+    try:
+        with open(json_cache, encoding="utf-8") as f:
+            return list(json.load(f).get("locations") or [])
+    except Exception:
+        return None
+
+
 def _tracit_report_cache_path(ext):
     cache_dir = os.path.join(_app_dir(), "cache")
     os.makedirs(cache_dir, exist_ok=True)
@@ -5205,14 +5458,32 @@ def _find_column(header_cells, candidates):
     return None
 
 
+def _find_columns_all(header_cells, candidates):
+    """Indexes of EVERY header that exactly (normalized) matches one of the
+    candidates; if none do, the first 'contains' match. Used for Employee
+    ID, where the EUC export has several such columns."""
+    normed = [_norm_header(h) for h in header_cells]
+    wanted = [_norm_header(c) for c in candidates if c]
+    exact = [i for i, h in enumerate(normed) if h and h in wanted]
+    if exact:
+        return exact
+    one = _find_column(header_cells, candidates)
+    return [one] if one is not None else []
+
+
+def _tracit_record(serial, asset_type="", hostname="", status=""):
+    return {"serial": serial, "asset_type": asset_type, "hostname": hostname, "status": status}
+
+
 def parse_tracit_report(path, cfg):
     """Returns (index, record_count) where index is {employee_id_key:
-    [ {serial, asset_type, hostname}, ... ]} - every asset row per
-    employee, indexed under each form of the ID (see _employee_id_keys)."""
+    [ {serial, asset_type, hostname, status}, ... ]} - every asset row per
+    employee, indexed under each Employee ID column it has (Assigned
+    Owner AND Computer User) and each form of that ID (_employee_id_keys)."""
     rows = _read_tabular_rows(path)
     header_idx = None
     for i, row in enumerate(rows[:15]):
-        if _find_column(row, cfg.get("employee_id_columns", [])) is not None and \
+        if _find_columns_all(row, cfg.get("employee_id_columns", [])) and \
                 _find_column(row, cfg.get("serial_columns", [])) is not None:
             header_idx = i
             break
@@ -5224,10 +5495,11 @@ def parse_tracit_report(path, cfg):
             "serial_columns in CONFIG."
         )
     header = [str(h).strip() if h is not None else "" for h in rows[header_idx]]
-    emp_col = _find_column(header, cfg.get("employee_id_columns", []))
+    emp_cols = _find_columns_all(header, cfg.get("employee_id_columns", []))
     serial_col = _find_column(header, cfg.get("serial_columns", []))
     type_col = _find_column(header, cfg.get("asset_type_columns", []))
     host_col = _find_column(header, cfg.get("hostname_columns", []))
+    status_col = _find_column(header, cfg.get("status_columns", []))
 
     def cell(row, idx):
         if idx is None or idx >= len(row) or row[idx] is None:
@@ -5236,30 +5508,63 @@ def parse_tracit_report(path, cfg):
 
     index, count = {}, 0
     for row in rows[header_idx + 1:]:
-        emp = cell(row, emp_col)
-        if not emp:
+        emps = [cell(row, c) for c in emp_cols]
+        emps = [e for e in emps if e]
+        if not emps:
             continue
-        rec = {"serial": cell(row, serial_col), "asset_type": cell(row, type_col),
-               "hostname": cell(row, host_col)}
-        for key in _employee_id_keys(emp):
+        rec = _tracit_record(cell(row, serial_col), cell(row, type_col), cell(row, host_col), cell(row, status_col))
+        keys = []
+        for emp in emps:
+            for key in _employee_id_keys(emp):
+                if key not in keys:
+                    keys.append(key)
+        for key in keys:
+            index.setdefault(key, []).append(rec)
+        count += 1
+    return index, count
+
+
+def build_tracit_index_from_rows(rows):
+    """Same index as parse_tracit_report, built from the compact rows the
+    hidden TracIT window returns from the EUC Report API."""
+    index, count = {}, 0
+    for r in rows or []:
+        emps = [str(r.get(k) or "").strip() for k in ("owner", "user")]
+        emps = [e for e in emps if e]
+        if not emps:
+            continue
+        asset_type = " ".join(x for x in (r.get("type"), r.get("model")) if x)
+        rec = _tracit_record(str(r.get("serial") or "").strip(), asset_type,
+                             str(r.get("host") or ""), str(r.get("status") or ""))
+        keys = []
+        for emp in emps:
+            for key in _employee_id_keys(emp):
+                if key not in keys:
+                    keys.append(key)
+        for key in keys:
             index.setdefault(key, []).append(rec)
         count += 1
     return index, count
 
 
 def tracit_best_laptop(records, cfg):
-    """Picks the laptop out of an employee's asset rows: a row whose asset
-    type/model mentions a laptop keyword wins; otherwise the first row
-    that has a serial at all. Returns the record dict or None."""
+    """Picks the laptop out of an employee's asset rows: rows whose type/
+    model mentions a laptop keyword score highest, then rows in a
+    preferred lifecycle status (Active/Deployed...); ties keep report
+    order. Rows without a serial are ignored. Returns the record or None."""
     with_serial = [r for r in (records or []) if r.get("serial")]
     if not with_serial:
         return None
     keywords = [k.lower() for k in (cfg.get("laptop_keywords") or [])]
-    for r in with_serial:
+    statuses = [k.lower() for k in (cfg.get("preferred_statuses") or [])]
+
+    def score(r):
         text = (r.get("asset_type", "") + " " + r.get("hostname", "")).lower()
-        if any(k in text for k in keywords):
-            return r
-    return with_serial[0]
+        status = (r.get("status") or "").lower()
+        return (2 if any(k in text for k in keywords) else 0) + (1 if any(st in status for st in statuses) else 0)
+
+    best = max(score(r) for r in with_serial)
+    return next(r for r in with_serial if score(r) == best)
 
 
 def tracit_find_laptop(tracit_state, emp_id, cfg):
@@ -5814,13 +6119,27 @@ class WizardApp(tk.Tk):
             right, "SSRS ASSET REPORT", self.ssrs_status_var, "⟳",
             lambda: self._ssrs_refresh(force=True), "Download the SSRS report again now",
         )
-        tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=14)
+        tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=10)
         self.tracit_report_status_var = tk.StringVar(value="Not loaded")
-        self.tracit_report_button = self._header_status_block(
-            right, "TRACIT EUC REPORT", self.tracit_report_status_var, "Load…",
-            self._load_tracit_report_dialog,
-            "Load the TracIT EUC report you exported (the newest one in Downloads is picked up automatically)",
+        self.tracit_download_button = self._header_status_block(
+            right, "TRACIT EUC REPORT", self.tracit_report_status_var, "⟳",
+            lambda: self._tracit_report_refresh(force_download=True),
+            "Download the EUC report from TracIT again now (it downloads automatically once a day)",
         )
+        self.tracit_report_button = ttk.Button(
+            self.tracit_download_button.master, text="Load…", style="Icon.TButton", width=6,
+            command=self._load_tracit_report_dialog,
+        )
+        self.tracit_report_button.pack(side="left", padx=(4, 0))
+        self._attach_hover_tooltip(self.tracit_report_button, "Load an EUC report file you exported from TracIT")
+        self.tracit_location_button = ttk.Button(
+            self.tracit_download_button.master, text="", style="Icon.TButton",
+            command=self._change_tracit_location,
+        )
+        self.tracit_location_button.pack(side="left", padx=(4, 0))
+        self._attach_hover_tooltip(self.tracit_location_button,
+                                   "TracIT Assigned Location the EUC report is downloaded for - click to change")
+        self._refresh_tracit_location_button()
         tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=14)
         settings_button = ttk.Button(
             right, text="⚙", width=3, style="Icon.TButton",
@@ -5946,57 +6265,88 @@ class WizardApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------ TracIT report
-    def _tracit_report_refresh(self, chosen_path=None):
-        """Loads the TracIT EUC report in the background: the file the
-        operator just picked (chosen_path), else the newest matching file
-        in Downloads if it's newer than the cached copy, else the cached
-        copy from last time. The file is copied into cache/ so it keeps
-        working even after Downloads is cleaned out."""
+    def _tracit_report_refresh(self, chosen_path=None, force_download=False):
+        """Loads the TracIT EUC report in the background, best source first:
+          1. a file the operator just picked with "Load…" (chosen_path);
+          2. today's automatic download, if already done today;
+          3. a fresh automatic download through the hidden, signed-in
+             TracIT window (once a day, or right now with the ⟳ button);
+          4. otherwise the newest exported EUC file in Downloads, or the
+             last copy the app cached.
+        Every result is cached under cache/ so it survives restarts."""
         cfg = self.config_data.get("tracit_report", {})
         if hasattr(self, "tracit_report_status_var"):
-            self.tracit_report_status_var.set("Loading...")
+            self.tracit_report_status_var.set("Downloading from TracIT…" if (
+                cfg.get("auto_download") and not chosen_path) else "Loading…")
+        if hasattr(self, "tracit_download_button"):
+            self.tracit_download_button.config(state="disabled")
+
+        locations = self._tracit_locations()
 
         def worker():
             error, index, records, source, updated = "", {}, 0, None, None
+            json_cache = _tracit_report_cache_path(".json")
             try:
-                cached = next((_tracit_report_cache_path(ext) for ext in TRACIT_REPORT_EXTENSIONS
-                               if os.path.exists(_tracit_report_cache_path(ext))), None)
-                candidate = chosen_path or find_newest_tracit_report(cfg)
-                if candidate and (chosen_path or not cached
-                                  or os.path.getmtime(candidate) > os.path.getmtime(cached)):
-                    ext = os.path.splitext(candidate)[1].lower()
-                    ext = ext if ext in TRACIT_REPORT_EXTENSIONS else ".xlsx"
-                    for old_ext in TRACIT_REPORT_EXTENSIONS:
-                        old = _tracit_report_cache_path(old_ext)
-                        if os.path.exists(old):
-                            os.remove(old)
-                    cached = _tracit_report_cache_path(ext)
-                    shutil.copy2(candidate, cached)
-                    source = candidate
-                    logger.info("TracIT report: loaded new file %r", candidate)
-                if cached:
-                    index, records = parse_tracit_report(cached, cfg)
-                    updated = datetime.fromtimestamp(os.path.getmtime(cached))
-                    source = source or cached
+                if chosen_path:
+                    index, records, source, updated = self._tracit_load_file(chosen_path, cfg, copy_to_cache=True)
+                else:
+                    fresh_json = (os.path.exists(json_cache) and not force_download and
+                                  datetime.fromtimestamp(os.path.getmtime(json_cache)).date() == date.today()
+                                  and _tracit_cache_locations(json_cache) == locations)
+                    if fresh_json:
+                        with open(json_cache, encoding="utf-8") as f:
+                            index, records = build_tracit_index_from_rows(json.load(f).get("rows"))
+                        source, updated = "TracIT (downloaded today)", datetime.fromtimestamp(os.path.getmtime(json_cache))
+                    elif cfg.get("auto_download"):
+                        try:
+                            rows = self.tracit_session.export_euc(
+                                timeout=float(cfg.get("download_timeout_seconds") or 240) + 60,
+                                assigned_locations=locations,
+                            )
+                            if not rows:
+                                raise RuntimeError(f"TracIT returned 0 rows for Assigned Location {', '.join(locations) or '(all)'} "
+                                                   "- check the location code.")
+                            tmp = json_cache + ".part"
+                            with open(tmp, "w", encoding="utf-8") as f:
+                                json.dump({"downloaded": datetime.now().isoformat(), "locations": locations,
+                                           "rows": rows}, f)
+                            os.replace(tmp, json_cache)
+                            index, records = build_tracit_index_from_rows(rows)
+                            source, updated = "TracIT (downloaded)", datetime.now()
+                        except Exception as exc:
+                            logger.warning("TracIT report: automatic download failed (%s) - trying files", exc)
+                            error = f"Auto-download failed: {exc}"
+                    if not records:
+                        # Fallbacks: newest exported file in Downloads / cached
+                        # copy / an older automatic download - whichever is newest.
+                        index2, records2, source2, updated2 = self._tracit_load_newest_file(cfg)
+                        if os.path.exists(json_cache):
+                            jt = datetime.fromtimestamp(os.path.getmtime(json_cache))
+                            if not updated2 or jt > updated2:
+                                with open(json_cache, encoding="utf-8") as f:
+                                    index2, records2 = build_tracit_index_from_rows(json.load(f).get("rows"))
+                                source2, updated2 = "TracIT (earlier download)", jt
+                        if records2:
+                            index, records, source, updated = index2, records2, source2, updated2
             except Exception as exc:
                 logger.exception("TracIT report: could not load")
-                error = str(exc)
+                error = error or str(exc)
 
             def apply():
-                if error:
-                    status = "Error"
-                elif not records:
-                    status = "Not loaded"
-                else:
+                if records:
                     age_h = (datetime.now() - updated).total_seconds() / 3600.0 if updated else 999
                     status = "Available" if age_h <= cfg.get("cache_max_age_hours", 24) else "Stale"
+                else:
+                    status = "Error" if error else "Not loaded"
                 self.tracit_report_state = {
                     "status": status, "records": records, "index": index,
                     "file": source, "last_updated": updated, "error": error,
                 }
-                logger.info("TracIT report: status=%r records=%d error=%r", status, records, error)
+                logger.info("TracIT report: status=%r records=%d source=%r error=%r", status, records, source, error)
                 self._refresh_tracit_report_labels()
-                if error and chosen_path:
+                if hasattr(self, "tracit_download_button"):
+                    self.tracit_download_button.config(state="normal")
+                if error and (chosen_path or force_download):
                     messagebox.showerror("TracIT report", error)
                 # Fill the on-screen form now if it was waiting on this.
                 if hasattr(self, "current_serial_var"):
@@ -6006,6 +6356,68 @@ class WizardApp(tk.Tk):
             self.after(0, apply)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _tracit_load_file(self, path, cfg, copy_to_cache=False):
+        if copy_to_cache:
+            ext = os.path.splitext(path)[1].lower()
+            ext = ext if ext in TRACIT_REPORT_EXTENSIONS else ".xlsx"
+            for old_ext in TRACIT_REPORT_EXTENSIONS:
+                old = _tracit_report_cache_path(old_ext)
+                if os.path.exists(old):
+                    os.remove(old)
+            cached = _tracit_report_cache_path(ext)
+            shutil.copy2(path, cached)
+            path = cached
+        index, records = parse_tracit_report(path, cfg)
+        return index, records, path, datetime.fromtimestamp(os.path.getmtime(path))
+
+    def _tracit_load_newest_file(self, cfg):
+        """Newest of: the exported EUC file in Downloads, the cached copy."""
+        cached = next((_tracit_report_cache_path(ext) for ext in TRACIT_REPORT_EXTENSIONS
+                       if os.path.exists(_tracit_report_cache_path(ext))), None)
+        candidate = find_newest_tracit_report(cfg)
+        try:
+            if candidate and (not cached or os.path.getmtime(candidate) > os.path.getmtime(cached)):
+                logger.info("TracIT report: loading exported file %r", candidate)
+                return self._tracit_load_file(candidate, cfg, copy_to_cache=True)
+            if cached:
+                return self._tracit_load_file(cached, cfg)
+        except Exception:
+            logger.exception("TracIT report: could not read the exported file")
+        return {}, 0, None, None
+
+    def _tracit_locations(self):
+        """The TracIT Assigned Location code(s) to download: this user's own
+        setting, or the CONFIG default (II033)."""
+        own = _parse_location_codes((self.user_settings or {}).get("tracit_assigned_locations", ""))
+        return own or list(self.config_data.get("tracit_report", {}).get("assigned_locations", []))
+
+    def _refresh_tracit_location_button(self):
+        if hasattr(self, "tracit_location_button"):
+            codes = self._tracit_locations()
+            text = (", ".join(codes) if codes else "All locations") + " ✎"
+            self.tracit_location_button.config(text=text, width=len(text) + 1)
+
+    def _change_tracit_location(self):
+        value = simpledialog.askstring(
+            "TracIT Location",
+            "TracIT 'Assigned Location' code to download the EUC report for\n"
+            "(e.g. II033 - separate several codes with commas):",
+            initialvalue=", ".join(self._tracit_locations()), parent=self,
+        )
+        if value is None:
+            return  # cancelled
+        codes = _parse_location_codes(value)
+        if not codes:
+            messagebox.showwarning("TracIT Location", "Please enter at least one location code, e.g. II033.")
+            return
+        if codes == self._tracit_locations():
+            return
+        settings = dict(self.user_settings)
+        settings["tracit_assigned_locations"] = ", ".join(codes)
+        self.user_settings = _save_user_settings(settings)
+        self._refresh_tracit_location_button()
+        self._tracit_report_refresh(force_download=True)
 
     def _load_tracit_report_dialog(self):
         path = filedialog.askopenfilename(
@@ -6023,10 +6435,10 @@ class WizardApp(tk.Tk):
         if st.get("records"):
             when = st["last_updated"].strftime("%d-%b %I:%M %p") if st.get("last_updated") else ""
             self.tracit_report_status_var.set(f"{st['status']} · {st['records']:,} rows · {when}")
+        elif st.get("status") == "Error":
+            self.tracit_report_status_var.set("Download failed - ⟳ to retry, or Load…")
         else:
-            self.tracit_report_status_var.set(
-                "Error - see log" if st.get("status") == "Error" else "Not loaded - export it from TracIT"
-            )
+            self.tracit_report_status_var.set("Not loaded - ⟳ to download, or Load…")
 
     def _apply_tracit_report_to_current_serial(self):
         """Single Person tab: fill Current Device Serial Number from the
@@ -6144,6 +6556,15 @@ class WizardApp(tk.Tk):
         ttk.Entry(frm, textvariable=email_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
         row += 1
 
+        ttk.Label(frm, text="TracIT Location Code(s):").grid(row=row, column=0, sticky="w", **pad)
+        tracit_loc_var = tk.StringVar(value=", ".join(self._tracit_locations()))
+        ttk.Entry(frm, textvariable=tracit_loc_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        row += 1
+        ttk.Label(frm, text="TracIT 'Assigned Location' to download the EUC report for, e.g. II033 "
+                            "(several: II033, II045)", style="Muted.TLabel", wraplength=420).grid(
+            row=row, column=1, columnspan=2, sticky="w", padx=10, pady=(0, 6))
+        row += 1
+
         admin_vars = {}
         if not first_run:
             # Admin / shared-install settings: SSRS Report URL, AD Lookup URL,
@@ -6193,7 +6614,9 @@ class WizardApp(tk.Tk):
             if not root_var.get().strip():
                 messagebox.showwarning("Root Save Folder required", "Please choose a root save folder.", parent=dlg)
                 return
+            old_locations = self._tracit_locations()
             self.user_settings = _save_user_settings({
+                "tracit_assigned_locations": ", ".join(_parse_location_codes(tracit_loc_var.get())),
                 "root_save_folder": root_var.get().strip(),
                 "operator_name": op_var.get().strip(),
                 "location": loc_var.get().strip(),
@@ -6217,7 +6640,10 @@ class WizardApp(tk.Tk):
                 self._batch_refresh_save_path()
             self._refresh_header_operator_label()
             self._refresh_save_location_hint()
+            self._refresh_tracit_location_button()
             dlg.destroy()
+            if self._tracit_locations() != old_locations:
+                self._tracit_report_refresh(force_download=True)
 
         ttk.Button(btn_row, text="Save", command=do_save).pack(side="left", padx=6)
         if not first_run:
