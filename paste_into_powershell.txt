@@ -1,0 +1,32 @@
+$d = [Environment]::GetFolderPath('Desktop')
+$sec = 'cookie|authorization|token|xsrf|csrf|session|secret|passw|signature|bearer|saml|jwt|auth'
+$out = @("=== TracIT export details (secrets masked) $(Get-Date -Format 'yyyy-MM-dd HH:mm') ===")
+$har = Get-ChildItem $d -Filter *.har | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$entries = (Get-Content $har.FullName -Raw | ConvertFrom-Json).log.entries
+$hits = @($entries | Where-Object { $_.request.url -notmatch '\.(js|css|png|svg|woff2?|ico|map)(\?|$)' -and ($_.request.url -match 'export|download|report|xlsx|csv' -or @($_.response.headers | Where-Object { $_.name -match 'content-(type|disposition)' -and $_.value -match 'spreadsheet|excel|csv|octet|attachment' }).Count -gt 0) })
+foreach ($e in ($hits | Select-Object -Last 3)) {
+  $out += ''; $out += "REQUEST: $($e.request.method) " + ($e.request.url -replace "(?i)((?:$sec|sig)[^=&]*=)[^&]*", '$1***')
+  $out += "  Status: $($e.response.status)"
+  foreach ($h in $e.response.headers) { if ($h.name -match 'content-(type|disposition)') { $out += "  Response $($h.name): $($h.value)" } }
+  foreach ($h in $e.request.headers) { if ($h.name -notlike ':*') { if ($h.name -match $sec) { $out += "  Header $($h.name): ***" } else { $out += "  Header $($h.name): $($h.value)" } } }
+  if ($e.request.postData) { $out += "  Payload: " + ($e.request.postData.text -replace "(?i)(`"[^`"]*(?:$sec)[^`"]*`"\s*:\s*)`"[^`"]*`"", '$1"***"') }
+}
+if ($hits.Count -eq 0) { $out += 'No export request found in the .har file.' } else {
+  $e = $hits[-1]; $out += ''; $out += 'DOWNLOAD TEST (Windows login only, no browser cookies):'
+  try {
+    $p = @{ Uri = $e.request.url; Method = $e.request.method; UseDefaultCredentials = $true; UseBasicParsing = $true; TimeoutSec = 120 }
+    if ($e.request.postData.text) { $p.Body = $e.request.postData.text; $p.ContentType = $e.request.postData.mimeType }
+    $r = Invoke-WebRequest @p
+    $kind = 'unknown'
+    if ($r.Content -is [byte[]]) { if ($r.Content[0] -eq 80 -and $r.Content[1] -eq 75) { $kind = 'XLSX file - GOOD' } else { $kind = 'binary file' } }
+    elseif ($r.Content -match '(?i)<html|<!doctype') { $kind = 'HTML page (login page?) - needs browser' }
+    elseif ($r.Content -match '^\s*[\{\[]') { $kind = 'JSON (two-step export?)' }
+    elseif ($r.Content -match ',') { $kind = 'CSV text - GOOD' }
+    $out += "  HTTP $($r.StatusCode), $(@($r.Headers['Content-Type']) -join ', '), $($r.RawContentLength) bytes -> $kind"
+  } catch { $out += "  FAILED: $($_.Exception.Message)" }
+}
+$rep = Get-ChildItem $d -File | Where-Object { $_.Name -match '(?i)euc' -and $_.Extension -match '(?i)xlsx|xlsm|csv' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$out += ''; $out += "REPORT FILE: $($rep.Name)"
+if ($rep.Extension -match '(?i)csv') { $all = Get-Content $rep.FullName; $out += "  Rows: $($all.Count)"; foreach ($ln in ($all | Select-Object -First 10)) { if (@($ln -split ',' | Where-Object { $_.Trim('" ') }).Count -ge 3) { $out += '  Header: ' + (($ln -split ',') -join ' | '); break } } }
+else { try { $x = New-Object -ComObject Excel.Application; $wb = $x.Workbooks.Open($rep.FullName, 0, $true); $ws = $wb.Worksheets.Item(1); $out += "  Rows: $($ws.UsedRange.Rows.Count)"; for ($r = 1; $r -le 5; $r++) { $vals = @(); for ($c = 1; $c -le $ws.UsedRange.Columns.Count; $c++) { $vals += $ws.Cells.Item($r, $c).Text }; if (($vals -join '').Trim()) { $out += "  Row ${r}: " + ($vals -join ' | '); if (@($vals | Where-Object { $_ }).Count -ge 3) { break } } }; $wb.Close($false); $x.Quit() } catch { $out += '  (Could not open with Excel - please send a screenshot of the header row)' } }
+$out | Set-Content (Join-Path $d 'TracIT_Export_Details.txt'); $out; "Saved to $d\TracIT_Export_Details.txt"
