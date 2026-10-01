@@ -4607,6 +4607,12 @@ def _find_signature_field_boxes(pdf_path, target_size_pt=(141.73, 47.24), tolera
                     pass
 
         candidates.sort(key=lambda r: -r[3])  # top of page first
+        # A logo or other picture can be the same size as a signature box
+        # (seen on a real BU template: the header logo matched). The two
+        # signature boxes are always the LOWEST two on the form, so keep
+        # only those - still in top-to-bottom order (Employee, Receiver).
+        if len(candidates) > 2:
+            candidates = candidates[-2:]
         return candidates
     except Exception:
         return []
@@ -8521,10 +8527,11 @@ class WizardApp(tk.Tk):
         self.b_output_path_override = None
 
         parent = self.batch_person_frame
-        ttk.Label(
+        self.b_title_label = ttk.Label(
             parent, text=f"Now processing  ·  {item.get('employee_name') or 'looking up…'}",
             style="CardTitle.TLabel",
-        ).pack(anchor="w", pady=(0, 2))
+        )
+        self.b_title_label.pack(anchor="w", pady=(0, 2))
         ttk.Label(parent, text=f"Employee ID {item['employee_id']}   ·   #{item['row_number']} in the list",
                   style="Muted.TLabel").pack(anchor="w", pady=(0, 12))
 
@@ -8543,6 +8550,8 @@ class WizardApp(tk.Tk):
         details_box = ttk.LabelFrame(parent, text="EMPLOYEE", padding=10)
         details_box.pack(fill="x", pady=(0, 12))
         self.b_emp_name_var = tk.StringVar(value=item.get("employee_name") or "")
+        self.b_emp_name_var.trace_add("write", lambda *_a: self.b_title_label.config(
+            text=f"Now processing  ·  {self.b_emp_name_var.get().strip() or 'looking up…'}"))
         self.b_manager_name_var = tk.StringVar(value=item.get("manager_name") or "")
         ttk.Label(details_box, text="Employee Name:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(details_box, textvariable=self.b_emp_name_var, width=40).grid(row=0, column=1, sticky="w", padx=6)
