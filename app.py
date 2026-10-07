@@ -101,6 +101,7 @@ WHAT YOU NEED ON THE MACHINE RUNNING THIS
 """
 
 import base64
+import hashlib
 import io
 import csv
 import json
@@ -113,9 +114,10 @@ import tempfile
 import threading
 import time
 import uuid
-import webbrowser
+import getpass
+import urllib.parse
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
 
 import tkinter as tk
@@ -170,6 +172,65 @@ import openpyxl
 # CONFIGURATION - edit these values directly, no separate config file needed
 # ============================================================================
 CONFIG = {
+    "debug_logging": False,
+    # False (default): logs/application.log records INFO and above only -
+    # no raw directory rows (names, emails, managers) are written to disk.
+    # Set True ONLY while troubleshooting, then back to False.
+
+    "security": {
+        # Security controls added for the SRE review (findings tracker
+        # IT_Asset_App_Security_Findings). Defaults keep the app working
+        # exactly as before; production_mode=True turns on the strict
+        # settings marked [prod] below in one go.
+        "production_mode": False,
+        # Who may change the Admin / Shared Settings (endpoint URLs) in
+        # Settings: Windows user names, and/or AD groups (whoami /groups).
+        # Local Windows administrators count too unless turned off.
+        "admin_users": ["srajaamu"],
+        "admin_ad_groups": [],
+        "local_admins_are_app_admins": True,
+        # Every SSRS / TracIT / AD / ServiceNow URL must be HTTPS on one of
+        # these company domains (or a sub-domain of one).
+        "allowed_host_suffixes": ["optum.com", "uhc.com", "uhg.com", "unitedhealthgroup.com", "uhcprod.net"],
+        "allow_insecure_http": False,
+        # LDAP: ask Windows to sign + seal (encrypt) the directory traffic.
+        # True [prod] = refuse to look up without it; False = fall back to a
+        # normal bind if the domain controller doesn't accept it (logged).
+        "ldap_require_sealing": False,
+        # On-screen (mouse/touch) signature when the Topaz pad isn't
+        # available: "allow" (old behaviour), "confirm" (default: the
+        # operator confirms, and it's recorded as such in the audit log and
+        # the PDF signature), "block" [prod] = Topaz pad only.
+        "onscreen_signature": "confirm",
+        # Show a "check these details" confirmation (with where each value
+        # came from) before a PDF is generated and signed.
+        "confirm_before_generate": True,
+        # Hidden browser windows (SSRS AD-lookup fallback / Fetch from
+        # TracIT): True keeps the sign-in session between runs (as today);
+        # False [prod] = private session, nothing kept on disk.
+        "webview_persistent_session": True,
+        # Word templates: refuse oversized / suspicious .docx files.
+        "max_template_mb": 25,
+        "max_template_entries": 2000,
+        "max_template_uncompressed_mb": 200,
+        # Signing: path to an IT-issued .pfx certificate (recommended for
+        # production). Blank = the app's own certificate, whose private key
+        # is now stored ENCRYPTED (password protected by Windows DPAPI).
+        "signing_pfx_path": "",
+        # Restrict the output / data folders to the current user + admins
+        # (+ admin_ad_groups) with icacls. Off by default because a shared
+        # output folder may be used by several operators.
+        "restrict_acls": False,
+        # Copy of each audit-log line to a central (e.g. network share or
+        # SIEM-collected) folder. Blank = local audit log only.
+        "audit_central_path": "",
+    },
+
+    "data_dir": "",
+    # Blank = data (logs, cache, audit, settings, signing identity) next to
+    # app.py if that folder is writable (as before), else
+    # %PROGRAMDATA%\ITAssetSubmissionForm. Set a path to choose explicitly.
+
     "bu_templates_folder": "bu_templates",
     # Where uploaded per-BU Word doc templates are stored (both the
     # original upload and the auto-generated fillable version).
@@ -303,74 +364,19 @@ CONFIG = {
     # automatically (e.g. ...\\Generated\\Break_Fix\\, ...\\Generated\\LWD\\).
 
     "tracit_submission_types": ["Break Fix", "LWD", "Contractor LWD"],
-    # Submission types that show an "Open TracIT" button next to the
-    # Current Device Serial Number field.
+    # Submission types whose Current Device Serial Number is filled from the
+    # loaded TracIT EUC report (Load… in the header).
+
+    "lwd_date_submission_types": ["LWD", "Contractor LWD"],
+    # Submission types that show a "Last Working Date" box (typed by the
+    # operator, or prefilled from the bulk Excel file). Printed on the
+    # form's Last Working Date line. Optional - leave blank if not known.
 
     "no_current_asset_submission_types": ["New Hire"],
     # Submission types where the person has no existing/old device, so
     # the "Current Device Serial Number" field is hidden entirely (only
     # "New Device Serial Number" applies). New Hire is the obvious case;
     # add others here if they ever come up.
-    "tracit_url_template": "https://tracit.optum.com/ham/view-assets",
-    # The TracIT page to open. This is the base page only - the exact
-    # query-string format for deep-linking straight to an employee ID or
-    # serial number search wasn't available yet, so the button opens this
-    # page as-is and the ID/serial are typed in there by hand, same as
-    # today. If TracIT DOES support a URL format like
-    # "https://tracit.optum.com/ham/view-assets?empId={employee_id}&serial={serial_number}",
-    # paste that real (working) URL here instead - the {employee_id} and
-    # {serial_number} placeholders will be filled in automatically from
-    # the form.
-
-    "tracit_lookup": {
-        "enabled": True,
-        # TracIT's "View Assets" page has one fixed URL (no query-string
-        # deep-link into a filtered result) - it always reopens showing
-        # whatever filter was last applied there, so every automated
-        # lookup below starts by clearing that stale filter before
-        # applying a fresh one for the Employee ID being looked up.
-        "search_page_url": "https://tracit.optum.com/ham/view-assets",
-        # These are matched by their VISIBLE TEXT (label / aria-label /
-        # button caption), not by CSS class - TracIT is a React/MUI app
-        # whose class names (e.g. "css-xeauuy") are build-specific and
-        # change on every TracIT deploy, so matching by class would break
-        # the moment TracIT ships an update. Matching by the words a
-        # person actually reads on screen is far more stable.
-        "filter_toggle_aria_label": "Show Filters",
-        # aria-label of the funnel icon that opens the filter panel, if
-        # it isn't already open.
-        "employee_id_field_label": "User Employee Id",
-        # The floating label text above the Employee ID box inside the
-        # filter panel.
-        "clear_button_text": "Clear Filters",
-        "apply_button_text": "Apply Filters",
-        "serial_number_column_header": "Serial Number",
-        # The results table's column is found by matching this header
-        # text, not a fixed column position - so it keeps working even if
-        # TracIT reorders/adds columns later.
-        "results_ready_timeout_seconds": 20,
-        # Keep the TracIT browser window completely off-screen at all
-        # times, instead of popping it up on every "Fetch from TracIT"
-        # click. There's nothing the operator needs to see or click in it
-        # (login is Windows SSO, same as the AD lookup window) - showing
-        # it just interrupts them. Set to False to bring back the old
-        # visible popup for troubleshooting.
-        "keep_window_hidden": True,
-        # Reload the TracIT page in the background this often (seconds)
-        # even when nobody is searching, so the page/session stays warm
-        # and the very next lookup doesn't pay for a cold page load. Set
-        # to 0/None to disable the background refresh entirely. Skipped
-        # automatically if a lookup happens to be in progress right then.
-        "auto_refresh_seconds": 300,
-    },
-    # Drives the same embedded-browser approach used for AD Lookup to
-    # pull the Current Device Serial Number straight from TracIT for LWD/
-    # Contractor LWD/Break Fix submissions, instead of the operator typing
-    # it in by hand. See TracitLookupSession / _run_tracit_webview_helper
-    # further down in this file. If TracIT's real page ever stops
-    # matching the text above (e.g. the field gets relabeled), update the
-    # strings here - no code changes needed.
-
     "signing_identity_folder": "signing_identity",
     # Where this app's own self-signed signing certificate + private key
     # are stored, once generated on first use (see ensure_signing_identity
@@ -473,29 +479,21 @@ CONFIG = {
     },
 
     "tracit_report": {
-        # TracIT's EUC asset report, downloaded from TracIT (Export) and
-        # loaded ONCE - then every LWD/Contractor LWD/Break Fix lookup is
-        # an instant in-memory match instead of driving the TracIT page
-        # per employee. The app picks the newest matching file up
-        # automatically from the Downloads folder (or "Load TracIT
-        # Report..." in the header to choose one by hand).
-        # AUTOMATIC DOWNLOAD: TracIT's EUC Report screen gets its rows from
-        # one API call (POST .../Reports/GetEUCReportExtractNew - confirmed
-        # from the Edge network log); "Export as Excel" just turns those
-        # rows into a file inside the browser. That API only accepts the
-        # signed-in TracIT browser session (a plain Windows-login request
-        # gets HTTP 403), so the app makes the same call from inside its
-        # hidden TracIT window, which is already signed in. Once a day at
-        # startup (or the ⟳ button in the header). Falls back to the newest
-        # exported file in Downloads if this ever fails.
-        "auto_download": True,
-        "api_path": "/api/ham/api/Reports/GetEUCReportExtractNew",
-        # Same filter as on the TracIT screen ("Assigned Location"). Leave
-        # the list empty to fetch every location (much bigger download).
-        "assigned_locations": ["II033"],
-        "page_size": 6000,
-        "max_pages": 10,
-        "download_timeout_seconds": 240,
+        # TracIT's EUC asset report, exported from TracIT by the operator
+        # (EUC Report -> Export) and loaded with "Load…" in the header -
+        # then every LWD/Contractor LWD/Break Fix lookup is an instant
+        # in-memory match. At startup the app also picks up the newest
+        # matching export from the Downloads folder automatically, but only
+        # if it is recent (max_auto_file_age_hours), not oversized
+        # (max_file_mb) and has the expected TracIT columns.
+        # (Automatic download from TracIT has been removed.)
+        "max_auto_file_age_hours": 24,
+        "max_file_mb": 50,
+        "max_rows": 50000,  # a report bigger than this is refused (bounded processing)
+        # Only the minimum needed (Employee ID -> serial/type/host/status)
+        # is cached, as cache/tracit_index.json, and deleted after this many
+        # days. The full exported workbook is never copied into the cache.
+        "cache_retention_days": 7,
         "watch_folder": "",  # blank = the signed-in user's Downloads folder
         # A file counts as "the TracIT report" if its name contains any
         # of these (case-insensitive) and it's .xlsx/.xls/.csv.
@@ -591,6 +589,58 @@ def _app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _asset_path(*parts):
+    """A bundled read-only file (logo, placeholder image). In a PyInstaller
+    .exe these live in the bundle folder (_internal); an 'assets' folder
+    placed next to the .exe / app.py wins, so a logo can be swapped
+    without rebuilding."""
+    beside = os.path.join(_app_dir(), "assets", *parts)
+    if os.path.exists(beside):
+        return beside
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        return os.path.join(bundle, "assets", *parts)
+    return beside
+
+
+def _dir_is_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_test_%d" % os.getpid())
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _data_dir():
+    """Where the app keeps its DATA (logs, cache, audit log, admin settings,
+    signing identity, templates) - security finding #13:
+      1. CONFIG["data_dir"] or the ITASSET_DATA_DIR environment variable, if set;
+      2. otherwise next to app.py/the .exe IF that folder is writable (how the
+         app has always worked - unchanged for a copied-in app.py);
+      3. otherwise %PROGRAMDATA%\\ITAssetSubmissionForm (the app was installed
+         read-only, e.g. under Program Files, as recommended)."""
+    configured = (CONFIG.get("data_dir") or os.environ.get("ITASSET_DATA_DIR") or "").strip()
+    if configured:
+        os.makedirs(configured, exist_ok=True)
+        return configured
+    app_dir = _app_dir()
+    if _DATA_DIR_CACHE.get(app_dir) is None:
+        if _dir_is_writable(app_dir):
+            _DATA_DIR_CACHE[app_dir] = app_dir
+        else:
+            base = os.environ.get("PROGRAMDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+            _DATA_DIR_CACHE[app_dir] = os.path.join(base, "ITAssetSubmissionForm")
+            os.makedirs(_DATA_DIR_CACHE[app_dir], exist_ok=True)
+    return _DATA_DIR_CACHE[app_dir]
+
+
+_DATA_DIR_CACHE = {}
+
+
 # ============================================================================
 # DIAGNOSTIC LOGGING - writes a plain-text log file next to app.py so a
 # problem in the field (AD lookup, Topaz pad, PDF generation, etc.) can be
@@ -605,7 +655,7 @@ logger = logging.getLogger("it_asset_app")
 
 
 def _setup_logging():
-    log_dir = os.path.join(_app_dir(), "logs")
+    log_dir = os.path.join(_data_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "application.log")
 
@@ -623,7 +673,9 @@ def _setup_logging():
         log_path, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(fmt)
-    file_handler.setLevel(logging.DEBUG)
+    # Security: DEBUG lines can contain personal data (raw AD rows with names
+    # and emails), so they only reach the log file when debug_logging is on.
+    file_handler.setLevel(logging.DEBUG if CONFIG.get("debug_logging") else logging.INFO)
     logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
@@ -767,7 +819,8 @@ def fetch_employee_details(emp_id, config):
             "'http://adlookup.company.com/search?id={emp_id}'"
         )
 
-    url = url_template.format(emp_id=emp_id)
+    url = url_template.format(emp_id=urllib.parse.quote(str(emp_id), safe=""))
+    _validate_endpoint(url, config, what="AD Lookup URL")
     timeout = config.get("ad_lookup_timeout_seconds", 8)
 
     auth = HttpNegotiateAuth() if HAS_SSPI else None
@@ -868,13 +921,36 @@ def _adsi_default_search_base():
     return "LDAP://" + root.Get("defaultNamingContext")
 
 
+# ADS_SECURE_AUTHENTICATION | ADS_USE_SIGNING | ADS_USE_SEALING: Kerberos
+# (Windows login) bind with signed + encrypted LDAP traffic (finding #14).
+ADS_SECURE_SIGN_SEAL = 0x1 | 0x40 | 0x80
+
+
+def _adsi_open_connection(win32com_client, config=None):
+    """Opens the ADsDSOObject connection asking for signing + sealing. If
+    the directory refuses and security.ldap_require_sealing is False, falls
+    back to the normal Windows-login bind (logged as a warning)."""
+    def open_conn(flags):
+        conn = win32com_client.Dispatch("ADODB.Connection")
+        conn.Provider = "ADsDSOObject"
+        if flags is not None:
+            conn.Properties("ADSI Flag").Value = flags
+        conn.Open("Active Directory Provider")
+        return conn
+    try:
+        return open_conn(ADS_SECURE_SIGN_SEAL)
+    except Exception as exc:
+        if _sec(config, "ldap_require_sealing", False):
+            raise LdapUnavailable(f"LDAP sign+seal was refused ({exc}) and security.ldap_require_sealing is on.")
+        logger.warning("LDAP: sign+seal bind not accepted (%s) - using the standard Windows-login bind", exc)
+        return open_conn(None)
+
+
 def _adsi_search(search_base, ldap_filter, attributes, timeout_seconds=10):
     """Runs one subtree search through the ADsDSOObject (ADSI) OLE DB
     provider and returns a list of {attribute: value} dicts."""
     import win32com.client
-    conn = win32com.client.Dispatch("ADODB.Connection")
-    conn.Provider = "ADsDSOObject"
-    conn.Open("Active Directory Provider")
+    conn = _adsi_open_connection(win32com.client)
     try:
         cmd = win32com.client.Dispatch("ADODB.Command")
         cmd.ActiveConnection = conn
@@ -908,7 +984,14 @@ def _adsi_read_object(dn, attributes):
     """Binds directly to one directory object by its DN (e.g. the manager
     entry an employee's `manager` attribute points to)."""
     import win32com.client
-    obj = win32com.client.GetObject("LDAP://" + dn.replace("/", "\\/"))
+    path = "LDAP://" + dn.replace("/", "\\/")
+    try:
+        obj = win32com.client.GetObject("LDAP:").OpenDSObject(path, None, None, ADS_SECURE_SIGN_SEAL)
+    except Exception as exc:
+        if _sec(None, "ldap_require_sealing", False):
+            raise LdapUnavailable(f"LDAP sign+seal was refused for the manager lookup ({exc}).")
+        logger.warning("LDAP: sign+seal bind for manager not accepted (%s) - standard bind", exc)
+        obj = win32com.client.GetObject(path)
     out = {}
     for attr in attributes:
         try:
@@ -1007,10 +1090,10 @@ def ldap_lookup_employee(emp_id, config):
             pass
 
     logger.info(
-        "LDAP lookup: emp_id=%r -> %d candidate(s) in %.2fs (emp_name=%r manager_name=%r)",
+        "LDAP lookup: emp_id=%r -> %d candidate(s) in %.2fs (name found: %s, manager found: %s)",
         emp_id, len(candidates), time.time() - start,
-        candidates[0].get("emp_name") if candidates else None,
-        candidates[0].get("manager_name") if candidates else None,
+        bool(candidates and candidates[0].get("emp_name")),
+        bool(candidates and candidates[0].get("manager_name")),
     )
     return candidates
 
@@ -1181,180 +1264,6 @@ class BrowserLookupSession:
         if "error" in result:
             raise RuntimeError(result["error"])
         return result.get("candidates", [])
-
-    def shutdown(self):
-        """Call when the main app is closing, to cleanly close the
-        embedded browser window and end the helper process."""
-        with self._lock:
-            if self._proc is None:
-                return
-            try:
-                self._proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
-                self._proc.stdin.flush()
-            except Exception:
-                pass
-            try:
-                self._proc.wait(timeout=5)
-            except Exception:
-                try:
-                    self._proc.terminate()
-                except Exception:
-                    pass
-            self._proc = None
-
-
-class TracitLookupSession:
-    """Bulk-serial-number-pulling sibling of BrowserLookupSession, above -
-    same overall design (a background subprocess drives a real embedded
-    browser window so TracIT's own SSO session gets reused, request/
-    response pairs travel over stdin/stdout keyed by request_id), just
-    talking to TracIT's "View Assets" page instead of the AD report."""
-
-    SEARCH_TIMEOUT_SECONDS = 60
-
-    def __init__(self):
-        self._proc = None
-        self._lock = threading.Lock()
-        self._pending = {}  # request_id -> {"event": Event, "result": dict}
-        self._fatal_error = None
-
-    def _build_command(self):
-        if getattr(sys, "frozen", False):
-            return [sys.executable, "--tracit-helper"]
-        return [sys.executable, os.path.abspath(__file__), "--tracit-helper"]
-
-    def start(self):
-        """Launches the helper process and its background window. Safe to
-        call more than once - a no-op if already running."""
-        with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
-                return
-            self._fatal_error = None
-            command = self._build_command()
-            try:
-                self._proc = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-                logger.info("TracIT helper: launched new subprocess (pid=%s): %r", self._proc.pid, command)
-            except FileNotFoundError:
-                logger.exception("TracIT helper: failed to launch subprocess: %r", command)
-                self._fatal_error = (
-                    f"Could not launch the TracIT lookup helper process ({command[0]}). "
-                    "This usually means Python itself couldn't be found - "
-                    "if you're running the packaged .exe, try reinstalling it."
-                )
-                self._proc = None
-                return
-
-            threading.Thread(target=self._read_loop, daemon=True).start()
-
-    def _read_loop(self):
-        proc = self._proc
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except Exception:
-                continue
-
-            if data.get("cmd") == "fatal_error":
-                self._fatal_error = data.get("error", "Unknown fatal error in TracIT lookup helper.")
-                for entry in self._pending.values():
-                    entry["result"] = {"error": self._fatal_error}
-                    entry["event"].set()
-                continue
-
-            request_id = data.get("request_id")
-            entry = self._pending.get(request_id)
-            if entry is not None:
-                entry["result"] = data
-                entry["event"].set()
-        with self._lock:
-            if self._proc is proc:
-                self._proc = None
-
-    def is_running(self):
-        return self._proc is not None and self._proc.poll() is None
-
-    def export_euc(self, timeout=300, assigned_locations=None):
-        """Downloads the TracIT EUC report rows through the hidden, signed-in
-        TracIT window (see _perform_tracit_euc_export). Returns a list of
-        compact row dicts; raises RuntimeError on failure."""
-        message = {"cmd": "export_euc"}
-        if assigned_locations is not None:
-            message["assigned_locations"] = list(assigned_locations)
-        result = self._request(message, timeout)
-        return result.get("rows") or []
-
-    def _request(self, message, timeout):
-        if not self.is_running():
-            self.start()
-        if self._fatal_error:
-            raise RuntimeError(self._fatal_error)
-        if self._proc is None:
-            raise RuntimeError("TracIT helper failed to start.")
-        request_id = uuid.uuid4().hex
-        event = threading.Event()
-        self._pending[request_id] = {"event": event, "result": None}
-        try:
-            self._proc.stdin.write(json.dumps(dict(message, request_id=request_id)) + "\n")
-            self._proc.stdin.flush()
-        except Exception as exc:
-            self._pending.pop(request_id, None)
-            raise RuntimeError(f"TracIT helper is not responding ({exc}).")
-        if not event.wait(timeout=timeout):
-            self._pending.pop(request_id, None)
-            raise RuntimeError("Timed out waiting for TracIT.")
-        result = self._pending.pop(request_id)["result"]
-        if "error" in result:
-            raise RuntimeError(result["error"])
-        return result
-
-    def search(self, emp_id):
-        """Blocks until a serial number is returned or raises RuntimeError.
-        Returns the serial number string (never None on success - a
-        genuinely empty Serial Number cell on TracIT's side surfaces as a
-        RuntimeError, same as a not-found search, so the caller never
-        silently overwrites a real value with blank text)."""
-        if not self.is_running():
-            self.start()
-        if self._fatal_error:
-            raise RuntimeError(self._fatal_error)
-        if self._proc is None:
-            raise RuntimeError("TracIT lookup helper failed to start.")
-
-        request_id = uuid.uuid4().hex
-        event = threading.Event()
-        self._pending[request_id] = {"event": event, "result": None}
-
-        try:
-            self._proc.stdin.write(json.dumps({"request_id": request_id, "emp_id": emp_id}) + "\n")
-            self._proc.stdin.flush()
-        except Exception as exc:
-            self._pending.pop(request_id, None)
-            raise RuntimeError(
-                f"TracIT lookup helper is not responding ({exc}). It may have "
-                "been closed - click Fetch from TracIT again to restart it."
-            )
-
-        if not event.wait(timeout=self.SEARCH_TIMEOUT_SECONDS):
-            self._pending.pop(request_id, None)
-            raise RuntimeError(
-                "Timed out waiting for the TracIT search result. If a login "
-                "page appeared, please complete it and try again."
-            )
-
-        result = self._pending.pop(request_id)["result"]
-        if "error" in result:
-            raise RuntimeError(result["error"])
-        return result.get("serial_number")
 
     def shutdown(self):
         """Call when the main app is closing, to cleanly close the
@@ -1836,10 +1745,21 @@ def _perform_ssrs_search(window, emp_id, button_text, header_keyword, name_colum
             f"'{emp_id}'. Double-check the ID is correct and enabled in AD."
         )
     logger.info(
-        "AD lookup: SUCCESS for emp_id=%r - %d candidate(s), emp_name=%r manager_name=%r",
-        emp_id, len(candidates), candidates[0].get("emp_name"), candidates[0].get("manager_name"),
+        "AD lookup: SUCCESS for emp_id=%r - %d candidate(s) (name found: %s, manager found: %s)",
+        emp_id, len(candidates), bool(candidates[0].get("emp_name")), bool(candidates[0].get("manager_name")),
     )
     return candidates
+
+
+def _webview_start(webview, profile_dir):
+    """Security (finding #4): with security.webview_persistent_session
+    True (default) the hidden window keeps its sign-in session in the
+    user's own profile folder (as before); False = private session, no
+    cookies/storage written to disk."""
+    if _sec(CONFIG, "webview_persistent_session", True):
+        webview.start(gui="edgechromium", private_mode=False, storage_path=profile_dir)
+    else:
+        webview.start(gui="edgechromium", private_mode=True)
 
 
 def _run_webview_helper():
@@ -1898,6 +1818,12 @@ def _run_webview_helper():
                 ),
             })
             return
+
+    try:
+        _validate_endpoint(search_url, config, what="AD lookup page")
+    except ValueError as exc:
+        _send({"cmd": "fatal_error", "error": str(exc)})
+        return
 
     window = webview.create_window(
         "Employee Lookup - log in here if prompted, then leave this window open",
@@ -2081,665 +2007,7 @@ def _run_webview_helper():
     # gui="edgechromium" forces the WebView2/Edge backend on Windows.
     # private_mode=False + storage_path keeps the session/cookies alive on
     # disk too, as a bonus, in case the app is restarted later.
-    webview.start(gui="edgechromium", private_mode=False, storage_path=profile_dir)
-
-
-# ============================================================================
-# TRACIT LOOKUP - embedded-browser helper (runs in a SEPARATE process - this
-# same file, relaunched with --tracit-helper; see TracitLookupSession above
-# and the bottom of this file for the dispatcher)
-# ============================================================================
-
-def _perform_tracit_search(window, emp_id, cfg):
-    """Runs one search against TracIT's "View Assets" page: makes sure the
-    filter panel is open, clears whatever filter TracIT kept from the last
-    search, types the Employee ID into the field, applies it, waits for
-    the results table to actually reflect that Employee ID, then reads
-    the Serial Number cell out of the first row.
-
-    Every element is found by its VISIBLE TEXT (label/aria-label/button
-    caption) rather than a CSS selector - see the tracit_lookup CONFIG
-    comment for why (TracIT's MUI class names are build-specific and
-    change on every TracIT deploy)."""
-    employee_id_label = cfg.get("employee_id_field_label", "User Employee Id")
-    clear_text = cfg.get("clear_button_text", "Clear Filters")
-    apply_text = cfg.get("apply_button_text", "Apply Filters")
-    toggle_aria = cfg.get("filter_toggle_aria_label", "Show Filters")
-    serial_header = cfg.get("serial_number_column_header", "Serial Number")
-    ready_timeout = cfg.get("results_ready_timeout_seconds", 20)
-
-    logger.info("TracIT lookup: starting search for emp_id=%r", emp_id)
-
-    find_input_js = f"""
-    (function() {{
-        var wantLabel = {json.dumps(employee_id_label.strip().lower())};
-        var nodes = document.querySelectorAll('label, span, p, div, legend');
-        for (var i = 0; i < nodes.length; i++) {{
-            var t = (nodes[i].textContent || '').trim().toLowerCase();
-            if (t !== wantLabel) continue;
-            var container = nodes[i].closest('div');
-            for (var d = 0; d < 4 && container; d++) {{
-                var inp = container.querySelector('input');
-                if (inp) return true;
-                container = container.parentElement;
-            }}
-        }}
-        return false;
-    }})();
-    """
-
-    # Open the filter panel first, if the Employee ID field isn't already
-    # visible - TracIT hides the filter row behind a funnel icon until
-    # it's clicked.
-    if not window.evaluate_js(find_input_js):
-        # IMPORTANT: the filter button is a real open/close TOGGLE (its
-        # aria-label flips between e.g. "Show Filters" and "Hide Filters"
-        # once the panel is open), not an idempotent "make sure it's open"
-        # action. Clicking it again while the panel is already open (or
-        # mid-way through its open animation) closes it right back up. The
-        # previous version of this helper re-clicked it on every single
-        # poll (treating repeated clicks as always safe), which was wrong:
-        # if the panel's
-        # open animation hadn't finished rendering the input yet, the next
-        # poll would click the now-"Hide Filters" button and slam the panel
-        # shut again, and the loop could spend its whole 8s deadline
-        # flip-flopping the panel open/closed instead of just waiting for
-        # it to finish opening. This produced the intermittent "Could not
-        # find the Employee ID field ... even after trying to open the
-        # filter panel" failures seen in production, clustered on certain
-        # lookups rather than every lookup, exactly as a race like this
-        # would present.
-        #
-        # Fix: only click the button when its own state says it's actually
-        # closed. If its aria-label doesn't distinguish show/hide (some
-        # TracIT builds may not), fall back to clicking at most ONCE and
-        # then just wait out the animation instead of clicking repeatedly.
-        toggle_js = f"""
-        (function(skipAmbiguousClick) {{
-            var wantAria = {json.dumps(toggle_aria.strip().lower())};
-            var btns = document.querySelectorAll('button');
-            for (var i = 0; i < btns.length; i++) {{
-                var aria = (btns[i].getAttribute('aria-label') || '').trim().toLowerCase();
-                if (aria === wantAria) {{
-                    btns[i].click();
-                    return "CLICKED";
-                }}
-                if (aria.indexOf('hide') !== -1 && aria.indexOf('filter') !== -1) {{
-                    return "ALREADY_OPEN";
-                }}
-            }}
-            if (skipAmbiguousClick) return "WAITING";
-            for (var i = 0; i < btns.length; i++) {{
-                var aria2 = (btns[i].getAttribute('aria-label') || '').trim().toLowerCase();
-                if (aria2.indexOf('filter') !== -1) {{
-                    btns[i].click();
-                    return "CLICKED_FALLBACK";
-                }}
-            }}
-            return "NOT_FOUND";
-        }})(%s);
-        """
-        # A freshly-opened TracIT window may fire "loaded" before React has
-        # finished its first render/hydration pass, so the toggle button
-        # (and then the field) can be missing on the very first click. Keep
-        # polling for up to 8s, but only click the toggle when it's safe to
-        # (see comment above) so the panel doesn't get toggled shut again.
-        deadline = time.time() + 8
-        ambiguous_clicked = False
-        while time.time() < deadline and not window.evaluate_js(find_input_js):
-            result = window.evaluate_js(toggle_js % ("true" if ambiguous_clicked else "false"))
-            if result == "CLICKED_FALLBACK":
-                ambiguous_clicked = True
-            time.sleep(0.3)
-        if not window.evaluate_js(find_input_js):
-            logger.error("TracIT lookup: could not open the filter panel / find the Employee ID field")
-            raise RuntimeError(
-                f"Could not find the '{employee_id_label}' field on the TracIT "
-                "View Assets page (even after trying to open the filter panel). "
-                "TracIT may have changed its layout - update tracit_lookup in "
-                "CONFIG to match the current field/button wording."
-            )
-
-    # Clear whatever filter TracIT kept from the previous search (it does
-    # not reset itself when the page reopens) before applying a new one.
-    clear_js = f"""
-    (function(text) {{
-        var btns = document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {{
-            if ((btns[i].textContent || '').trim().toLowerCase() === text) {{
-                btns[i].click();
-                return "OK";
-            }}
-        }}
-        return "NOT_FOUND";
-    }})({json.dumps(clear_text.strip().lower())});
-    """
-    if window.evaluate_js(clear_js) == "OK":
-        logger.debug("TracIT lookup: cleared the previous filter")
-        time.sleep(0.5)
-
-    # Fill the Employee ID field. TracIT is a React app, so a plain
-    # `.value = ...` assignment doesn't register with React's own state -
-    # the native property setter has to be used instead, same trick the
-    # rest of this function relies on for every other field it fills.
-    fill_js = f"""
-    (function(wantLabel, empId) {{
-        var nodes = document.querySelectorAll('label, span, p, div, legend');
-        var input = null;
-        for (var i = 0; i < nodes.length; i++) {{
-            var t = (nodes[i].textContent || '').trim().toLowerCase();
-            if (t !== wantLabel) continue;
-            var container = nodes[i].closest('div');
-            for (var d = 0; d < 4 && container && !input; d++) {{
-                input = container.querySelector('input');
-                container = container.parentElement;
-            }}
-            if (input) break;
-        }}
-        if (!input) return "NO_INPUT";
-        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        input.focus();
-        setter.call(input, '');
-        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        setter.call(input, empId);
-        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        input.blur();
-        return "OK";
-    }})({json.dumps(employee_id_label.strip().lower())}, {json.dumps(emp_id)});
-    """
-    if window.evaluate_js(fill_js) != "OK":
-        logger.error("TracIT lookup: could not find/fill the '%s' field for emp_id=%r", employee_id_label, emp_id)
-        raise RuntimeError(
-            f"Could not fill the '{employee_id_label}' field on the TracIT "
-            "View Assets page. Update tracit_lookup.employee_id_field_label "
-            "in CONFIG if TracIT has changed that label's wording."
-        )
-    logger.debug("TracIT lookup: filled Employee ID field OK")
-
-    # Snapshot the results table BEFORE applying the new filter, so the
-    # "ready" check below can require the table to actually have changed -
-    # not just the filter chip to have appeared. The chip is added to the
-    # DOM as soon as the filter *state* changes (synchronous, client-side),
-    # but the table itself only updates once TracIT's async fetch for the
-    # newly-filtered rows returns and React re-renders - those two events
-    # are NOT simultaneous. Relying on the chip alone let this function
-    # read the still-stale (pre-filter) table and grab an unrelated row's
-    # empty Serial Number cell, which is what production logs showed
-    # ("results filtered after 0.0s" followed by an empty Serial Number).
-    snapshot_js = """
-    (function() {
-        var table = document.querySelector('table');
-        var tbody = table ? table.querySelector('tbody') : null;
-        return tbody ? (tbody.textContent || '') : '';
-    })();
-    """
-    table_snapshot_before = window.evaluate_js(snapshot_js) or ""
-
-    apply_js = f"""
-    (function(text) {{
-        var btns = document.querySelectorAll('button');
-        for (var i = 0; i < btns.length; i++) {{
-            if ((btns[i].textContent || '').trim().toLowerCase() === text) {{
-                btns[i].click();
-                return "OK";
-            }}
-        }}
-        return "NOT_FOUND";
-    }})({json.dumps(apply_text.strip().lower())});
-    """
-    if window.evaluate_js(apply_js) != "OK":
-        logger.error("TracIT lookup: could not find the '%s' button", apply_text)
-        raise RuntimeError(
-            f"Could not find the '{apply_text}' button on the TracIT View "
-            "Assets page. Update tracit_lookup.apply_button_text in CONFIG "
-            "if TracIT has changed that button's wording."
-        )
-    logger.debug("TracIT lookup: clicked '%s'", apply_text)
-
-    # Wait for the results to actually reflect THIS Employee ID - TracIT
-    # shows the applied filter as a chip reading "Employee ID: <value>",
-    # which only appears once the new filter has taken effect.
-    chip_ready_js = f"""
-    (function(empId) {{
-        var wantText = ('employee id: ' + empId).toLowerCase();
-        var nodes = document.querySelectorAll('span, div');
-        for (var i = 0; i < nodes.length; i++) {{
-            var t = (nodes[i].textContent || '').trim().toLowerCase();
-            if (t === wantText) return true;
-        }}
-        return false;
-    }})({json.dumps(emp_id)});
-    """
-    wait_start = time.time()
-    deadline = wait_start + ready_timeout
-    chip_found = False
-    table_changed = False
-    while time.time() < deadline:
-        if not chip_found and window.evaluate_js(chip_ready_js):
-            chip_found = True
-            logger.debug("TracIT lookup: filter chip appeared after %.1fs", time.time() - wait_start)
-        if chip_found:
-            current_table = window.evaluate_js(snapshot_js) or ""
-            if current_table != table_snapshot_before:
-                table_changed = True
-                break
-        time.sleep(0.3)
-    if not chip_found:
-        logger.error(
-            "TracIT lookup: TIMED OUT after %.1fs waiting for the Employee ID "
-            "filter chip for emp_id=%r", time.time() - wait_start, emp_id,
-        )
-        raise RuntimeError(
-            f"Timed out waiting for TracIT to apply the Employee ID filter "
-            f"for '{emp_id}'. TracIT may be slow, or the ID may not exist "
-            "there - try increasing tracit_lookup.results_ready_timeout_"
-            "seconds in CONFIG."
-        )
-    if not table_changed:
-        # The chip appeared but the table's content never visibly changed
-        # within the timeout. This can legitimately happen (e.g. the
-        # previous search happened to already show this same row), so
-        # don't hard-fail - just note it and fall through to extraction
-        # with whatever the table currently shows.
-        logger.warning(
-            "TracIT lookup: filter chip appeared for emp_id=%r but the "
-            "results table content never changed within %.1fs - proceeding "
-            "with extraction anyway", emp_id, ready_timeout,
-        )
-    else:
-        logger.debug("TracIT lookup: results table updated after %.1fs", time.time() - wait_start)
-    # Give React a brief moment to finish committing the new rows after the
-    # table content first differs, before reading cell values out of it.
-    time.sleep(0.3)
-
-    # Scan every row for the Serial Number, not just the first one. An
-    # employee can have more than one asset record (e.g. a phone plan or
-    # accessory row with no serial alongside their actual laptop/monitor
-    # rows), and TracIT doesn't guarantee the row with a populated Serial
-    # Number sorts first. Production logs showed "Serial Number cell was
-    # empty" recurring even after the stale-table-read fix, which points to
-    # this - reading only row 0 - rather than a timing bug.
-    extract_js = f"""
-    (function(wantHeader) {{
-        var table = document.querySelector('table');
-        if (!table) return {{error: "NO_TABLE"}};
-        var headerCells = table.querySelectorAll('thead th');
-        var colIndex = -1;
-        for (var i = 0; i < headerCells.length; i++) {{
-            var t = (headerCells[i].textContent || '').trim().toLowerCase();
-            if (t === wantHeader) {{ colIndex = i; break; }}
-        }}
-        if (colIndex === -1) return {{error: "NO_SERIAL_COLUMN"}};
-        var bodyRows = table.querySelectorAll('tbody tr');
-        if (!bodyRows.length) return {{error: "NO_ROWS"}};
-        var serials = [];
-        for (var r = 0; r < bodyRows.length; r++) {{
-            var cells = bodyRows[r].querySelectorAll('td');
-            serials.push(colIndex < cells.length ? (cells[colIndex].textContent || '').trim() : '');
-        }}
-        var firstNonEmpty = '';
-        for (var s = 0; s < serials.length; s++) {{
-            if (serials[s]) {{ firstNonEmpty = serials[s]; break; }}
-        }}
-        return {{serial: serials[0], firstNonEmptySerial: firstNonEmpty, rowCount: bodyRows.length}};
-    }})({json.dumps(serial_header.strip().lower())});
-    """
-    scan = window.evaluate_js(extract_js) or {}
-    if scan.get("error") == "NO_SERIAL_COLUMN":
-        raise RuntimeError(
-            f"TracIT's results table doesn't have a '{serial_header}' column "
-            "(or its wording has changed). Update tracit_lookup."
-            "serial_number_column_header in CONFIG."
-        )
-    if scan.get("error") in ("NO_TABLE", "NO_ROWS"):
-        raise RuntimeError(
-            f"TracIT returned no asset records for Employee ID '{emp_id}'. "
-            "Double-check the ID, or look it up on TracIT directly."
-        )
-    serial = (scan.get("firstNonEmptySerial") or "").strip()
-    if not serial:
-        # Every row's Serial Number cell was empty. The row(s) may still be
-        # mid-render (React can commit a row's shell slightly before its
-        # cell text settles) - give it a short grace window and re-read
-        # before treating this as a real empty-Serial-Number record.
-        retry_deadline = time.time() + 3
-        while not serial and time.time() < retry_deadline:
-            time.sleep(0.3)
-            scan = window.evaluate_js(extract_js) or {}
-            serial = (scan.get("firstNonEmptySerial") or "").strip()
-    if not serial:
-        raise RuntimeError(
-            f"TracIT found {scan.get('rowCount')} record(s) for Employee ID "
-            f"'{emp_id}', but none had a Serial Number filled in."
-        )
-    if scan.get("serial") and scan.get("serial") != serial:
-        logger.info(
-            "TracIT lookup: emp_id=%r - first row's Serial Number was blank, "
-            "used the first non-empty one from another row instead", emp_id,
-        )
-    logger.info(
-        "TracIT lookup: SUCCESS for emp_id=%r - serial_number=%r (rowCount=%s)",
-        emp_id, serial, scan.get("rowCount"),
-    )
-    return serial
-
-
-# ----------------------------------------------------------------------
-# TracIT EUC report - automatic download through the hidden TracIT window
-# ----------------------------------------------------------------------
-
-# The same request TracIT's own "EUC Report" screen sends (captured from
-# the Edge network log), with every filter empty except Assigned Location.
-TRACIT_EUC_COLUMNS = [
-    "serialNumber", "assetTag", "deviceType", "hostName", "partNumber", "modelNm", "manufacturerNm",
-    "osName", "lifecycleStatus", "lifecycleSubStatus", "poNumber", "lifecycleStatusUpdateDate",
-    "assignedOwnerEmpid", "assignedOwnerName", "assignedOwnerUserID", "computerUser", "computerUserEMPID",
-    "assetLocation", "assetLocationCountry", "assetLocationCity", "assignedLocation", "companyName",
-    "isIntegrated", "uhgOwned", "audOwner", "audOwnerMsId", "audRequestNumber", "audEffectiveDate",
-    "audFollowupDate", "audComment", "comment", "specialProjectHandlingType", "chargebackType",
-    "assetAging", "monthsInService", "purchaseInvoiceDate", "assetScanAging", "isAUD", "lastScanDate",
-    "lastScanSource", "lastLogonDate", "lastLogonUserId", "computraceAgent", "computraceEventStatus",
-    "computraceLastCall", "audCategoryName", "previousLifecycleStatus", "previousLifecycleDate",
-    "eucDeviceId", "svpVendorName",
-]
-
-
-def _tracit_euc_payload(cfg):
-    payload = {
-        "pageSize": int(cfg.get("page_size") or 6000), "pageNumber": 1,
-        "assetType": [], "lifecycleStatus": [], "lifecycleSubStatus": [], "assetLocationCountry": [],
-        "specialProjectHandlingType": [], "assetScanAging": [], "assetAging": [], "companyName": [],
-        "assignedLocation": list(cfg.get("assigned_locations") or []), "assetLocation": [], "aud": [],
-        "serialNumber": [], "assetTag": [], "machineName": [], "primaryUserEmployeeId": [],
-        "primaryUserMSId": [], "assignedOwnerEmployeeId": [], "assignedOwnerUserId": [], "poNumber": [],
-        "manufacturer": [], "audOwnerMSId": [], "modelNM": None, "partNumber": None, "osName": None,
-        "computraceAgent": [], "computraceEventStatus": [], "lastLogonDateFrom": None,
-        "lastLogonDateTo": None, "lifecycleStatusDateFrom": None, "lifecycleStatusDateTo": None,
-        "columns": TRACIT_EUC_COLUMNS,
-    }
-    return payload
-
-
-# Runs INSIDE the signed-in TracIT page: same-origin fetch, so the page's
-# own session cookies go with it. If TracIT answers 401/403 it retries once
-# with the page's stored sign-in token (MSAL keeps it in session/local
-# storage), in case the API wants a Bearer header rather than cookies.
-# Pages through results, keeps only the columns the app needs, and leaves
-# the outcome in window.__eucExport for Python to poll.
-_TRACIT_EUC_EXPORT_JS = r"""
-(function (cfg) {
-  window.__eucExport = { done: false };
-  function findToken() {
-    try {
-      var stores = [window.sessionStorage, window.localStorage];
-      for (var s = 0; s < stores.length; s++) {
-        var st = stores[s];
-        for (var i = 0; i < st.length; i++) {
-          var k = st.key(i);
-          if (!/accesstoken/i.test(k)) continue;
-          try { var v = JSON.parse(st.getItem(k)); if (v && v.secret) return v.secret; } catch (e) {}
-        }
-      }
-    } catch (e) {}
-    return null;
-  }
-  function rowsOf(obj, depth) {
-    depth = depth || 0;
-    if (depth > 4 || obj === null || obj === undefined) return null;
-    if (Array.isArray(obj)) return (obj.length === 0 || typeof obj[0] === 'object') ? obj : null;
-    if (typeof obj === 'object') {
-      for (var k in obj) { var r = rowsOf(obj[k], depth + 1); if (r) return r; }
-    }
-    return null;
-  }
-  function pick(row, names) {
-    var lower = {};
-    for (var k in row) lower[k.toLowerCase()] = row[k];
-    for (var i = 0; i < names.length; i++) {
-      var v = lower[names[i].toLowerCase()];
-      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
-    }
-    return '';
-  }
-  async function page(n, token) {
-    var body = JSON.parse(JSON.stringify(cfg.payload));
-    body.pageNumber = n;
-    var h = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/plain, */*' };
-    if (token) h['Authorization'] = 'Bearer ' + token;
-    var r = await fetch(cfg.url, { method: 'POST', credentials: 'include', headers: h, body: JSON.stringify(body) });
-    if (!r.ok) throw { status: r.status };
-    return rowsOf(await r.json()) || [];
-  }
-  (async function () {
-    var token = null, all = [], n = 1, auth = 'session';
-    try {
-      while (true) {
-        var rows;
-        try {
-          rows = await page(n, token);
-        } catch (e) {
-          if (e && (e.status === 401 || e.status === 403) && !token && (token = findToken())) {
-            auth = 'token';
-            rows = await page(n, token);
-          } else { throw e; }
-        }
-        for (var i = 0; i < rows.length; i++) {
-          var r = rows[i];
-          all.push({
-            serial: pick(r, ['serialNumber']),
-            owner: pick(r, ['assignedOwnerEmpid', 'assignedOwnerEmployeeId']),
-            user: pick(r, ['computerUserEMPID', 'computerUserEmpid', 'primaryUserEmployeeId']),
-            type: pick(r, ['deviceType', 'assetType']),
-            model: pick(r, ['modelNm', 'modelName']),
-            host: pick(r, ['hostName', 'machineName']),
-            status: pick(r, ['lifecycleStatus'])
-          });
-        }
-        if (rows.length < cfg.payload.pageSize || n >= cfg.maxPages) break;
-        n++;
-      }
-      window.__eucExport = { done: true, rows: all, pages: n, auth: auth };
-    } catch (e) {
-      window.__eucExport = { done: true, error: (e && e.status) ? ('HTTP ' + e.status) : String(e && e.message || e) };
-    }
-  })();
-  return 'started';
-})(%s);
-"""
-
-
-def _perform_tracit_euc_export(window, cfg):
-    """Fetches the EUC report rows through the (signed-in) TracIT window.
-    Returns the list of compact rows; raises RuntimeError on failure."""
-    js_cfg = {
-        "url": cfg.get("api_path") or "/api/ham/api/Reports/GetEUCReportExtractNew",
-        "payload": _tracit_euc_payload(cfg),
-        "maxPages": int(cfg.get("max_pages") or 10),
-    }
-    start = time.time()
-    window.evaluate_js(_TRACIT_EUC_EXPORT_JS % json.dumps(js_cfg))
-    timeout = float(cfg.get("download_timeout_seconds") or 240)
-    while time.time() - start < timeout:
-        raw = window.evaluate_js(
-            "(window.__eucExport && window.__eucExport.done) ? JSON.stringify(window.__eucExport) : null"
-        )
-        if raw:
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            if result.get("error"):
-                raise RuntimeError(
-                    f"TracIT refused the EUC report request ({result['error']}). If TracIT asks you to "
-                    "sign in, open it once in Edge and try again - or use 'Load…' with an exported file."
-                )
-            rows = result.get("rows") or []
-            logger.info("TracIT EUC export: %d row(s) in %.1fs (%s page(s), auth=%s)",
-                        len(rows), time.time() - start, result.get("pages"), result.get("auth"))
-            return rows
-        time.sleep(0.5)
-    raise RuntimeError(f"TracIT EUC report download timed out after {int(timeout)}s.")
-
-
-def _run_tracit_webview_helper():
-    import webview
-
-    logger.info("TracIT helper: subprocess started (pid=%s)", os.getpid())
-
-    config = CONFIG
-    _apply_admin_settings_overrides(config)
-    cfg = config.get("tracit_lookup", {})
-    search_url = cfg.get("search_page_url") or config.get("tracit_url_template", "")
-    profile_dir = os.path.join(os.path.expanduser("~"), ".it_asset_form_tracit_webview_profile")
-
-    if not search_url:
-        _send({
-            "cmd": "fatal_error",
-            "error": "CONFIG -> tracit_lookup.search_page_url isn't set. See README.md.",
-        })
-        return
-
-    keep_hidden = cfg.get("keep_window_hidden", True)
-    window = webview.create_window(
-        "TracIT Lookup (background - stays hidden, no action needed here)",
-        search_url,
-        width=1200,
-        height=800,
-        hidden=bool(keep_hidden),
-    )
-
-    # `page_ready` tracks only the WINDOW'S VERY FIRST LOAD, and is never
-    # cleared again after that. It is set exactly once, by whichever fires
-    # first: the initial navigation, or (see below) a later refresh. This
-    # is deliberate: an earlier version of this helper reused page_ready
-    # for the background refresh too (clearing it before each reload and
-    # waiting for it to be set again), which meant that if a background
-    # refresh's "loaded" event never fired - a slow SSO redirect, a
-    # transient network hiccup, TracIT throwing a native "leave site?"
-    # confirm dialog on navigation-away, anything - page_ready was left
-    # PERMANENTLY cleared, and every real lookup after that point would
-    # sit for the full 180s timeout and fail with "Browser window never
-    # finished loading", even though the window was actually fine. That's
-    # the "worked the first time, then stopped working" failure mode.
-    # `reload_ready` (below) is a separate event used only to time out a
-    # refresh attempt - it never blocks a real lookup.
-    page_ready = threading.Event()
-    reload_ready = threading.Event()
-
-    def _on_loaded():
-        page_ready.set()
-        reload_ready.set()
-
-    window.events.loaded += _on_loaded
-
-    # Serializes access to the window between an in-progress lookup and the
-    # background refresh loop below, so a scheduled reload can never land
-    # in the middle of a search (and vice versa).
-    window_lock = threading.Lock()
-
-    def refresh_loop():
-        try:
-            interval = int(cfg.get("auto_refresh_seconds") or 0)
-        except (TypeError, ValueError):
-            interval = 0
-        if interval <= 0:
-            return
-        interval = max(60, interval)
-        logger.info("TracIT helper: background refresh enabled every %ss", interval)
-        while True:
-            time.sleep(interval)
-            if not window_lock.acquire(blocking=False):
-                logger.debug("TracIT helper: skipping scheduled refresh - a lookup is in progress")
-                continue
-            try:
-                logger.info("TracIT helper: refreshing the TracIT page in the background to keep it warm")
-                reload_ready.clear()
-                window.load_url(search_url)
-                if not reload_ready.wait(timeout=60):
-                    # Best-effort only. Deliberately do NOT touch page_ready
-                    # here - real lookups must keep working off the window's
-                    # last known-good state even if this particular refresh
-                    # never confirmed completion.
-                    logger.warning(
-                        "TracIT helper: background refresh did not confirm "
-                        "loading within 60s (non-fatal - real lookups are "
-                        "unaffected; will retry next interval)"
-                    )
-                else:
-                    logger.info("TracIT helper: background refresh completed")
-            except Exception:
-                logger.exception("TracIT helper: background refresh failed (non-fatal, will retry next interval)")
-            finally:
-                window_lock.release()
-
-    threading.Thread(target=refresh_loop, daemon=True).start()
-
-    def stdin_reader():
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                req = json.loads(line)
-            except Exception:
-                continue
-
-            if req.get("cmd") == "shutdown":
-                try:
-                    window.destroy()
-                except Exception:
-                    pass
-                return
-
-            request_id = req.get("request_id")
-
-            if req.get("cmd") == "export_euc":
-                logger.info("TracIT helper: EUC report download requested (request_id=%r)", request_id)
-                if not page_ready.wait(timeout=180):
-                    _send({"request_id": request_id,
-                           "error": "TracIT window never finished loading (sign-in taking too long?)."})
-                    continue
-                with window_lock:
-                    try:
-                        export_cfg = dict(cfg)
-                        if "assigned_locations" in req:  # current Settings value from the app
-                            export_cfg["assigned_locations"] = req["assigned_locations"]
-                        rows = _perform_tracit_euc_export(window, export_cfg)
-                        _send({"request_id": request_id, "rows": rows})
-                    except Exception as exc:
-                        logger.exception("TracIT helper: EUC report download failed")
-                        _send({"request_id": request_id, "error": str(exc)})
-                continue
-
-            emp_id = (req.get("emp_id") or "").strip()
-            logger.info("TracIT helper: received lookup request_id=%r emp_id=%r", request_id, emp_id)
-
-            if not emp_id:
-                logger.warning("TracIT helper: empty employee ID in request_id=%r", request_id)
-                _send({"request_id": request_id, "error": "Empty employee ID."})
-                continue
-
-            if not page_ready.wait(timeout=180):
-                logger.error("TracIT helper: browser window never finished loading (request_id=%r)", request_id)
-                _send({
-                    "request_id": request_id,
-                    "error": "Browser window never finished loading (login taking too long?).",
-                })
-                continue
-
-            # The window is never shown (see keep_window_hidden in CONFIG) -
-            # the lock just keeps this search from overlapping a scheduled
-            # background refresh, not from anything visual.
-            with window_lock:
-                try:
-                    serial = _perform_tracit_search(window, emp_id, cfg)
-                    logger.info("TracIT helper: sending serial_number back for request_id=%r", request_id)
-                    _send({"request_id": request_id, "serial_number": serial})
-                except Exception as exc:
-                    logger.exception("TracIT helper: lookup failed for request_id=%r emp_id=%r", request_id, emp_id)
-                    _send({"request_id": request_id, "error": str(exc)})
-
-    threading.Thread(target=stdin_reader, daemon=True).start()
-
-    webview.start(gui="edgechromium", private_mode=False, storage_path=profile_dir)
+    _webview_start(webview, profile_dir)
 
 
 # ============================================================================
@@ -2791,6 +2059,32 @@ def resolve_submission_type(raw_type, type_aliases):
         if key == canonical.lower() or key in [a.lower() for a in aliases]:
             return canonical, True
     return str(raw_type).strip(), False
+
+
+_LWD_DATE_FORMATS = ("%d-%b-%Y", "%d-%B-%Y", "%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y",
+                     "%Y-%m-%d", "%d-%b-%y", "%d/%m/%y", "%d-%m-%y", "%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_lwd_date(value):
+    """Last Working Date as typed (30-Sep-2026, 30/09/2026, 30-09-2026,
+    2026-09-30, 30 Sep 2026...) or an Excel date -> '30-Sep-2026' (the same
+    format as the form's Date). '' stays ''. Raises ValueError if it isn't
+    a real date. Day comes before month (Indian/UK style)."""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d-%b-%Y")
+    if isinstance(value, date):
+        return value.strftime("%d-%b-%Y")
+    text = " ".join(str(value).strip().split())
+    if not text:
+        return ""
+    for fmt in _LWD_DATE_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%d-%b-%Y")
+        except ValueError:
+            continue
+    raise ValueError(f"'{text}' is not a date. Please type it like 30-Sep-2026 or 30/09/2026.")
 
 
 def _parse_pasted_employee_ids(text):
@@ -3000,6 +2294,67 @@ class ControlInsertionError(Exception):
     pass
 
 
+class TemplateSecurityError(ControlInsertionError):
+    """A Word template was refused by validate_docx_package (finding #10)."""
+
+
+_DOCX_RISKY_PARTS = ("vbaproject.bin", "/activex/", "vbadata.xml", "/embeddings/")
+_DOCX_RISKY_REL_TYPES = ("/attachedtemplate", "/oleobject", "/frame", "/subdocument", "/control")
+
+
+def validate_docx_package(path, config=None):
+    """Security (finding #10): checks a Word .docx BEFORE it is unpacked or
+    opened in Word - size/entry-count/expansion limits (zip bombs), no
+    path-traversal or link entries, no macros/ActiveX/embedded objects,
+    and no relationships that make Word fetch something from outside
+    (remote templates/frames/OLE). Raises TemplateSecurityError."""
+    config = config or CONFIG
+    name = os.path.basename(path)
+    if not str(path).lower().endswith(".docx"):
+        raise TemplateSecurityError(f"{name}: only .docx Word templates are accepted (not .docm/.doc).")
+    max_bytes = float(_sec(config, "max_template_mb", 25)) * 1024 * 1024
+    if os.path.getsize(path) > max_bytes:
+        raise TemplateSecurityError(f"{name} is larger than {_sec(config, 'max_template_mb', 25)} MB.")
+    if not zipfile.is_zipfile(path):
+        raise TemplateSecurityError(f"{name} is not a valid .docx file.")
+    with zipfile.ZipFile(path) as z:
+        infos = z.infolist()
+        if len(infos) > int(_sec(config, "max_template_entries", 2000)):
+            raise TemplateSecurityError(f"{name} has too many parts ({len(infos)}).")
+        total = sum(i.file_size for i in infos)
+        if total > float(_sec(config, "max_template_uncompressed_mb", 200)) * 1024 * 1024:
+            raise TemplateSecurityError(f"{name} expands to more than "
+                                        f"{_sec(config, 'max_template_uncompressed_mb', 200)} MB.")
+        names = set()
+        for i in infos:
+            n = i.filename.replace("\\", "/")
+            low = n.lower()
+            if n.startswith("/") or ".." in n.split("/") or ":" in n:
+                raise TemplateSecurityError(f"{name} contains an unsafe path ({i.filename!r}).")
+            if (i.external_attr >> 16) & 0o170000 == 0o120000:
+                raise TemplateSecurityError(f"{name} contains a link entry ({i.filename!r}).")
+            if i.compress_size and i.file_size / max(i.compress_size, 1) > 200 and i.file_size > 5 * 1024 * 1024:
+                raise TemplateSecurityError(f"{name} contains a suspiciously compressed part ({i.filename!r}).")
+            if any(r in "/" + low for r in _DOCX_RISKY_PARTS):
+                raise TemplateSecurityError(f"{name} contains macros, ActiveX or embedded objects "
+                                            f"({i.filename}) - save it as a plain .docx without them.")
+            names.add(low)
+        if "[content_types].xml" not in names or "word/document.xml" not in names:
+            raise TemplateSecurityError(f"{name} is not a Word document (word/document.xml missing).")
+        ctypes_xml = z.read("[Content_Types].xml").decode("utf-8", "replace").lower()
+        if "macroenabled" in ctypes_xml or "vbaproject" in ctypes_xml:
+            raise TemplateSecurityError(f"{name} is a macro-enabled document - save it as a plain .docx.")
+        for i in infos:
+            if i.filename.lower().endswith(".rels"):
+                rels = z.read(i.filename).decode("utf-8", "replace")
+                for m in re.finditer(r"<Relationship\b[^>]*>", rels):
+                    tag = m.group(0)
+                    if 'TargetMode="External"' in tag and any(t in tag.lower() for t in _DOCX_RISKY_REL_TYPES):
+                        raise TemplateSecurityError(
+                            f"{name} links to an external template/object ({i.filename}) - remove it and re-save.")
+    return True
+
+
 class FillDocxError(Exception):
     """Raised when a previously-inserted control can't be found while
     filling a document - almost always means the BU template is stale
@@ -3187,6 +2542,7 @@ def insert_controls(source_docx_path, output_docx_path, placeholder_image_path):
     logger.info("insert_controls: starting for %r -> %r", source_docx_path, output_docx_path)
     with tempfile.TemporaryDirectory() as tmp:
         unpack_dir = os.path.join(tmp, "unpacked")
+        validate_docx_package(source_docx_path)
         with zipfile.ZipFile(source_docx_path) as z:
             z.extractall(unpack_dir)
 
@@ -3251,7 +2607,9 @@ def _default_placeholder_image_path():
     to satisfy the picture-control requirement of holding *some* image
     when a BU template is first added - fill_docx() always replaces it
     with the real captured signature before anyone sees the output."""
-    path = os.path.join(_app_dir(), "assets", "_sig_placeholder.png")
+    path = _asset_path("_sig_placeholder.png")
+    if not os.path.exists(path):
+        path = os.path.join(_data_dir(), "assets", "_sig_placeholder.png")  # writable location
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         Image.new("RGBA", (400, 120), (255, 255, 255, 0)).save(path)
@@ -3606,6 +2964,10 @@ def fill_docx(fillable_docx_path, output_docx_path, field_values, checked_tags, 
     )
     with tempfile.TemporaryDirectory() as tmp:
         unpack_dir = os.path.join(tmp, "unpacked")
+        try:
+            validate_docx_package(fillable_docx_path)
+        except TemplateSecurityError as exc:
+            raise FillDocxError(str(exc)) from exc
         with zipfile.ZipFile(fillable_docx_path) as z:
             z.extractall(unpack_dir)
 
@@ -3757,6 +3119,7 @@ def add_template(templates_folder, bu_name, source_docx_path):
     uploading it, since it tells them exactly what to check in the Word
     doc before re-uploading.
     """
+    validate_docx_package(source_docx_path)
     bu_id = uuid.uuid4().hex[:10]
     bu_dir = os.path.join(templates_folder, bu_id)
     os.makedirs(bu_dir, exist_ok=True)
@@ -3824,8 +3187,14 @@ def convert_docx_to_pdf_via_word(docx_path, pdf_path):
             word.DisplayAlerts = 0
         except Exception as exc:
             logger.debug("Word export: could not set DisplayAlerts=0 (%s)", exc)
+        try:
+            # Security (finding #10): never run macros/automation from the
+            # document (msoAutomationSecurityForceDisable).
+            word.AutomationSecurity = 3
+        except Exception as exc:
+            logger.debug("Word export: could not set AutomationSecurity (%s)", exc)
         logger.debug("Word export: opening %r", docx_abspath)
-        doc = word.Documents.Open(docx_abspath, ReadOnly=True)
+        doc = word.Documents.Open(docx_abspath, ReadOnly=True, AddToRecentFiles=False)
         logger.debug("Word export: saving as PDF -> %r", pdf_abspath)
         doc.SaveAs(pdf_abspath, FileFormat=17)  # wdFormatPDF
     except Exception as exc:
@@ -4410,6 +3779,7 @@ class TopazSigner:
                 # the rest of the app sees the same thing either way.
                 img = Image.open(outcome["path"])
                 img.load()
+                _remove_quietly(outcome["path"])  # the raw bitmap isn't needed any more
         except Exception as exc:
             logger.exception("Topaz: could not decode captured signature image")
             raise TopazNotAvailable(f"Could not decode the captured signature image ({exc}).") from exc
@@ -4418,6 +3788,38 @@ class TopazSigner:
         img.save(tmp_path)
         logger.info("Topaz: capture SUCCESS, saved to %s", tmp_path)
         return tmp_path
+
+
+def _remove_quietly(path):
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _cleanup_stale_signature_files(max_age_hours=12):
+    """Signature images are written to %TEMP% only for as long as one form
+    needs them. This sweeps any left behind (e.g. the app was closed
+    mid-form) once they are older than max_age_hours. Never raises."""
+    removed = 0
+    try:
+        tmp = tempfile.gettempdir()
+        cutoff = time.time() - max_age_hours * 3600
+        for name in os.listdir(tmp):
+            if name.startswith(("sig_", "sig_topaz_")) and name.endswith((".png", ".bmp")):
+                p = os.path.join(tmp, name)
+                try:
+                    if os.path.getmtime(p) < cutoff:
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    if removed:
+        logger.info("Signatures: removed %d old signature image(s) from the temp folder", removed)
+    return removed
 
 
 class SignatureService:
@@ -4431,24 +3833,71 @@ class SignatureService:
         self.config_data = config_data
         self.canvas_signer = CanvasSigner()
         self.topaz_signer = TopazSigner(config_data.get("topaz_progid_options"))
+        self.methods = {}  # image path -> capture method
 
     def capture(self, parent, title="Sign here"):
+        """Returns the captured image path (or None). How it was captured
+        ("Topaz pad" / "On-screen") is remembered in self.methods[path] so
+        the audit log and the PDF signature can record it (finding #11)."""
         use_topaz = self.config_data.get("use_topaz_pad", False)
-        logger.info("SignatureService.capture: use_topaz_pad=%s, title=%r", use_topaz, title)
+        policy = str(_sec(self.config_data, "onscreen_signature", "confirm") or "confirm").lower()
+        logger.info("SignatureService.capture: use_topaz_pad=%s, on-screen policy=%s, title=%r",
+                    use_topaz, policy, title)
         if use_topaz:
             try:
                 path = self.topaz_signer.capture(parent, title)
                 logger.info("SignatureService.capture: Topaz path returned %r", path)
+                if path:
+                    self.methods[path] = "Topaz pad"
                 return path
             except TopazNotAvailable as exc:
-                logger.warning("Topaz pad not available, falling back to on-screen signing: %s", exc)
-                messagebox.showwarning(
-                    "Topaz pad not available",
-                    f"{exc}\n\nFalling back to on-screen signature capture.",
-                )
+                logger.warning("Topaz pad not available (on-screen policy=%s): %s", policy, exc)
+                if policy == "block":
+                    messagebox.showerror(
+                        "Topaz pad required",
+                        f"{exc}\n\nOn-screen signatures are turned off for this installation "
+                        "(security.onscreen_signature = block). Connect the signature pad and try again.",
+                    )
+                    return None
+                if policy == "confirm":
+                    if not messagebox.askyesno(
+                        "Topaz pad not available",
+                        f"{exc}\n\nCapture the signature ON SCREEN (mouse/touch) instead?\n"
+                        "It will be recorded as an on-screen signature in the audit log and the PDF.",
+                    ):
+                        return None
+                else:
+                    messagebox.showwarning(
+                        "Topaz pad not available",
+                        f"{exc}\n\nFalling back to on-screen signature capture.",
+                    )
+        elif policy == "block":
+            messagebox.showerror("Topaz pad required",
+                                 "On-screen signatures are turned off for this installation - turn on "
+                                 "use_topaz_pad and connect the signature pad.")
+            return None
         path = self.canvas_signer.capture(parent, title)
         logger.info("SignatureService.capture: on-screen canvas path returned %r", path)
+        if path:
+            self.methods[path] = "On-screen"
         return path
+
+    def discard(self, *paths):
+        """Deletes signature images once the signed PDF exists (or the form
+        is reset) - the signatures live on only inside the PDF."""
+        for p in paths:
+            if p:
+                _remove_quietly(p)
+                self.methods.pop(p, None)
+
+    def method_for(self, *paths):
+        """'Topaz pad' / 'On-screen' / 'Topaz pad + On-screen' for the given images."""
+        out = []
+        for p in paths:
+            m = self.methods.get(p, "Unknown") if p else None
+            if m and m not in out:
+                out.append(m)
+        return " + ".join(out)
 
 
 # ============================================================================
@@ -4468,23 +3917,85 @@ def _signing_identity_paths(config_data):
     )
 
 
+_DPAPI_PREFIX = b"DPAPI1:"
+_PLAIN_PREFIX = b"PLAIN1:"  # non-Windows development machines only
+CRYPTPROTECT_LOCAL_MACHINE = 0x4
+
+
+def _dpapi_protect(data, description="IT Asset app secret"):
+    """Encrypts `data` with Windows DPAPI (machine scope: every operator
+    who signs in to THIS PC can use it, but the file is useless if copied
+    to any other machine). Returns bytes ready to write to a file."""
+    if sys.platform == "win32":
+        import win32crypt
+        blob = win32crypt.CryptProtectData(data, description, None, None, None, CRYPTPROTECT_LOCAL_MACHINE)
+        return _DPAPI_PREFIX + blob
+    logger.warning("Signing: DPAPI not available on this platform - secret stored unprotected (dev only)")
+    return _PLAIN_PREFIX + data
+
+
+def _dpapi_unprotect(stored):
+    if stored.startswith(_DPAPI_PREFIX):
+        import win32crypt
+        return win32crypt.CryptUnprotectData(stored[len(_DPAPI_PREFIX):], None, None, None, 0)[1]
+    if stored.startswith(_PLAIN_PREFIX):
+        return stored[len(_PLAIN_PREFIX):]
+    raise SigningError("The signing key password file is not in a recognised format.")
+
+
+def _write_bytes_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def _signing_key_passphrase(key_path):
+    """The (DPAPI-protected) passphrase of the app's own signing key."""
+    with open(key_path + ".pass", "rb") as f:
+        return _dpapi_unprotect(f.read())
+
+
+def _key_is_encrypted(key_path):
+    with open(key_path, "rb") as f:
+        head = f.read(200)
+    return b"ENCRYPTED" in head
+
+
+def _encrypt_existing_signing_key(key_path):
+    """Security (finding #1): migrates a plaintext key written by an older
+    version of the app to an encrypted one, IN PLACE - same key, same
+    certificate, so earlier signed PDFs and any trust IT already set up
+    are unaffected."""
+    from cryptography.hazmat.primitives import serialization
+    with open(key_path, "rb") as f:
+        key = serialization.load_pem_private_key(f.read(), password=None)
+    passphrase = base64.urlsafe_b64encode(os.urandom(32))
+    _write_bytes_atomic(key_path + ".pass", _dpapi_protect(passphrase, "IT Asset signing key"))
+    _write_bytes_atomic(key_path, key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(passphrase),
+    ))
+    logger.info("Signing: existing signing key is now stored encrypted (%r)", key_path)
+
+
 def ensure_signing_identity(config_data):
     """
-    Creates a free, self-signed RSA/X.509 signing certificate + private key
-    the FIRST time this app runs, and reuses the same one for every
-    signature after that - this is what lets the app cryptographically
-    sign PDFs by itself, with no Adobe Acrobat license, no Topaz plug-in,
-    and no external Certificate Authority.
+    Creates the app's own RSA/X.509 signing certificate + private key the
+    FIRST time this app runs, and reuses the same one for every signature
+    after that. The private key is stored ENCRYPTED (PKCS#8 + AES); its
+    random password is protected with Windows DPAPI in signing_key.pem.pass
+    (security finding #1). A plaintext key from an older version is
+    encrypted automatically on first use.
 
-    TRADE-OFF (accepted): because nobody outside this organization vouches
-    for this certificate, Acrobat/Reader will correctly show every PDF
-    this app signs as genuinely signed and tamper-evident, but will also
-    flag the certificate itself as "not trusted" - until/unless your IT
-    team installs the cert this returns as a Trusted Certificate. See the
-    README for exactly how.
+    For production, set security.signing_pfx_path to an IT/PKI-issued
+    certificate instead (finding #2) - see _load_app_signer().
     """
     key_path, cert_path = _signing_identity_paths(config_data)
     if os.path.exists(key_path) and os.path.exists(cert_path):
+        if not _key_is_encrypted(key_path) or not os.path.exists(key_path + ".pass"):
+            _encrypt_existing_signing_key(key_path)
         return key_path, cert_path
 
     from cryptography import x509
@@ -4492,19 +4003,20 @@ def ensure_signing_identity(config_data):
     from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.x509.oid import NameOID
 
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, "IT Asset Submission Acknowledgement"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Internal IT Department"),
     ])
+    now = datetime.now(timezone.utc)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
         .issuer_name(issuer)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.utcnow() - timedelta(days=1))
-        .not_valid_after(datetime.utcnow() + timedelta(days=3650))
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=825))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
             x509.KeyUsage(
@@ -4518,15 +4030,49 @@ def ensure_signing_identity(config_data):
     )
 
     os.makedirs(os.path.dirname(key_path), exist_ok=True)
-    with open(key_path, "wb") as f:
-        f.write(key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ))
+    _restrict_folder_acl(os.path.dirname(key_path), config_data)
+    passphrase = base64.urlsafe_b64encode(os.urandom(32))
+    _write_bytes_atomic(key_path + ".pass", _dpapi_protect(passphrase, "IT Asset signing key"))
+    _write_bytes_atomic(key_path, key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.BestAvailableEncryption(passphrase),
+    ))
     with open(cert_path, "wb") as f:
         f.write(cert.public_bytes(serialization.Encoding.PEM))
     return key_path, cert_path
+
+
+def protect_pfx_password(pfx_path, password):
+    """Stores the password of an IT-issued .pfx next to it, DPAPI-protected
+    (run:  python app.py --protect-pfx-password "C:\\path\\cert.pfx")."""
+    _write_bytes_atomic(pfx_path + ".pass", _dpapi_protect(password.encode("utf-8"), "IT Asset signing PFX"))
+    return pfx_path + ".pass"
+
+
+def _load_app_signer(config_data):
+    """The pyHanko signer to use: the IT-issued .pfx when
+    security.signing_pfx_path is set (finding #2), otherwise the app's own
+    encrypted key + certificate (finding #1). Returns (signer, description)."""
+    from pyhanko.sign import signers
+    pfx = (_sec(config_data, "signing_pfx_path", "") or "").strip()
+    if pfx:
+        if not os.path.isfile(pfx):
+            raise SigningError(f"security.signing_pfx_path points at a missing file: {pfx}")
+        password = None
+        if os.path.exists(pfx + ".pass"):
+            with open(pfx + ".pass", "rb") as f:
+                password = _dpapi_unprotect(f.read())
+        signer = signers.SimpleSigner.load_pkcs12(pfx, passphrase=password)
+        if signer is None:
+            raise SigningError("Could not open the .pfx signing certificate (wrong password?). Run:\n"
+                               f'    python app.py --protect-pfx-password "{pfx}"')
+        return signer, "IT-issued certificate"
+    key_path, cert_path = ensure_signing_identity(config_data)
+    signer = signers.SimpleSigner.load(key_path, cert_path, key_passphrase=_signing_key_passphrase(key_path))
+    if signer is None:
+        raise SigningError("Could not unlock the app's signing key on this PC.")
+    return signer, "app certificate"
 
 
 def _find_signature_field_boxes(pdf_path, target_size_pt=(141.73, 47.24), tolerance=0.35):
@@ -4704,9 +4250,12 @@ def sign_pdf_with_signatures(input_pdf_path, output_pdf_path, signatures, config
             "    pip install pyhanko cryptography"
         ) from exc
 
-    key_path, cert_path = ensure_signing_identity(config_data)
     try:
-        signer = signers.SimpleSigner.load(key_path, cert_path, key_passphrase=None)
+        signer, signer_kind = _load_app_signer(config_data)
+        logger.info("Signing: using the %s", signer_kind)
+    except SigningError:
+        logger.exception("Signing: could not load the signing certificate")
+        raise
     except Exception as exc:
         logger.exception("Signing: could not load the signing certificate")
         raise SigningError(f"Could not load this app's signing certificate: {exc}") from exc
@@ -4861,7 +4410,7 @@ def open_draft(data, to_addresses="", attachment_path=None):
 def _resolve_path(config_data, key, default):
     p = config_data.get(key, default)
     if not os.path.isabs(p):
-        p = os.path.join(_app_dir(), p)
+        p = os.path.join(_data_dir(), p)
     return p
 
 
@@ -4891,7 +4440,6 @@ def _safe_folder_name(name, fallback="Unspecified"):
 # ============================================================================
 
 DEFAULT_USER_SETTINGS = {
-    "tracit_assigned_locations": "",  # e.g. "II033" or "II033, II045" - blank = CONFIG default
     "root_save_folder": "",
     "operator_name": "",
     "location": "",
@@ -4989,6 +4537,146 @@ def _user_settings_configured(data):
 
 
 # ============================================================================
+# SECURITY HELPERS (SRE findings) - admin authorisation, endpoint allow-list,
+# Windows identity, production-mode switches.
+# ============================================================================
+
+_PRODUCTION_OVERRIDES = {
+    "ldap_require_sealing": True,
+    "onscreen_signature": "block",
+    "webview_persistent_session": False,
+    "restrict_acls": True,
+}
+
+
+def _sec(config, key, default=None):
+    """Effective value of a security setting (production_mode forces the
+    strict value of the [prod] settings)."""
+    sec = ((config or CONFIG).get("security") or {})
+    if sec.get("production_mode") and key in _PRODUCTION_OVERRIDES:
+        return _PRODUCTION_OVERRIDES[key]
+    return sec.get(key, default)
+
+
+def _current_windows_user():
+    try:
+        return os.environ.get("USERNAME") or getpass.getuser() or ""
+    except Exception:
+        return ""
+
+
+def _current_identity():
+    """DOMAIN\\user of whoever is signed in to Windows (for the audit log)."""
+    user = _current_windows_user()
+    domain = os.environ.get("USERDOMAIN", "")
+    return f"{domain}\\{user}" if domain and user else user
+
+
+_AD_GROUPS_CACHE = {}
+
+
+def _current_user_groups():
+    """Group names in the signed-in user's Windows token (whoami /groups),
+    lower-case, without the DOMAIN\\ prefix as well as with it."""
+    if "groups" in _AD_GROUPS_CACHE:
+        return _AD_GROUPS_CACHE["groups"]
+    groups = set()
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(["whoami", "/groups", "/fo", "csv", "/nh"], capture_output=True,
+                                 text=True, timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                 ).stdout
+            for row in csv.reader(io.StringIO(out)):
+                if row:
+                    name = row[0].strip().lower()
+                    groups.add(name)
+                    groups.add(name.split("\\")[-1])
+        except Exception:
+            logger.warning("Security: could not read Windows group membership", exc_info=True)
+    _AD_GROUPS_CACHE["groups"] = groups
+    return groups
+
+
+def _is_windows_admin():
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _is_app_admin(config=None):
+    """Security (finding #3): only these may change the shared Admin
+    settings (endpoint URLs): users in security.admin_users, members of
+    security.admin_ad_groups, or local Windows administrators."""
+    config = config or CONFIG
+    sec = config.get("security") or {}
+    user = _current_windows_user().lower()
+    if user and user in [str(u).strip().lower() for u in sec.get("admin_users", [])]:
+        return True
+    wanted = [str(g).strip().lower() for g in sec.get("admin_ad_groups", []) if str(g).strip()]
+    if wanted:
+        groups = _current_user_groups()
+        if any(g in groups or g.split("\\")[-1] in groups for g in wanted):
+            return True
+    if sec.get("local_admins_are_app_admins", True) and _is_windows_admin():
+        return True
+    return False
+
+
+def _validate_endpoint(url, config=None, what="URL"):
+    """Security (finding #14): every outbound URL must be HTTPS and point at
+    an approved company host. Raises ValueError otherwise; returns url.
+    {placeholders} in URL templates are allowed."""
+    config = config or CONFIG
+    text = str(url or "").strip()
+    probe = re.sub(r"\{[^{}]*\}", "x", text)
+    try:
+        parts = urllib.parse.urlsplit(probe)
+    except ValueError:
+        raise ValueError(f"{what}: not a valid URL ({text!r}).")
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    if scheme != "https" and not (scheme == "http" and _sec(config, "allow_insecure_http", False)):
+        raise ValueError(f"{what}: only https:// addresses are allowed (got {text!r}).")
+    if not host or parts.username or parts.password:
+        raise ValueError(f"{what}: the address must name a server and must not contain a user name or password.")
+    suffixes = [str(x).strip().lower().lstrip(".") for x in _sec(config, "allowed_host_suffixes", []) if str(x).strip()]
+    if not any(host == suf or host.endswith("." + suf) for suf in suffixes):
+        raise ValueError(f"{what}: {host!r} is not an approved company server "
+                         f"(allowed: {', '.join(suffixes) or 'none configured'}).")
+    return text
+
+
+def _restrict_folder_acl(path, config=None):
+    """Security (findings #7/#13, opt-in via security.restrict_acls): limits
+    a folder to the current user, Administrators, SYSTEM and the admin AD
+    groups. Uses icacls with a fixed argument list (no shell). Never raises."""
+    config = config or CONFIG
+    if not _sec(config, "restrict_acls", False) or sys.platform != "win32" or not path:
+        return False
+    try:
+        os.makedirs(path, exist_ok=True)
+        grants = [_current_identity() or _current_windows_user(), "*S-1-5-32-544", "*S-1-5-18"]
+        grants += [g for g in (config.get("security") or {}).get("admin_ad_groups", []) if g]
+        args = ["icacls", path, "/inheritance:r"]
+        for g in grants:
+            args += ["/grant:r", f"{g}:(OI)(CI)F"]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            logger.warning("Security: icacls on %r failed: %s", path, (r.stdout + r.stderr).strip()[:300])
+            return False
+        logger.info("Security: folder access restricted: %r", path)
+        return True
+    except Exception:
+        logger.warning("Security: could not restrict %r", path, exc_info=True)
+        return False
+
+
+# ============================================================================
 # ADMIN / INSTALLATION SETTINGS - shared endpoints (SSRS report URL, AD
 # Lookup URL, TracIT URL, ...) that apply to EVERYONE using this copy of the
 # app, unlike user_settings.json above (which is per-Windows-login and lives
@@ -5011,13 +4699,12 @@ ADMIN_SETTINGS_FIELDS = {
     # admin_settings.json key -> (CONFIG dict path, human label)
     "ssrs_report_url": (("ssrs_asset_report", "url"), "SSRS Asset Report URL"),
     "ad_lookup_url_template": (("ad_lookup_url_template",), "AD Lookup URL template"),
-    "tracit_url_template": (("tracit_url_template",), "TracIT URL template"),
     "ssrs_cache_max_age_hours": (("ssrs_asset_report", "cache_max_age_hours"), "SSRS cache max age (hours)"),
 }
 
 
 def _admin_settings_path():
-    return os.path.join(_app_dir(), "admin_settings.json")
+    return os.path.join(_data_dir(), "admin_settings.json")
 
 
 def _load_admin_settings():
@@ -5037,11 +4724,22 @@ def _load_admin_settings():
         return {}
 
 
-def _save_admin_settings(data):
+def _save_admin_settings(data, config=None):
+    """Only an app admin may save (finding #3); URLs are validated (#14).
+    Who changed it, and when, is recorded in the file and the audit log."""
+    if not _is_app_admin(config):
+        raise PermissionError("Only an app administrator can change the Admin / Shared Settings.")
     path = _admin_settings_path()
     to_write = {k: v for k, v in (data or {}).items() if k in ADMIN_SETTINGS_FIELDS and str(v).strip() != ""}
+    for key in ("ssrs_report_url", "ad_lookup_url_template"):
+        if key in to_write:
+            _validate_endpoint(to_write[key], config, what=ADMIN_SETTINGS_FIELDS[key][1])
+    on_disk = dict(to_write, _updated_by=_current_identity(),
+                   _updated_at=datetime.now().isoformat(timespec="seconds"))
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(to_write, f, indent=2)
+        json.dump(on_disk, f, indent=2)
+    _write_audit_log_entry(operator=_current_identity(), submission_type="ADMIN SETTINGS CHANGED",
+                           lookup_source=", ".join(sorted(to_write.keys())) or "cleared")
     logger.info("Admin settings: saved to %r (%s)", path, ", ".join(sorted(to_write.keys())) or "no overrides set")
     return to_write
 
@@ -5059,6 +4757,14 @@ def _apply_admin_settings_overrides(config, admin_data=None):
         if not mapping:
             continue
         path, _label = mapping
+        if key in ("ssrs_report_url", "ad_lookup_url_template"):
+            try:
+                _validate_endpoint(value, config, what=_label)
+            except ValueError as exc:
+                # Security (#3/#14): a tampered admin_settings.json can't
+                # redirect the app to an unapproved server.
+                logger.error("Admin settings: ignoring %s - %s", key, exc)
+                continue
         node = config
         for part in path[:-1]:
             node = node.setdefault(part, {})
@@ -5068,8 +4774,6 @@ def _apply_admin_settings_overrides(config, admin_data=None):
                 value = float(value)
             except (TypeError, ValueError):
                 continue
-        if leaf == "assigned_locations" and isinstance(value, str):
-            value = [v.strip() for v in value.split(",") if v.strip()]
         node[leaf] = value
     return config
 
@@ -5081,53 +4785,138 @@ def _apply_admin_settings_overrides(config, admin_data=None):
 # in Excel for a quick audit review.
 # ============================================================================
 
+APP_VERSION = "2026.10.07-sec1"
+
 AUDIT_LOG_COLUMNS = [
     "timestamp", "operator", "employee_id", "submission_type",
     "ssrs_match_status", "lookup_source", "pdf_generated", "pdf_location", "email_draft_created",
+    # Added for security finding #12 (tamper-evident, attributable log):
+    "windows_user", "computer", "app_version", "signature_method", "pdf_sha256",
+    "prev_hash", "entry_hash",
 ]
+_AUDIT_LOCK = threading.Lock()
+_AUDIT_GENESIS = "0" * 64
 
 
 def _audit_log_path():
-    log_dir = os.path.join(_app_dir(), "logs")
+    log_dir = os.path.join(_data_dir(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, "audit.log")
 
 
+def _csv_safe(value):
+    """Prevents CSV/Excel formula injection: a cell starting with = + - @ (or
+    tab/CR) is prefixed with ' so Excel shows it as text instead of running
+    it when someone opens audit.log in Excel."""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def _audit_entry_hash(prev_hash, values):
+    payload = prev_hash + "\x1f" + "\x1f".join(values)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _audit_prepare_file(path):
+    """Starts a fresh audit.log if there is none, or if the existing one is
+    from an older version (different columns) - that one is kept, renamed
+    audit_legacy_<date>.log, and still shown in Generated Documents.
+    Returns the last entry_hash in the current file."""
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        if rows and rows[0] == AUDIT_LOG_COLUMNS:
+            return rows[-1][-1] if len(rows) > 1 and rows[-1] else _AUDIT_GENESIS
+        legacy = os.path.join(os.path.dirname(path), f"audit_legacy_{datetime.now():%Y%m%d_%H%M%S}.log")
+        os.replace(path, legacy)
+        logger.info("Audit log: older-format log kept as %r", legacy)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(AUDIT_LOG_COLUMNS)
+    return _AUDIT_GENESIS
+
+
 def _write_audit_log_entry(operator="", employee_id="", submission_type="",
                             ssrs_match_status="", lookup_source="", pdf_generated=False,
-                            pdf_location="", email_draft_created=False):
+                            pdf_location="", email_draft_created=False,
+                            signature_method="", pdf_sha256=""):
+    """Appends one hash-chained line: each line's entry_hash covers its own
+    values AND the previous line's hash, so editing/deleting a line breaks
+    the chain (verify_audit_log / the 'Verify log' button). Also copied to
+    security.audit_central_path when set. Never raises."""
     path = _audit_log_path()
-    is_new = not os.path.exists(path)
     try:
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if is_new:
-                writer.writerow(AUDIT_LOG_COLUMNS)
-            writer.writerow([
+        if pdf_generated and pdf_location and not pdf_sha256 and os.path.isfile(pdf_location):
+            pdf_sha256 = _file_sha256(pdf_location)
+        with _AUDIT_LOCK:
+            prev = _audit_prepare_file(path)
+            values = [_csv_safe(v) for v in (
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 operator, employee_id, submission_type, ssrs_match_status, lookup_source,
                 "Yes" if pdf_generated else "No", pdf_location,
                 "Yes" if email_draft_created else "No",
-            ])
+                _current_identity(), os.environ.get("COMPUTERNAME", ""), APP_VERSION,
+                signature_method, pdf_sha256,
+            )]
+            values.append(prev)
+            values.append(_audit_entry_hash(prev, values))
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(values)
+        central = (_sec(None, "audit_central_path", "") or "").strip()
+        if central:
+            try:
+                os.makedirs(central, exist_ok=True)
+                name = f"{os.environ.get('COMPUTERNAME', 'pc')}_{_current_windows_user() or 'user'}_audit.log"
+                cpath = os.path.join(central, re.sub(r"[^A-Za-z0-9_.-]", "_", name))
+                new_file = not os.path.exists(cpath)
+                with open(cpath, "a", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    if new_file:
+                        w.writerow(AUDIT_LOG_COLUMNS)
+                    w.writerow(values)
+            except Exception:
+                logger.warning("Audit log: could not copy entry to the central folder %r", central, exc_info=True)
     except Exception:
         logger.exception("Audit log: could not write entry (employee_id=%r)", employee_id)
 
 
+def verify_audit_log(path=None):
+    """Re-computes the hash chain. Returns (ok, human-readable message)."""
+    path = path or _audit_log_path()
+    if not os.path.exists(path):
+        return True, "No audit log yet."
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] != AUDIT_LOG_COLUMNS:
+        return False, "audit.log is not in the expected format."
+    prev = _AUDIT_GENESIS
+    for n, row in enumerate(rows[1:], start=2):
+        if len(row) != len(AUDIT_LOG_COLUMNS):
+            return False, f"Line {n}: wrong number of columns - the log was edited."
+        if row[-2] != prev or _audit_entry_hash(prev, row[:-1]) != row[-1]:
+            return False, f"Line {n}: hash mismatch - this line (or one before it) was changed or deleted."
+        prev = row[-1]
+    return True, f"Audit log OK - {len(rows) - 1} entr{'y' if len(rows) == 2 else 'ies'}, chain intact."
+
+
 def _read_audit_log_entries():
     """Returns a list of dicts (one per row), newest first, for the
-    Generated Documents history screen. Never raises - returns [] on any
-    problem reading the file (e.g. it doesn't exist yet)."""
+    Generated Documents history screen - from audit.log plus any older-
+    format audit_legacy_*.log files. Never raises."""
     path = _audit_log_path()
-    if not os.path.exists(path):
-        return []
+    folder = os.path.dirname(path)
+    rows = []
     try:
-        with open(path, newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        rows.reverse()
-        return rows
-    except Exception:
-        logger.exception("Audit log: could not read %r", path)
-        return []
+        files = sorted(f for f in os.listdir(folder) if f.startswith("audit_legacy_") and f.endswith(".log"))
+    except OSError:
+        files = []
+    for name in files + (["audit.log"] if os.path.exists(path) else []):
+        try:
+            with open(os.path.join(folder, name), newline="", encoding="utf-8") as f:
+                rows.extend(csv.DictReader(f))
+        except Exception:
+            logger.exception("Audit log: could not read %r", name)
+    rows.reverse()
+    return rows
 
 
 # ============================================================================
@@ -5175,7 +4964,7 @@ SSRS_STATUS_STALE = "Stale"
 
 
 def _ssrs_cache_path():
-    cache_dir = os.path.join(_app_dir(), "cache")
+    cache_dir = os.path.join(_data_dir(), "cache")
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, "ssrs_asset_report.xlsx")
 
@@ -5212,10 +5001,16 @@ def download_ssrs_asset_report(url, dest_path, timeout=60):
             "(Windows only - this lets the download reuse your existing network "
             "login instead of a password prompt.)"
         )
+    try:
+        _validate_endpoint(url, CONFIG, what="SSRS report URL")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     auth = HttpNegotiateAuth()
     try:
         resp = requests.get(url, auth=auth, timeout=timeout)
         resp.raise_for_status()
+        # A redirect must not take the download somewhere unapproved either.
+        _validate_endpoint(resp.url or url, CONFIG, what="SSRS report (after redirect)")
     except requests.exceptions.SSLError as exc:
         # NOTE: must be caught BEFORE requests.exceptions.ConnectionError below,
         # since SSLError is a subclass of it - otherwise this more specific,
@@ -5358,16 +5153,27 @@ def _employee_id_keys(emp_id):
 
 
 def _ssrs_find_record(ssrs_state, emp_id):
-    """Looks an Employee ID up in the loaded SSRS asset report index, by
-    its literal text, digits only, or without leading zeros."""
+    """Looks an Employee ID up in the loaded SSRS asset report index.
+    Security (finding #16): the ID as typed / digits only is an EXACT match
+    and always wins; a match that only works after dropping leading zeros
+    is used only if exactly ONE report row matches that way."""
     index = (ssrs_state or {}).get("index", {}) or {}
-    for key in _employee_id_keys(emp_id):
-        if key in index:
+    raw = str(emp_id or "").strip()
+    for key in dict.fromkeys([raw, _canonical_emp_id(raw)]):
+        if key and key in index:
             return index[key]
-    stripped = {k.lstrip("0"): v for k, v in index.items()} if index else {}
-    for key in _employee_id_keys(emp_id):
-        if key.lstrip("0") in stripped:
-            return stripped[key.lstrip("0")]
+    wanted = _canonical_emp_id(raw).lstrip("0")
+    if not wanted:
+        return None
+    matches = []
+    for k, v in index.items():
+        if k.lstrip("0") == wanted and all(v is not m for m in matches):
+            matches.append(v)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.warning("SSRS report: Employee ID %r is ambiguous (%d rows match without leading zeros)",
+                       emp_id, len(matches))
     return None
 
 
@@ -5379,28 +5185,45 @@ def _ssrs_find_record(ssrs_state, emp_id):
 TRACIT_REPORT_EXTENSIONS = (".xlsx", ".xlsm", ".csv")
 
 
-def _parse_location_codes(text):
-    """'II033, ii045 ;II050' -> ['II033', 'II045', 'II050'] (upper-cased, no dupes)."""
-    out = []
-    for code in re.split(r"[,;\s]+", str(text or "")):
-        code = code.strip().upper()
-        if code and code not in out:
-            out.append(code)
-    return out
-
-
-def _tracit_cache_locations(json_cache):
-    try:
-        with open(json_cache, encoding="utf-8") as f:
-            return list(json.load(f).get("locations") or [])
-    except Exception:
-        return None
-
-
-def _tracit_report_cache_path(ext):
-    cache_dir = os.path.join(_app_dir(), "cache")
+def _tracit_index_cache_path():
+    """Minimised cache (Employee ID -> serial/type/host/status only)."""
+    cache_dir = os.path.join(_data_dir(), "cache")
     os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, "tracit_report" + ext)
+    return os.path.join(cache_dir, "tracit_index.json")
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _purge_tracit_cache(cfg):
+    """Security (finding #9): deletes full report copies that older versions
+    of the app kept in cache/, and the minimised index once it is older than
+    cache_retention_days. Never raises."""
+    removed = []
+    for ext in TRACIT_REPORT_EXTENSIONS + (".json",):
+        legacy = os.path.join(_data_dir(), "cache", "tracit_report" + ext)
+        if os.path.exists(legacy):
+            try:
+                os.remove(legacy)
+                removed.append(legacy)
+            except OSError:
+                logger.warning("TracIT cache: could not delete legacy copy %r", legacy)
+    days = float(cfg.get("cache_retention_days") or 0)
+    idx = os.path.join(_data_dir(), "cache", "tracit_index.json")
+    if days > 0 and os.path.exists(idx) and time.time() - os.path.getmtime(idx) > days * 86400:
+        try:
+            os.remove(idx)
+            removed.append(idx)
+        except OSError:
+            pass
+    if removed:
+        logger.info("TracIT cache: removed %d old file(s)", len(removed))
+    return removed
 
 
 def _default_downloads_folder():
@@ -5409,14 +5232,20 @@ def _default_downloads_folder():
 
 def find_newest_tracit_report(cfg):
     """Newest file in the watch folder (Downloads by default) whose name
-    looks like the TracIT EUC report. Returns a path or None."""
+    looks like the TracIT EUC report AND that is recent enough
+    (max_auto_file_age_hours) and not oversized (max_file_mb) to be picked
+    up WITHOUT the operator choosing it (security finding #8). The content
+    is still schema-checked by parse_tracit_report. Returns a path or None."""
     folder = (cfg.get("watch_folder") or "").strip() or _default_downloads_folder()
     needles = [n.lower() for n in (cfg.get("file_name_contains") or ["euc"]) if n]
+    max_age_s = float(cfg.get("max_auto_file_age_hours") or 24) * 3600
+    max_bytes = float(cfg.get("max_file_mb") or 50) * 1024 * 1024
     try:
         names = os.listdir(folder)
     except OSError:
         return None
     best, best_mtime = None, -1.0
+    now = time.time()
     for name in names:
         low = name.lower()
         if not low.endswith(TRACIT_REPORT_EXTENSIONS) or low.startswith("~$"):
@@ -5425,28 +5254,41 @@ def find_newest_tracit_report(cfg):
             continue
         path = os.path.join(folder, name)
         try:
-            mtime = os.path.getmtime(path)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            st = os.stat(path)
         except OSError:
             continue
-        if mtime > best_mtime:
-            best, best_mtime = path, mtime
+        if now - st.st_mtime > max_age_s or st.st_size > max_bytes:
+            continue
+        if st.st_mtime > best_mtime:
+            best, best_mtime = path, st.st_mtime
     return best
 
 
 def _read_tabular_rows(path, max_rows=None):
-    """Rows (lists of cell values) from an .xlsx/.xlsm or .csv file."""
+    """Rows (lists of cell values) from an .xlsx/.xlsm or .csv file. Stops
+    with an error once more than max_rows rows are read (bounded processing)."""
+    def bounded(it):
+        out = []
+        for row in it:
+            out.append(list(row))
+            if max_rows and len(out) > max_rows + 15:
+                raise RuntimeError(f"{os.path.basename(path)} has more than {max_rows:,} rows - "
+                                   "export a smaller report (filter by Assigned Location) and load it again.")
+        return out
     if path.lower().endswith(".csv"):
         for enc in ("utf-8-sig", "cp1252"):
             try:
                 with open(path, newline="", encoding=enc) as f:
-                    return [row for row in csv.reader(f)]
+                    return bounded(csv.reader(f))
             except UnicodeDecodeError:
                 continue
         raise RuntimeError(f"Could not read {os.path.basename(path)} as text.")
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     try:
         ws = wb[wb.sheetnames[0]]
-        return [list(r) for r in ws.iter_rows(values_only=True)]
+        return bounded(ws.iter_rows(values_only=True))
     finally:
         wb.close()
 
@@ -5477,16 +5319,28 @@ def _find_columns_all(header_cells, candidates):
     return [one] if one is not None else []
 
 
-def _tracit_record(serial, asset_type="", hostname="", status=""):
-    return {"serial": serial, "asset_type": asset_type, "hostname": hostname, "status": status}
+def _tracit_record(serial, asset_type="", hostname="", status="", emp_ids=()):
+    return {"serial": serial, "asset_type": asset_type, "hostname": hostname, "status": status,
+            "emp_ids": [e for e in emp_ids if e]}
 
 
-def parse_tracit_report(path, cfg):
-    """Returns (index, record_count) where index is {employee_id_key:
-    [ {serial, asset_type, hostname, status}, ... ]} - every asset row per
-    employee, indexed under each Employee ID column it has (Assigned
-    Owner AND Computer User) and each form of that ID (_employee_id_keys)."""
-    rows = _read_tabular_rows(path)
+def _canonical_emp_id(emp_id):
+    """Digits-only form of an Employee ID as stored (Excel '2225112.0' -> '2225112')."""
+    emp_id = str(emp_id or "").strip()
+    if emp_id.endswith(".0") and emp_id[:-2].isdigit():
+        emp_id = emp_id[:-2]
+    return "".join(c for c in emp_id if c.isdigit()) or emp_id
+
+
+def parse_tracit_report_rows(path, cfg):
+    """Reads an exported TracIT EUC report and returns only the minimum the
+    app needs - compact rows {emps, serial, type, host, status}. Raises
+    RuntimeError if the file is too big or doesn't have the TracIT columns."""
+    max_bytes = float(cfg.get("max_file_mb") or 50) * 1024 * 1024
+    if os.path.getsize(path) > max_bytes:
+        raise RuntimeError(f"{os.path.basename(path)} is larger than {cfg.get('max_file_mb') or 50} MB - "
+                           "that doesn't look like the TracIT EUC report.")
+    rows = _read_tabular_rows(path, max_rows=int(cfg.get("max_rows") or 50000))
     header_idx = None
     for i, row in enumerate(rows[:15]):
         if _find_columns_all(row, cfg.get("employee_id_columns", [])) and \
@@ -5512,36 +5366,41 @@ def parse_tracit_report(path, cfg):
             return ""
         return str(row[idx]).strip()
 
-    index, count = {}, 0
+    out = []
     for row in rows[header_idx + 1:]:
-        emps = [cell(row, c) for c in emp_cols]
-        emps = [e for e in emps if e]
+        emps = [e for e in (cell(row, c) for c in emp_cols) if e]
         if not emps:
             continue
-        rec = _tracit_record(cell(row, serial_col), cell(row, type_col), cell(row, host_col), cell(row, status_col))
-        keys = []
-        for emp in emps:
-            for key in _employee_id_keys(emp):
-                if key not in keys:
-                    keys.append(key)
-        for key in keys:
-            index.setdefault(key, []).append(rec)
-        count += 1
-    return index, count
+        out.append({"emps": emps, "serial": cell(row, serial_col), "type": cell(row, type_col),
+                    "host": cell(row, host_col), "status": cell(row, status_col)})
+    return out
+
+
+def parse_tracit_report(path, cfg):
+    """Returns (index, record_count) where index is {employee_id_key:
+    [ {serial, asset_type, hostname, status, emp_ids}, ... ]} - every asset
+    row per employee, indexed under each Employee ID column it has
+    (Assigned Owner AND Computer User) and each form of that ID."""
+    return build_tracit_index_from_rows(parse_tracit_report_rows(path, cfg))
 
 
 def build_tracit_index_from_rows(rows):
-    """Same index as parse_tracit_report, built from the compact rows the
-    hidden TracIT window returns from the EUC Report API."""
+    """Index from compact rows: {emps:[...]} (or the older owner/user keys)."""
     index, count = {}, 0
     for r in rows or []:
-        emps = [str(r.get(k) or "").strip() for k in ("owner", "user")]
+        emps = r.get("emps")
+        if emps is None:
+            emps = [r.get(k) for k in ("owner", "user")]
+        emps = [str(e or "").strip() for e in emps]
         emps = [e for e in emps if e]
         if not emps:
             continue
-        asset_type = " ".join(x for x in (r.get("type"), r.get("model")) if x)
+        asset_type = r.get("type") or ""
+        if r.get("model"):
+            asset_type = " ".join(x for x in (asset_type, r.get("model")) if x)
         rec = _tracit_record(str(r.get("serial") or "").strip(), asset_type,
-                             str(r.get("host") or ""), str(r.get("status") or ""))
+                             str(r.get("host") or ""), str(r.get("status") or ""),
+                             [_canonical_emp_id(e) for e in emps])
         keys = []
         for emp in emps:
             for key in _employee_id_keys(emp):
@@ -5553,14 +5412,33 @@ def build_tracit_index_from_rows(rows):
     return index, count
 
 
-def tracit_best_laptop(records, cfg):
-    """Picks the laptop out of an employee's asset rows: rows whose type/
-    model mentions a laptop keyword score highest, then rows in a
-    preferred lifecycle status (Active/Deployed...); ties keep report
-    order. Rows without a serial are ignored. Returns the record or None."""
+def save_tracit_index_cache(rows, source_name="", sha256=""):
+    """Writes the minimised rows (no names/emails/models etc.) to the cache."""
+    path = _tracit_index_cache_path()
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"saved": datetime.now().isoformat(timespec="seconds"), "source": source_name,
+                   "sha256": sha256, "rows": rows}, f)
+    os.replace(tmp, path)
+    return path
+
+
+def load_tracit_index_cache():
+    """(index, count, saved_datetime, source) from the minimised cache, or None."""
+    path = _tracit_index_cache_path()
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    index, count = build_tracit_index_from_rows(data.get("rows"))
+    return index, count, datetime.fromtimestamp(os.path.getmtime(path)), data.get("source") or ""
+
+
+def tracit_laptop_candidates(records, cfg):
+    """All of an employee's rows that tie for the best laptop score."""
     with_serial = [r for r in (records or []) if r.get("serial")]
     if not with_serial:
-        return None
+        return []
     keywords = [k.lower() for k in (cfg.get("laptop_keywords") or [])]
     statuses = [k.lower() for k in (cfg.get("preferred_statuses") or [])]
 
@@ -5570,15 +5448,50 @@ def tracit_best_laptop(records, cfg):
         return (2 if any(k in text for k in keywords) else 0) + (1 if any(st in status for st in statuses) else 0)
 
     best = max(score(r) for r in with_serial)
-    return next(r for r in with_serial if score(r) == best)
+    return [r for r in with_serial if score(r) == best]
+
+
+def tracit_best_laptop(records, cfg):
+    """Picks the laptop out of an employee's asset rows: rows whose type/
+    model mentions a laptop keyword score highest, then rows in a
+    preferred lifecycle status (Active/Deployed...); ties keep report
+    order. Rows without a serial are ignored. Returns the record (with
+    'candidates' = how many rows tied, so the UI can warn) or None."""
+    cands = tracit_laptop_candidates(records, cfg)
+    if not cands:
+        return None
+    return dict(cands[0], candidates=len(cands))
 
 
 def tracit_find_laptop(tracit_state, emp_id, cfg):
+    """Security (finding #16): an EXACT Employee ID match always wins. A
+    looser match (leading zeros dropped/added) is used only when it points
+    at exactly ONE employee - otherwise None (operator types the serial)."""
     index = (tracit_state or {}).get("index", {}) or {}
+    wanted = _canonical_emp_id(emp_id)
+    seen, records = set(), []
     for key in _employee_id_keys(emp_id):
-        if key in index:
-            return tracit_best_laptop(index[key], cfg)
-    return None
+        for r in index.get(key, []):
+            if id(r) not in seen:
+                seen.add(id(r))
+                records.append(r)
+    if not records:
+        return None
+    exact = [r for r in records if not r.get("emp_ids") or wanted in r["emp_ids"]]
+    if exact:
+        best = tracit_best_laptop(exact, cfg)
+        if best:
+            best["match"] = "exact"
+        return best
+    owners = {e for r in records for e in r.get("emp_ids", []) if e.lstrip("0") == wanted.lstrip("0")}
+    if len(owners) != 1:
+        logger.warning("TracIT report: Employee ID %r is ambiguous (%d similar IDs) - not auto-filled",
+                       emp_id, len(owners))
+        return None
+    best = tracit_best_laptop(records, cfg)
+    if best:
+        best["match"] = "alias"
+    return best
 
 
 def _ssrs_submission_type_for(config, record):
@@ -5654,6 +5567,11 @@ def fetch_servicenow_new_hire(emp_id, config):
 
     field_map = {k: v for k, v in sn_cfg.get("field_map", {}).items() if v and "REPLACE_ME" not in v}
     url = f"{base_url.rstrip('/')}/api/now/table/{table}"
+    try:
+        _validate_endpoint(url, config, what="ServiceNow URL")
+    except ValueError as exc:
+        logger.error("ServiceNow lookup: skipped - %s", exc)
+        return None
     params = {
         "sysparm_query": f"{query_field}={emp_id}",
         "sysparm_limit": "1",
@@ -5791,7 +5709,6 @@ class WizardApp(tk.Tk):
             self.user_settings.get("operator_name"),
         )
         self.browser_session = BrowserLookupSession()
-        self.tracit_session = TracitLookupSession()
         self.signature_service = SignatureService(self.config_data)
 
         self.title("IT Asset Submission Acknowledgement")
@@ -5840,7 +5757,15 @@ class WizardApp(tk.Tk):
         # the app from being usable in the meantime.
         self._ssrs_refresh(force=False)
         self._tracit_report_refresh()
+        _cleanup_stale_signature_files()
         self.after(400, self._show_startup_health_check)
+        if _sec(self.config_data, "restrict_acls", False):
+            # Security (findings #7/#13, opt-in): data + PDF folders limited
+            # to this user, Administrators and the admin AD groups.
+            for folder in (_data_dir(), self.user_settings.get("root_save_folder") or ""):
+                if folder:
+                    threading.Thread(target=_restrict_folder_acl, args=(folder, self.config_data),
+                                     daemon=True).start()
 
         logger.info("WizardApp: GUI ready")
 
@@ -6095,7 +6020,7 @@ class WizardApp(tk.Tk):
         brand = ttk.Frame(header, style="Header.TFrame")
         brand.pack(side="left")
         self._header_logo_image = None  # kept as an attribute so Tk doesn't GC it
-        logo_path = os.path.join(_app_dir(), "assets", "optum_logo.png")
+        logo_path = _asset_path("optum_logo.png")
         if os.path.exists(logo_path):
             try:
                 img = Image.open(logo_path)
@@ -6127,25 +6052,10 @@ class WizardApp(tk.Tk):
         )
         tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=10)
         self.tracit_report_status_var = tk.StringVar(value="Not loaded")
-        self.tracit_download_button = self._header_status_block(
-            right, "TRACIT EUC REPORT", self.tracit_report_status_var, "⟳",
-            lambda: self._tracit_report_refresh(force_download=True),
-            "Download the EUC report from TracIT again now (it downloads automatically once a day)",
+        self.tracit_report_button = self._header_status_block(
+            right, "TRACIT EUC REPORT", self.tracit_report_status_var, "Load…",
+            self._load_tracit_report_dialog, "Load an EUC report file you exported from TracIT",
         )
-        self.tracit_report_button = ttk.Button(
-            self.tracit_download_button.master, text="Load…", style="Icon.TButton", width=6,
-            command=self._load_tracit_report_dialog,
-        )
-        self.tracit_report_button.pack(side="left", padx=(4, 0))
-        self._attach_hover_tooltip(self.tracit_report_button, "Load an EUC report file you exported from TracIT")
-        self.tracit_location_button = ttk.Button(
-            self.tracit_download_button.master, text="", style="Icon.TButton",
-            command=self._change_tracit_location,
-        )
-        self.tracit_location_button.pack(side="left", padx=(4, 0))
-        self._attach_hover_tooltip(self.tracit_location_button,
-                                   "TracIT Assigned Location the EUC report is downloaded for - click to change")
-        self._refresh_tracit_location_button()
         tk.Frame(right, width=1, height=34, background=self.UI_BORDER).pack(side="left", padx=14)
         settings_button = ttk.Button(
             right, text="⚙", width=3, style="Icon.TButton",
@@ -6271,72 +6181,44 @@ class WizardApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     # ------------------------------------------------------ TracIT report
-    def _tracit_report_refresh(self, chosen_path=None, force_download=False):
-        """Loads the TracIT EUC report in the background, best source first:
+    def _tracit_report_refresh(self, chosen_path=None):
+        """Loads the TracIT EUC report in the background:
           1. a file the operator just picked with "Load…" (chosen_path);
-          2. today's automatic download, if already done today;
-          3. a fresh automatic download through the hidden, signed-in
-             TracIT window (once a day, or right now with the ⟳ button);
-          4. otherwise the newest exported EUC file in Downloads, or the
-             last copy the app cached.
-        Every result is cached under cache/ so it survives restarts."""
+          2. otherwise (startup) the newest RECENT exported EUC file in
+             Downloads (find_newest_tracit_report), or else the app's own
+             minimised cache from the last load.
+        Only the minimised rows are cached (cache/tracit_index.json); the
+        file's SHA-256 is logged so it's clear which export was used."""
         cfg = self.config_data.get("tracit_report", {})
         if hasattr(self, "tracit_report_status_var"):
-            self.tracit_report_status_var.set("Downloading from TracIT…" if (
-                cfg.get("auto_download") and not chosen_path) else "Loading…")
-        if hasattr(self, "tracit_download_button"):
-            self.tracit_download_button.config(state="disabled")
-
-        locations = self._tracit_locations()
+            self.tracit_report_status_var.set("Loading…")
+        if hasattr(self, "tracit_report_button"):
+            self.tracit_report_button.config(state="disabled")
 
         def worker():
             error, index, records, source, updated = "", {}, 0, None, None
-            json_cache = _tracit_report_cache_path(".json")
             try:
-                if chosen_path:
-                    index, records, source, updated = self._tracit_load_file(chosen_path, cfg, copy_to_cache=True)
-                else:
-                    fresh_json = (os.path.exists(json_cache) and not force_download and
-                                  datetime.fromtimestamp(os.path.getmtime(json_cache)).date() == date.today()
-                                  and _tracit_cache_locations(json_cache) == locations)
-                    if fresh_json:
-                        with open(json_cache, encoding="utf-8") as f:
-                            index, records = build_tracit_index_from_rows(json.load(f).get("rows"))
-                        source, updated = "TracIT (downloaded today)", datetime.fromtimestamp(os.path.getmtime(json_cache))
-                    elif cfg.get("auto_download"):
-                        try:
-                            rows = self.tracit_session.export_euc(
-                                timeout=float(cfg.get("download_timeout_seconds") or 240) + 60,
-                                assigned_locations=locations,
-                            )
-                            if not rows:
-                                raise RuntimeError(f"TracIT returned 0 rows for Assigned Location {', '.join(locations) or '(all)'} "
-                                                   "- check the location code.")
-                            tmp = json_cache + ".part"
-                            with open(tmp, "w", encoding="utf-8") as f:
-                                json.dump({"downloaded": datetime.now().isoformat(), "locations": locations,
-                                           "rows": rows}, f)
-                            os.replace(tmp, json_cache)
-                            index, records = build_tracit_index_from_rows(rows)
-                            source, updated = "TracIT (downloaded)", datetime.now()
-                        except Exception as exc:
-                            logger.warning("TracIT report: automatic download failed (%s) - trying files", exc)
-                            error = f"Auto-download failed: {exc}"
-                    if not records:
-                        # Fallbacks: newest exported file in Downloads / cached
-                        # copy / an older automatic download - whichever is newest.
-                        index2, records2, source2, updated2 = self._tracit_load_newest_file(cfg)
-                        if os.path.exists(json_cache):
-                            jt = datetime.fromtimestamp(os.path.getmtime(json_cache))
-                            if not updated2 or jt > updated2:
-                                with open(json_cache, encoding="utf-8") as f:
-                                    index2, records2 = build_tracit_index_from_rows(json.load(f).get("rows"))
-                                source2, updated2 = "TracIT (earlier download)", jt
-                        if records2:
-                            index, records, source, updated = index2, records2, source2, updated2
+                _purge_tracit_cache(cfg)
+                path = chosen_path or find_newest_tracit_report(cfg)
+                cached = None
+                if not chosen_path:
+                    try:
+                        cached = load_tracit_index_cache()
+                    except Exception:
+                        logger.exception("TracIT report: cache unreadable - ignoring it")
+                if path and (chosen_path or not cached or os.path.getmtime(path) > cached[2].timestamp()):
+                    try:
+                        index, records, source, updated = self._tracit_load_file(path, cfg)
+                    except Exception as exc:
+                        if chosen_path or not cached:
+                            raise
+                        logger.warning("TracIT report: %r could not be used (%s) - using the cache", path, exc)
+                if not records and cached:
+                    index, records, updated, src = cached
+                    source = (src + " (cached)") if src else "cached"
             except Exception as exc:
                 logger.exception("TracIT report: could not load")
-                error = error or str(exc)
+                error = str(exc)
 
             def apply():
                 if records:
@@ -6350,9 +6232,9 @@ class WizardApp(tk.Tk):
                 }
                 logger.info("TracIT report: status=%r records=%d source=%r error=%r", status, records, source, error)
                 self._refresh_tracit_report_labels()
-                if hasattr(self, "tracit_download_button"):
-                    self.tracit_download_button.config(state="normal")
-                if error and (chosen_path or force_download):
+                if hasattr(self, "tracit_report_button"):
+                    self.tracit_report_button.config(state="normal")
+                if error and chosen_path:
                     messagebox.showerror("TracIT report", error)
                 # Fill the on-screen form now if it was waiting on this.
                 if hasattr(self, "current_serial_var"):
@@ -6363,67 +6245,20 @@ class WizardApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _tracit_load_file(self, path, cfg, copy_to_cache=False):
-        if copy_to_cache:
-            ext = os.path.splitext(path)[1].lower()
-            ext = ext if ext in TRACIT_REPORT_EXTENSIONS else ".xlsx"
-            for old_ext in TRACIT_REPORT_EXTENSIONS:
-                old = _tracit_report_cache_path(old_ext)
-                if os.path.exists(old):
-                    os.remove(old)
-            cached = _tracit_report_cache_path(ext)
-            shutil.copy2(path, cached)
-            path = cached
-        index, records = parse_tracit_report(path, cfg)
-        return index, records, path, datetime.fromtimestamp(os.path.getmtime(path))
-
-    def _tracit_load_newest_file(self, cfg):
-        """Newest of: the exported EUC file in Downloads, the cached copy."""
-        cached = next((_tracit_report_cache_path(ext) for ext in TRACIT_REPORT_EXTENSIONS
-                       if os.path.exists(_tracit_report_cache_path(ext))), None)
-        candidate = find_newest_tracit_report(cfg)
+    def _tracit_load_file(self, path, cfg):
+        """Parses + schema-checks an exported report and caches only the
+        minimised rows. Returns (index, records, source_name, file_time)."""
+        sha = _file_sha256(path)
+        rows = parse_tracit_report_rows(path, cfg)
+        index, records = build_tracit_index_from_rows(rows)
+        name = os.path.basename(path)
+        logger.info("TracIT report: loaded %r (%d rows, %d bytes, sha256=%s)",
+                    path, records, os.path.getsize(path), sha)
         try:
-            if candidate and (not cached or os.path.getmtime(candidate) > os.path.getmtime(cached)):
-                logger.info("TracIT report: loading exported file %r", candidate)
-                return self._tracit_load_file(candidate, cfg, copy_to_cache=True)
-            if cached:
-                return self._tracit_load_file(cached, cfg)
+            save_tracit_index_cache(rows, name, sha)
         except Exception:
-            logger.exception("TracIT report: could not read the exported file")
-        return {}, 0, None, None
-
-    def _tracit_locations(self):
-        """The TracIT Assigned Location code(s) to download: this user's own
-        setting, or the CONFIG default (II033)."""
-        own = _parse_location_codes((self.user_settings or {}).get("tracit_assigned_locations", ""))
-        return own or list(self.config_data.get("tracit_report", {}).get("assigned_locations", []))
-
-    def _refresh_tracit_location_button(self):
-        if hasattr(self, "tracit_location_button"):
-            codes = self._tracit_locations()
-            text = (", ".join(codes) if codes else "All locations") + " ✎"
-            self.tracit_location_button.config(text=text, width=len(text) + 1)
-
-    def _change_tracit_location(self):
-        value = simpledialog.askstring(
-            "TracIT Location",
-            "TracIT 'Assigned Location' code to download the EUC report for\n"
-            "(e.g. II033 - separate several codes with commas):",
-            initialvalue=", ".join(self._tracit_locations()), parent=self,
-        )
-        if value is None:
-            return  # cancelled
-        codes = _parse_location_codes(value)
-        if not codes:
-            messagebox.showwarning("TracIT Location", "Please enter at least one location code, e.g. II033.")
-            return
-        if codes == self._tracit_locations():
-            return
-        settings = dict(self.user_settings)
-        settings["tracit_assigned_locations"] = ", ".join(codes)
-        self.user_settings = _save_user_settings(settings)
-        self._refresh_tracit_location_button()
-        self._tracit_report_refresh(force_download=True)
+            logger.exception("TracIT report: could not write the minimised cache (non-fatal)")
+        return index, records, name, datetime.fromtimestamp(os.path.getmtime(path))
 
     def _load_tracit_report_dialog(self):
         path = filedialog.askopenfilename(
@@ -6442,9 +6277,9 @@ class WizardApp(tk.Tk):
             when = st["last_updated"].strftime("%d-%b %I:%M %p") if st.get("last_updated") else ""
             self.tracit_report_status_var.set(f"{st['status']} · {st['records']:,} rows · {when}")
         elif st.get("status") == "Error":
-            self.tracit_report_status_var.set("Download failed - ⟳ to retry, or Load…")
+            self.tracit_report_status_var.set("Could not load - use Load…")
         else:
-            self.tracit_report_status_var.set("Not loaded - ⟳ to download, or Load…")
+            self.tracit_report_status_var.set("Not loaded - use Load…")
 
     def _apply_tracit_report_to_current_serial(self):
         """Single Person tab: fill Current Device Serial Number from the
@@ -6465,7 +6300,7 @@ class WizardApp(tk.Tk):
                 extra = f" ({rec['asset_type']})" if rec.get("asset_type") else ""
                 hint.config(text=f"Filled from TracIT report{extra}.", foreground="#1a7f37")
         elif hint is not None and self.tracit_report_state.get("records"):
-            hint.config(text="Not in TracIT report - use Fetch from TracIT or type it.", foreground="#a05a00")
+            hint.config(text="Not in the TracIT report - please type it.", foreground="#a05a00")
 
     def _show_startup_health_check(self):
         """Enhancement 13 - a quick, non-blocking startup readiness panel.
@@ -6562,17 +6397,16 @@ class WizardApp(tk.Tk):
         ttk.Entry(frm, textvariable=email_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
         row += 1
 
-        ttk.Label(frm, text="TracIT Location Code(s):").grid(row=row, column=0, sticky="w", **pad)
-        tracit_loc_var = tk.StringVar(value=", ".join(self._tracit_locations()))
-        ttk.Entry(frm, textvariable=tracit_loc_var, width=42).grid(row=row, column=1, columnspan=2, sticky="w", **pad)
-        row += 1
-        ttk.Label(frm, text="TracIT 'Assigned Location' to download the EUC report for, e.g. II033 "
-                            "(several: II033, II045)", style="Muted.TLabel", wraplength=420).grid(
-            row=row, column=1, columnspan=2, sticky="w", padx=10, pady=(0, 6))
-        row += 1
-
         admin_vars = {}
-        if not first_run:
+        is_admin = _is_app_admin(self.config_data)
+        if not first_run and not is_admin:
+            ttk.Separator(frm, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(12, 4))
+            row += 1
+            ttk.Label(frm, text="Admin / Shared Settings can only be changed by an app administrator "
+                                "(security.admin_users / admin_ad_groups).",
+                      wraplength=420, foreground="#666").grid(row=row, column=0, columnspan=3, sticky="w", padx=10)
+            row += 1
+        if not first_run and is_admin:
             # Admin / shared-install settings: SSRS Report URL, AD Lookup URL,
             # TracIT URL template, SSRS cache lifetime. These are saved to
             # admin_settings.json NEXT TO the app (not %APPDATA%), so unlike
@@ -6595,7 +6429,6 @@ class WizardApp(tk.Tk):
             admin_field_specs = [
                 ("ssrs_report_url", "SSRS Report URL:", self.config_data.get("ssrs_asset_report", {}).get("url", "")),
                 ("ad_lookup_url_template", "AD Lookup URL template:", self.config_data.get("ad_lookup_url_template", "")),
-                ("tracit_url_template", "TracIT URL:", self.config_data.get("tracit_url_template", "")),
                 ("ssrs_cache_max_age_hours", "SSRS cache max age (hours):",
                  str(self.config_data.get("ssrs_asset_report", {}).get("cache_max_age_hours", 24))),
             ]
@@ -6620,9 +6453,21 @@ class WizardApp(tk.Tk):
             if not root_var.get().strip():
                 messagebox.showwarning("Root Save Folder required", "Please choose a root save folder.", parent=dlg)
                 return
-            old_locations = self._tracit_locations()
+            if admin_vars:
+                # Security (findings #3/#14): only an app admin gets here, and
+                # every URL must be HTTPS on an approved company host.
+                for key in ("ssrs_report_url", "ad_lookup_url_template"):
+                    value = admin_vars[key].get().strip() if key in admin_vars else ""
+                    if value:
+                        try:
+                            _validate_endpoint(value, self.config_data, what=key)
+                        except ValueError as exc:
+                            messagebox.showerror("Admin settings", str(exc), parent=dlg)
+                            return
+                if not _is_app_admin(self.config_data):
+                    messagebox.showerror("Admin settings", "Only an app administrator can change these.", parent=dlg)
+                    return
             self.user_settings = _save_user_settings({
-                "tracit_assigned_locations": ", ".join(_parse_location_codes(tracit_loc_var.get())),
                 "root_save_folder": root_var.get().strip(),
                 "operator_name": op_var.get().strip(),
                 "location": loc_var.get().strip(),
@@ -6631,7 +6476,12 @@ class WizardApp(tk.Tk):
             })
             if admin_vars:
                 old_ssrs_url = self.config_data.get("ssrs_asset_report", {}).get("url", "")
-                self.admin_settings = _save_admin_settings({k: v.get().strip() for k, v in admin_vars.items()})
+                try:
+                    self.admin_settings = _save_admin_settings({k: v.get().strip() for k, v in admin_vars.items()},
+                                                               self.config_data)
+                except (PermissionError, ValueError) as exc:
+                    messagebox.showerror("Admin settings", str(exc), parent=dlg)
+                    return
                 _apply_admin_settings_overrides(self.config_data, self.admin_settings)
                 new_ssrs_url = self.config_data.get("ssrs_asset_report", {}).get("url", "")
                 if hasattr(self, "_refresh_ssrs_status_labels"):
@@ -6646,10 +6496,7 @@ class WizardApp(tk.Tk):
                 self._batch_refresh_save_path()
             self._refresh_header_operator_label()
             self._refresh_save_location_hint()
-            self._refresh_tracit_location_button()
             dlg.destroy()
-            if self._tracit_locations() != old_locations:
-                self._tracit_report_refresh(force_download=True)
 
         ttk.Button(btn_row, text="Save", command=do_save).pack(side="left", padx=6)
         if not first_run:
@@ -6907,7 +6754,7 @@ class WizardApp(tk.Tk):
             if not item.get("employee_name"):
                 notes.append("Will look up via AD")
             else:
-                notes.append("Using Excel data - no AD lookup")
+                notes.append("Will be checked in AD - AD name/manager replace Excel's")
             tree.insert("", "end", values=(
                 item["row_number"], item["employee_id"], item["type"],
                 item.get("employee_name") or "", item.get("manager_name") or "",
@@ -7399,6 +7246,41 @@ class WizardApp(tk.Tk):
             self._refresh_save_path()  # picks up the per-submission-type subfolder
 
     # ------------------------------------------------ 5: asset info
+    def _build_lwd_date_row(self, parent, var):
+        """'Last Working Date' box + 'Today' button. Tidied to DD-Mon-YYYY
+        when the operator leaves the box; a wrong date is flagged in red."""
+        row = ttk.Frame(parent)
+        row.pack(anchor="w", pady=4)
+        ttk.Label(row, text="Last Working Date", width=34, style="FieldLabel.TLabel").pack(side="left")
+        entry = ttk.Entry(row, textvariable=var, width=16)
+        entry.pack(side="left", padx=8)
+        ttk.Button(row, text="Today", command=lambda: var.set(date.today().strftime("%d-%b-%Y"))).pack(side="left")
+        hint = ttk.Label(row, text="e.g. 30-Sep-2026 or 30/09/2026", foreground="#888")
+        hint.pack(side="left", padx=(8, 0))
+
+        def tidy(_event=None):
+            try:
+                var.set(_normalize_lwd_date(var.get()))
+                hint.config(text="e.g. 30-Sep-2026 or 30/09/2026", foreground="#888")
+            except ValueError:
+                hint.config(text="Not a valid date - use e.g. 30-Sep-2026", foreground="#b42318")
+        entry.bind("<FocusOut>", tidy)
+        entry.bind("<Return>", tidy)
+        return entry
+
+    def _lwd_date_for_pdf(self, sub_type, var):
+        """Normalised Last Working Date for the PDF ('' if this type has
+        none). Shows a warning and returns None if the date is invalid."""
+        if var is None or sub_type not in self.config_data.get("lwd_date_submission_types", []):
+            return ""
+        try:
+            value = _normalize_lwd_date(var.get())
+        except ValueError as exc:
+            messagebox.showwarning("Last Working Date", str(exc))
+            return None
+        var.set(value)
+        return value
+
     def _rebuild_asset_details(self):
         for child in self.asset_details_frame.winfo_children():
             child.destroy()
@@ -7406,7 +7288,8 @@ class WizardApp(tk.Tk):
 
         sub_type = self.submission_type_var.get()
 
-
+        old_lwd = getattr(self, "lwd_date_var", None)
+        self.lwd_date_var = tk.StringVar(value=old_lwd.get() if old_lwd is not None else "")
         self.current_serial_var = tk.StringVar(value="")
         self.new_serial_var = tk.StringVar(value="")
         self.assets_other_var = tk.StringVar(value="")
@@ -7424,21 +7307,14 @@ class WizardApp(tk.Tk):
         # no_current_asset_submission_types in CONFIG) rather than shown
         # blank and confusing.
         show_current_serial = sub_type not in self.config_data.get("no_current_asset_submission_types", [])
+        if sub_type in self.config_data.get("lwd_date_submission_types", []):
+            self._build_lwd_date_row(parent, self.lwd_date_var)
         if show_current_serial:
             row1 = ttk.Frame(parent)
             row1.pack(anchor="w", pady=4)
             ttk.Label(row1, text="Current Device Serial Number", width=34, style="FieldLabel.TLabel").pack(side="left")
             ttk.Entry(row1, textvariable=self.current_serial_var, width=30).pack(side="left", padx=8)
             if sub_type in self.config_data.get("tracit_submission_types", []):
-                self.tracit_fetch_button = ttk.Button(
-                    row1, text="Fetch from TracIT",
-                    command=lambda: self._fetch_serial_from_tracit(),
-                )
-                self.tracit_fetch_button.pack(side="left", padx=(4, 0))
-                ttk.Button(
-                    row1, text="Open TracIT",
-                    command=lambda: self._open_tracit(self.emp_id_var.get().strip(), self.current_serial_var.get().strip()),
-                ).pack(side="left", padx=(4, 0))
                 self.tracit_fetch_hint = ttk.Label(row1, text="", foreground="#888")
                 self.tracit_fetch_hint.pack(side="left", padx=(6, 0))
 
@@ -7549,6 +7425,8 @@ class WizardApp(tk.Tk):
         def sign_now():
             path = self.signature_service.capture(self, title=capture_title)
             if path:
+                if self._signature_paths.get(data_key) not in (None, path):
+                    self.signature_service.discard(self._signature_paths[data_key])  # re-signed
                 self._signature_paths[data_key] = path
                 show_preview(path)
                 self.status_var.set(f"{title.split('. ', 1)[-1]} captured.")
@@ -7557,6 +7435,8 @@ class WizardApp(tk.Tk):
 
     def _reset_signature_previews(self):
         for key in ("employee_signature_path", "asset_receiver_signature_path"):
+            if self._signature_paths.get(key) and os.path.exists(self._signature_paths[key]):
+                self.signature_service.discard(self._signature_paths[key])
             self._signature_paths[key] = None
             self._sig_preview_image.pop(key, None)
             label = getattr(self, f"_preview_label_{key}", None)
@@ -7593,127 +7473,6 @@ class WizardApp(tk.Tk):
         outright rather than accepted and then complained about."""
         return proposed_value == "" or proposed_value.isdigit()
 
-    def _open_tracit(self, employee_id, serial_number):
-        """Opens the configured TracIT page. If tracit_url_template
-        contains {employee_id}/{serial_number} placeholders (once a real
-        deep-link URL format is confirmed), they're filled in; otherwise
-        the plain base page opens as-is, same as clicking a bookmark."""
-        template = self.config_data.get("tracit_url_template", "").strip()
-        if not template:
-            messagebox.showwarning(
-                "TracIT not configured",
-                "tracit_url_template isn't set in CONFIG yet.",
-            )
-            return
-        try:
-            url = template.format(employee_id=employee_id or "", serial_number=serial_number or "")
-        except Exception:
-            logger.debug("TracIT: URL template has no/invalid placeholders, opening as-is", exc_info=True)
-            url = template
-        logger.info("TracIT: opening %s (employee_id=%r, serial_number=%r)", url, employee_id, serial_number)
-        webbrowser.open(url)
-
-    def _fetch_serial_from_tracit(self):
-        """Drives an embedded TracIT browser session (same overall idea as
-        the AD Lookup embedded session) to pull the Current Device Serial
-        Number straight from TracIT for this Employee ID, instead of the
-        operator having to open TracIT, filter it by hand, and retype the
-        serial number here."""
-        emp_id = self.emp_id_var.get().strip()
-        if not emp_id:
-            messagebox.showwarning("Missing Employee ID", "Please enter an Employee ID first.")
-            return
-        if not self.config_data.get("tracit_lookup", {}).get("enabled", True):
-            messagebox.showwarning("TracIT lookup disabled", "TracIT lookup is disabled in CONFIG.")
-            return
-        if hasattr(self, "tracit_fetch_button"):
-            self.tracit_fetch_button.config(state="disabled")
-        if hasattr(self, "tracit_fetch_hint"):
-            self.tracit_fetch_hint.config(text="Fetching from TracIT...", foreground="#888")
-
-        def worker():
-            try:
-                serial = self.tracit_session.search(emp_id)
-                self.after(0, self._on_tracit_fetch_success, emp_id, serial)
-            except Exception as exc:
-                self.after(0, self._on_tracit_fetch_failure, emp_id, exc)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_tracit_fetch_success(self, emp_id, serial):
-        if hasattr(self, "tracit_fetch_button"):
-            self.tracit_fetch_button.config(state="normal")
-        if emp_id != self.emp_id_var.get().strip():
-            # Employee ID changed again while this lookup was running - this
-            # result is for the old ID, not the one on screen now.
-            return
-        self.current_serial_var.set(serial)
-        if hasattr(self, "tracit_fetch_hint"):
-            self.tracit_fetch_hint.config(text="Filled from TracIT.", foreground="#1a7f37")
-
-    def _on_tracit_fetch_failure(self, emp_id, exc):
-        if hasattr(self, "tracit_fetch_button"):
-            self.tracit_fetch_button.config(state="normal")
-        logger.exception("TracIT fetch failed for emp_id=%r", emp_id)
-        if emp_id != self.emp_id_var.get().strip():
-            return
-        if hasattr(self, "tracit_fetch_hint"):
-            self.tracit_fetch_hint.config(text="Could not fetch from TracIT - enter it manually.", foreground="#b00020")
-        messagebox.showwarning("TracIT lookup failed", str(exc))
-
-    def _batch_fetch_serial_from_tracit(self, emp_id):
-        """Bulk-tab equivalent of _fetch_serial_from_tracit."""
-        emp_id = (emp_id or "").strip()
-        if not emp_id:
-            messagebox.showwarning("Missing Employee ID", "This row has no Employee ID yet.")
-            return
-        if not self.config_data.get("tracit_lookup", {}).get("enabled", True):
-            messagebox.showwarning("TracIT lookup disabled", "TracIT lookup is disabled in CONFIG.")
-            return
-        if hasattr(self, "b_tracit_fetch_button"):
-            self.b_tracit_fetch_button.config(state="disabled")
-        if hasattr(self, "b_tracit_fetch_hint"):
-            self.b_tracit_fetch_hint.config(text="Fetching from TracIT...", foreground="#888")
-
-        def worker():
-            try:
-                serial = self.tracit_session.search(emp_id)
-                self.after(0, self._on_batch_tracit_fetch_success, emp_id, serial)
-            except Exception as exc:
-                self.after(0, self._on_batch_tracit_fetch_failure, emp_id, exc)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _batch_active_row_emp_id(self):
-        """The Employee ID of whichever bulk row is currently on screen, or
-        '' if none is active - used to guard a background TracIT fetch
-        against the operator having moved to a different row (or the row
-        list having changed) before it finished."""
-        if self._batch_active_index is None or self._batch_active_index >= len(self.batch_queue):
-            return ""
-        return self.batch_queue[self._batch_active_index].get("employee_id") or ""
-
-    def _on_batch_tracit_fetch_success(self, emp_id, serial):
-        if hasattr(self, "b_tracit_fetch_button"):
-            self.b_tracit_fetch_button.config(state="normal")
-        if emp_id != self._batch_active_row_emp_id():
-            # The operator moved to a different row while this lookup was
-            # running - this result belongs to the row that's no longer shown.
-            return
-        self.b_current_serial_var.set(serial)
-        if hasattr(self, "b_tracit_fetch_hint"):
-            self.b_tracit_fetch_hint.config(text="Filled from TracIT.", foreground="#1a7f37")
-
-    def _on_batch_tracit_fetch_failure(self, emp_id, exc):
-        if hasattr(self, "b_tracit_fetch_button"):
-            self.b_tracit_fetch_button.config(state="normal")
-        logger.exception("Bulk TracIT fetch failed for emp_id=%r", emp_id)
-        if emp_id != self._batch_active_row_emp_id():
-            return
-        if hasattr(self, "b_tracit_fetch_hint"):
-            self.b_tracit_fetch_hint.config(text="Could not fetch from TracIT - enter it manually.", foreground="#b00020")
-        messagebox.showwarning("TracIT lookup failed", str(exc))
-
     # ------------------------------------------------------------ generate
     def _validate_form(self):
         if not self.bu_var.get():
@@ -7748,6 +7507,53 @@ class WizardApp(tk.Tk):
             return False
         return True
 
+    def _value_source_notes(self, emp_id, sub_type, current_serial, new_serial):
+        """Where the serial numbers came from, plus any warning (finding #17)."""
+        notes = {}
+        tr_cfg = self.config_data.get("tracit_report", {})
+        if current_serial:
+            rec = tracit_find_laptop(getattr(self, "tracit_report_state", {}), emp_id, tr_cfg)
+            if rec and rec.get("serial") == current_serial:
+                note = "TracIT report"
+                if rec.get("match") == "alias":
+                    note += " - matched on a similar Employee ID, please check"
+                if (rec.get("candidates") or 1) > 1:
+                    note += f" - {rec['candidates']} possible laptops, please check this is the right one"
+                notes["current"] = note
+            else:
+                notes["current"] = "typed / edited by operator"
+        if new_serial:
+            ssrs = _ssrs_find_record(getattr(self, "ssrs_state", {}), emp_id) or {}
+            notes["new"] = "SSRS report" if ssrs.get("serial_number") == new_serial else "typed / edited by operator"
+        return notes
+
+    def _confirm_before_generate(self, emp_id, emp_name, manager_name, sub_type, current_serial,
+                                 new_serial, identity_source, signature_method, lwd_date=""):
+        """Security (findings #6/#17): one last look at the key values, and
+        where each came from, before the PDF is generated and signed."""
+        if not _sec(self.config_data, "confirm_before_generate", True):
+            return True
+        notes = self._value_source_notes(emp_id, sub_type, current_serial, new_serial)
+        lines = [
+            f"Employee ID:  {emp_id}",
+            f"Employee name:  {emp_name}   [{identity_source}]",
+            f"Manager:  {manager_name or '-'}",
+            f"Submission type:  {sub_type}",
+        ]
+        if lwd_date:
+            lines.append(f"Last working date:  {lwd_date}")
+        if current_serial:
+            lines.append(f"Current device serial:  {current_serial}   [{notes.get('current')}]")
+        if new_serial:
+            lines.append(f"New device serial:  {new_serial}   [{notes.get('new')}]")
+        if signature_method:
+            lines.append(f"Signatures:  {signature_method}")
+        return messagebox.askyesno(
+            "Confirm before signing",
+            "Please check these details before the PDF is generated and signed:\n\n" + "\n".join(lines),
+            parent=self,
+        )
+
     def _on_generate(self):
         logger.info(
             "Generate clicked: emp_id=%r bu=%r submission_type=%r",
@@ -7776,6 +7582,10 @@ class WizardApp(tk.Tk):
             "ContactNumber": contact_number, "ManagerName": manager_name,
             "LastWorkingDate": "",
         }
+        lwd_date = self._lwd_date_for_pdf(chosen_type, getattr(self, "lwd_date_var", None))
+        if lwd_date is None:
+            return
+        field_values["LastWorkingDate"] = lwd_date
 
         checked_tags = {tag for label, tag in SUBMISSION_TYPE_TAGS.items() if label == chosen_type}
 
@@ -7796,6 +7606,15 @@ class WizardApp(tk.Tk):
             "EmployeeSignature": self._signature_paths.get("employee_signature_path"),
             "AssetReceiverSignature": self._signature_paths.get("asset_receiver_signature_path"),
         }
+
+        signature_method = self.signature_service.method_for(
+            signature_images["EmployeeSignature"], signature_images["AssetReceiverSignature"])
+        if not self._confirm_before_generate(
+                emp_id, emp_name, manager_name, chosen_type, current_serial, new_serial,
+                getattr(self, "_identity_lookup_source", "") or "Manual", signature_method, lwd_date):
+            logger.info("Generate: operator cancelled at the confirmation step")
+            self.status_var.set("Generation cancelled - check the details and generate again.")
+            return
 
         output_path = self.output_path_override or self._compute_default_output_path()
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -7843,6 +7662,8 @@ class WizardApp(tk.Tk):
             # signing timestamp pyHanko already embeds.
             base_reason = self.config_data.get("signing_reason") or "IT Asset Acknowledgement"
             emp_reason = f"{base_reason} - {emp_name} (Employee ID: {emp_id})"
+            if signature_method:
+                emp_reason += f" - signature captured: {signature_method}"
             sign_pdf_with_signatures(
                 unsigned_pdf, output_path,
                 [
@@ -7862,6 +7683,7 @@ class WizardApp(tk.Tk):
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
                 ssrs_match_status=ssrs_match_status, lookup_source=getattr(self, "_identity_lookup_source", ""),
                 pdf_generated=False, pdf_location="", email_draft_created=False,
+                signature_method=signature_method,
             )
             return
         except Exception as exc:
@@ -7872,12 +7694,15 @@ class WizardApp(tk.Tk):
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
                 ssrs_match_status=ssrs_match_status, lookup_source=getattr(self, "_identity_lookup_source", ""),
                 pdf_generated=False, pdf_location="", email_draft_created=False,
+                signature_method=signature_method,
             )
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         logger.info("Generate SUCCESS for emp_id=%r -> %s", emp_id, output_path)
+        self.signature_service.discard(signature_images["EmployeeSignature"],
+                                       signature_images["AssetReceiverSignature"])
 
         self.status_var.set(f"Saved (signed): {output_path}")
 
@@ -7900,6 +7725,7 @@ class WizardApp(tk.Tk):
             operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
             ssrs_match_status=ssrs_match_status, lookup_source=getattr(self, "_identity_lookup_source", ""),
             pdf_generated=True, pdf_location=output_path, email_draft_created=email_draft_created,
+            signature_method=signature_method,
         )
         if hasattr(self, "_history_refresh"):
             self._history_refresh()
@@ -7958,6 +7784,8 @@ class WizardApp(tk.Tk):
         self.contact_var.set("")
         self.submission_type_var.set("")
         self.submission_type_hint.config(text="")
+        if hasattr(self, "lwd_date_var"):
+            self.lwd_date_var.set("")
         self._rebuild_asset_details()
         self._reset_signature_previews()
         self.output_path_override = None
@@ -8192,7 +8020,10 @@ class WizardApp(tk.Tk):
         A newer paste/import cancels an older run (token check)."""
         self._batch_prefill_token += 1
         token = self._batch_prefill_token
-        todo = [(i, it["employee_id"]) for i, it in enumerate(self.batch_queue) if not it.get("employee_name")]
+        # Security (finding #6): Active Directory is authoritative for the
+        # name + manager, so EVERY row is checked - including rows whose
+        # Excel file already supplied a name.
+        todo = [(i, it["employee_id"]) for i, it in enumerate(self.batch_queue) if it.get("_lookup_source") != "AD"]
         if not todo:
             return
         total = len(todo)
@@ -8216,15 +8047,24 @@ class WizardApp(tk.Tk):
         item = self.batch_queue[index]
         if item["employee_id"] != emp_id:
             return
-        if candidates and len(candidates) == 1 and not item.get("employee_name"):
-            item["employee_name"] = candidates[0].get("emp_name") or None
-            item["manager_name"] = candidates[0].get("manager_name") or None
+        if candidates and len(candidates) == 1 and (candidates[0].get("emp_name") or "").strip():
+            old_name, old_mgr = item.get("employee_name") or "", item.get("manager_name") or ""
+            new_name = candidates[0].get("emp_name") or ""
+            new_mgr = candidates[0].get("manager_name") or old_mgr
+            if old_name and old_name.strip().lower() != new_name.strip().lower():
+                logger.info("Bulk: row %d - Excel name replaced by the Active Directory name", index + 1)
+                item["_import_mismatch"] = True
+            item["employee_name"] = new_name or None
+            item["manager_name"] = new_mgr or None
             item["_lookup_source"] = "AD"
             if index == self._batch_active_index and hasattr(self, "b_emp_name_var"):
-                if not self.b_emp_name_var.get().strip():
+                # Replace what's on screen unless the operator already edited it.
+                if self.b_emp_name_var.get().strip() in ("", old_name.strip()):
                     self.b_emp_name_var.set(item["employee_name"] or "")
-                if not self.b_manager_name_var.get().strip():
+                if self.b_manager_name_var.get().strip() in ("", old_mgr.strip()):
                     self.b_manager_name_var.set(item["manager_name"] or "")
+        elif item.get("employee_name") and item.get("_lookup_source") in (None, "", "Import"):
+            item["_lookup_source"] = "Import (unverified)"
         self._batch_refresh_tree()
         if done < total:
             self.batch_summary_var.set(self.batch_summary_var.get() + f"   ·   looking up names {done}/{total}…")
@@ -8252,6 +8092,7 @@ class WizardApp(tk.Tk):
         search_entry.bind("<KeyRelease>", lambda e: self._history_refresh())
         ttk.Button(toolbar, text="⟳  Refresh", command=self._history_refresh).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Open Folder", command=self._history_open_folder).pack(side="right")
+        ttk.Button(toolbar, text="Verify log", command=self._history_verify_log).pack(side="right", padx=(0, 6))
         ttk.Button(toolbar, text="Open PDF", style="Primary.TButton",
                    command=self._history_open_pdf).pack(side="right", padx=(0, 8))
 
@@ -8309,10 +8150,30 @@ class WizardApp(tk.Tk):
         path = self._history_selected_pdf_path()
         if not path:
             return
+        if not path.lower().endswith(".pdf"):
+            # Security: the path comes from audit.log (a plain text file). Never
+            # hand anything but a .pdf to the OS "open" action, so an edited
+            # log line can't be used to launch a program.
+            logger.warning("Generated Documents: refused to open non-PDF path %r", path)
+            messagebox.showwarning("Not a PDF", "Only PDF files can be opened from this list.")
+            return
         if not os.path.exists(path):
             messagebox.showwarning("File not found", f"This PDF no longer exists at:\n{path}")
             return
+        expected = next((e.get("pdf_sha256") for e in _read_audit_log_entries()
+                         if e.get("pdf_location") == path and e.get("pdf_sha256")), None)
+        if expected and _file_sha256(path) != expected:
+            logger.warning("Generated Documents: %r has changed since it was generated", path)
+            if not messagebox.askyesno(
+                    "PDF has changed",
+                    "This PDF is not the same file the app generated (its SHA-256 fingerprint no longer "
+                    "matches the audit log). It may have been replaced or edited.\n\nOpen it anyway?"):
+                return
         self._open_with_os_default(path)
+
+    def _history_verify_log(self):
+        ok, message = verify_audit_log()
+        (messagebox.showinfo if ok else messagebox.showerror)("Audit log check", message)
 
     def _history_open_folder(self):
         path = self._history_selected_pdf_path()
@@ -8515,7 +8376,7 @@ class WizardApp(tk.Tk):
             # Excel already supplied a name at import time -> "Import" is
             # the accurate lookup source unless/until SSRS or AD overrides
             # it below.
-            item["_lookup_source"] = "Import" if item.get("employee_name") else ""
+            item["_lookup_source"] = "Import (unverified)" if item.get("employee_name") else ""
 
         self.batch_placeholder.pack_forget()
         for child in self.batch_person_frame.winfo_children():
@@ -8636,7 +8497,9 @@ class WizardApp(tk.Tk):
         #  - Employee Name / Manager Name come from Active Directory (LDAP),
         #    unless the imported Excel row already supplied the name.
         self._batch_apply_ssrs_for_row(index)
-        if not item.get("employee_name"):
+        if item.get("_lookup_source") != "AD":
+            # Security (finding #6): AD is checked even when the Excel row
+            # supplied a name - the AD name/manager replace the Excel values.
             self._batch_run_lookup_for_active()
         else:
             if not self.b_manager_name_var.get().strip():
@@ -8773,6 +8636,15 @@ class WizardApp(tk.Tk):
         # below and no_current_asset_submission_types in CONFIG).
         no_current_types = self.config_data.get("no_current_asset_submission_types", [])
         show_current_serial = sub_type not in no_current_types
+        old_lwd = getattr(self, "b_lwd_date_var", None)
+        lwd_value = old_lwd.get() if (old_lwd is not None and getattr(self, "_b_lwd_row_index", None) == self._batch_active_index) else ""
+        if not lwd_value and self._batch_active_index is not None:
+            try:
+                lwd_value = _normalize_lwd_date(self.batch_queue[self._batch_active_index].get("last_working_date"))
+            except ValueError:
+                lwd_value = str(self.batch_queue[self._batch_active_index].get("last_working_date") or "")
+        self.b_lwd_date_var = tk.StringVar(value=lwd_value)
+        self._b_lwd_row_index = self._batch_active_index
         self.b_current_serial_var = tk.StringVar(value=known_serial if show_current_serial else "")
         self.b_new_serial_var = tk.StringVar(value=known_serial if not show_current_serial else "")
         self.b_assets_other_var = tk.StringVar(value="")
@@ -8784,6 +8656,8 @@ class WizardApp(tk.Tk):
             return
 
         prefill_note = " (from the imported file - check it, then edit if needed)" if known_serial else ""
+        if sub_type in self.config_data.get("lwd_date_submission_types", []):
+            self._build_lwd_date_row(parent, self.b_lwd_date_var)
 
         if show_current_serial:
             row1 = ttk.Frame(parent)
@@ -8791,15 +8665,6 @@ class WizardApp(tk.Tk):
             ttk.Label(row1, text="Current Device Serial Number", width=34, style="FieldLabel.TLabel").pack(side="left")
             ttk.Entry(row1, textvariable=self.b_current_serial_var, width=30).pack(side="left", padx=8)
             if sub_type in self.config_data.get("tracit_submission_types", []):
-                self.b_tracit_fetch_button = ttk.Button(
-                    row1, text="Fetch from TracIT",
-                    command=lambda: self._batch_fetch_serial_from_tracit(active_emp_id),
-                )
-                self.b_tracit_fetch_button.pack(side="left", padx=(4, 0))
-                ttk.Button(
-                    row1, text="Open TracIT",
-                    command=lambda: self._open_tracit(active_emp_id, self.b_current_serial_var.get().strip()),
-                ).pack(side="left", padx=(4, 0))
                 self.b_tracit_fetch_hint = ttk.Label(row1, text="", foreground="#888")
                 self.b_tracit_fetch_hint.pack(side="left", padx=(6, 0))
             if prefill_note:
@@ -8818,7 +8683,7 @@ class WizardApp(tk.Tk):
                 if hint is not None:
                     hint.config(text="Filled from TracIT report.", foreground="#1a7f37")
             elif hint is not None and self.tracit_report_state.get("records"):
-                hint.config(text="Not in TracIT report - Fetch from TracIT or type it.", foreground="#a05a00")
+                hint.config(text="Not in the TracIT report - please type it.", foreground="#a05a00")
 
         # Enhancement 7 (relocated) - same automatic SSRS check as the
         # single-tab form; matching is done as soon as the row loads (see
@@ -8890,6 +8755,8 @@ class WizardApp(tk.Tk):
         def sign_now():
             path = self.signature_service.capture(self, title=capture_title)
             if path:
+                if self.b_signature_paths.get(data_key) not in (None, path):
+                    self.signature_service.discard(self.b_signature_paths[data_key])  # re-signed
                 self.b_signature_paths[data_key] = path
                 show_preview(path)
                 self.status_var.set(f"{title} captured.")
@@ -8916,6 +8783,8 @@ class WizardApp(tk.Tk):
         if index != self._batch_active_index:
             return  # operator already moved to a different person
         if not candidates:
+            if self._batch_keep_unverified_import_name(index, "not found in Active Directory"):
+                return
             if self._batch_fill_name_from_ssrs_if_ad_missed(index):
                 return
             self._batch_mark_needs_attention("No AD match found - enter details manually.")
@@ -8943,9 +8812,24 @@ class WizardApp(tk.Tk):
         )
         if index != self._batch_active_index:
             return
+        if self._batch_keep_unverified_import_name(index, "Active Directory lookup unavailable"):
+            return
         if self._batch_fill_name_from_ssrs_if_ad_missed(index):
             return
         self._batch_mark_needs_attention("⚠ Employee lookup unavailable. Please enter details manually.")
+
+    def _batch_keep_unverified_import_name(self, index, why):
+        """AD couldn't confirm this person, but the Excel file named them -
+        keep that name, clearly flagged as unverified (finding #6)."""
+        item = self.batch_queue[index]
+        if not item.get("employee_name") or not self.b_emp_name_var.get().strip():
+            return False
+        item["_lookup_source"] = "Import (unverified)"
+        self.b_identity_hint.config(
+            text=f"⚠ {why.capitalize()} - the name below is from the Excel file and is NOT verified. "
+                 "Please check it before signing.")
+        self._batch_check_identity_resolved()
+        return True
 
     def _batch_fill_name_from_ssrs_if_ad_missed(self, index):
         """Last resort only (same as the Single Person tab): AD had nothing
@@ -9105,8 +8989,13 @@ class WizardApp(tk.Tk):
         field_values = {
             "Date": today_str, "EmpID": emp_id, "EmpName": emp_name,
             "ContactNumber": contact_number, "ManagerName": manager_name,
-            "LastWorkingDate": item.get("last_working_date") or "",
+            "LastWorkingDate": "",
         }
+        lwd_date = self._lwd_date_for_pdf(chosen_type, getattr(self, "b_lwd_date_var", None))
+        if lwd_date is None:
+            return
+        field_values["LastWorkingDate"] = lwd_date
+        item["last_working_date"] = lwd_date or item.get("last_working_date")
 
         checked_tags = {tag for label, tag in SUBMISSION_TYPE_TAGS.items() if label == chosen_type}
         current_serial = self.b_current_serial_var.get().strip()
@@ -9125,6 +9014,15 @@ class WizardApp(tk.Tk):
             "EmployeeSignature": self.b_signature_paths.get("employee_signature_path"),
             "AssetReceiverSignature": self.b_signature_paths.get("asset_receiver_signature_path"),
         }
+
+        signature_method = self.signature_service.method_for(
+            signature_images["EmployeeSignature"], signature_images["AssetReceiverSignature"])
+        if not self._confirm_before_generate(
+                emp_id, emp_name, manager_name, chosen_type, current_serial, new_serial,
+                item.get("_lookup_source", "") or "Manual", signature_method, lwd_date):
+            logger.info("Batch generate: operator cancelled at the confirmation step")
+            self.status_var.set("Generation cancelled - check the details and generate again.")
+            return
 
         output_path = self.b_output_path_override or self._batch_compute_default_output_path(item)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -9171,6 +9069,8 @@ class WizardApp(tk.Tk):
             # signing timestamp pyHanko already embeds.
             base_reason = self.config_data.get("signing_reason") or "IT Asset Acknowledgement"
             emp_reason = f"{base_reason} - {emp_name} (Employee ID: {emp_id})"
+            if signature_method:
+                emp_reason += f" - signature captured: {signature_method}"
             sign_pdf_with_signatures(
                 unsigned_pdf, output_path,
                 [
@@ -9190,6 +9090,7 @@ class WizardApp(tk.Tk):
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
                 ssrs_match_status=ssrs_match_status, lookup_source=item.get("_lookup_source", ""),
                 pdf_generated=False, pdf_location="", email_draft_created=False,
+                signature_method=signature_method,
             )
             return
         except Exception as exc:
@@ -9200,11 +9101,14 @@ class WizardApp(tk.Tk):
                 operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
                 ssrs_match_status=ssrs_match_status, lookup_source=item.get("_lookup_source", ""),
                 pdf_generated=False, pdf_location="", email_draft_created=False,
+                signature_method=signature_method,
             )
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+        self.signature_service.discard(signature_images["EmployeeSignature"],
+                                       signature_images["AssetReceiverSignature"])
         item["status"] = "Completed"
         item["output_path"] = output_path
         item["employee_name"] = emp_name
@@ -9231,6 +9135,7 @@ class WizardApp(tk.Tk):
             operator=operator_name, employee_id=emp_id, submission_type=chosen_type,
             ssrs_match_status=ssrs_match_status, lookup_source=item.get("_lookup_source", ""),
             pdf_generated=True, pdf_location=output_path, email_draft_created=email_draft_created,
+            signature_method=signature_method,
         )
         if hasattr(self, "_history_refresh"):
             self._history_refresh()
@@ -9264,10 +9169,6 @@ class WizardApp(tk.Tk):
             self.browser_session.shutdown()
         except Exception:
             logger.debug("WizardApp: browser_session.shutdown() failed (non-fatal)", exc_info=True)
-        try:
-            self.tracit_session.shutdown()
-        except Exception:
-            logger.debug("WizardApp: tracit_session.shutdown() failed (non-fatal)", exc_info=True)
         self.destroy()
         logger.info("WizardApp: closed")
 
@@ -9305,13 +9206,25 @@ if __name__ == "__main__":
     _log_path = _setup_logging()
     _enable_os_trust_store()
     if len(sys.argv) > 1 and sys.argv[1] == "--webview-helper":
+        # A windowed .exe may start with no sys.stdin/stdout objects even
+        # though the parent app gave it pipes - attach them to the pipes.
+        for _fd, _name, _mode in ((0, "stdin", "r"), (1, "stdout", "w")):
+            if getattr(sys, _name) is None:
+                try:
+                    setattr(sys, _name, open(_fd, _mode, encoding="utf-8", buffering=1, closefd=False))
+                except OSError:
+                    pass
         # Relaunched as the embedded-browser AD lookup helper - see
         # BrowserLookupSession._build_command() above for how/why.
         _run_webview_helper()
-    elif len(sys.argv) > 1 and sys.argv[1] == "--tracit-helper":
-        # Relaunched as the embedded-browser TracIT lookup helper - see
-        # TracitLookupSession._build_command() above for how/why.
-        _run_tracit_webview_helper()
+    elif len(sys.argv) > 2 and sys.argv[1] == "--protect-pfx-password":
+        # One-time admin step for an IT-issued signing certificate.
+        _pw = getpass.getpass(f"Password for {sys.argv[2]}: ")
+        print("Saved:", protect_pfx_password(sys.argv[2], _pw))
+    elif len(sys.argv) > 1 and sys.argv[1] == "--verify-audit-log":
+        _ok, _msg = verify_audit_log()
+        print(_msg)
+        sys.exit(0 if _ok else 1)
     else:
         _set_windows_dpi_awareness()
         app = WizardApp()
